@@ -1,4 +1,9 @@
-# Issue tracker: GitHub
+---
+title: GitHub issue tracker
+description: Agent workflow for reading, creating, and updating project work in GitHub Issues.
+sidebar:
+  label: Issue tracker
+---
 
 Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 

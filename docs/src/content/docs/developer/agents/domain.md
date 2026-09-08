@@ -1,4 +1,9 @@
-# Domain Docs
+---
+title: Domain docs
+description: Agent instructions for locating domain context, vocabulary, and architecture decisions.
+sidebar:
+  label: Domain docs
+---
 
 How the engineering skills should consume this repo's domain documentation when exploring the codebase.
 

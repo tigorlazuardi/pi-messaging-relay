@@ -1,4 +1,9 @@
-# Agent Relay handover
+---
+title: Agent Relay handover
+description: Provisional scope, protocol guidance, and lessons transferred from the predecessor Agent Relay project.
+status: draft
+draft: true
+---
 
 Status: input for wayfinder and grilling; not an approved specification.
 
