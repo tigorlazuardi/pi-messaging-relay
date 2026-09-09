@@ -34,6 +34,11 @@ export default defineConfig({
               description: 'Architecture, protocol, internals, decisions, and engineering reports.',
               paths: ['developer/**'],
             },
+            {
+              label: 'Report: Astro action Node version (2026-09)',
+              description: 'GitHub Pages build fails because withastro/action v3 defaults to unsupported Node 20.',
+              paths: ['developer/reports/2026-09-astro-action-node-version'],
+            },
           ],
         }),
       ],
