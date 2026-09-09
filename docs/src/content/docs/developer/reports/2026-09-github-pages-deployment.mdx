@@ -1,0 +1,76 @@
+---
+title: GitHub Pages deployment bootstrap failures
+description: GitHub Pages initially fails on unsupported Node 20, then returns deployment 404 until Pages is enabled for GitHub Actions.
+date: 2026-09-09
+severity: medium
+tags: [tech/astro, tech/github-actions, kind/vendor-quirk, area/ci]
+sidebar:
+  label: 2026-09-09 GitHub Pages bootstrap
+  order: -1788921750824
+---
+
+## Symptom
+
+```txt
+Node.js v20.20.2 is not supported by Astro!
+Please upgrade Node.js to a supported version: ">=22.12.0"
+```
+
+The initial build failed inside `withastro/action@v3`; deployment was skipped. After pinning Node 24, the build passed but deployment exposed a second bootstrap failure:
+
+```txt
+Error: Failed to create deployment (status: 404)
+Ensure GitHub Pages has been enabled
+```
+
+## Context
+
+The documentation site uses Astro 7. Local builds ran on Node 24 and passed. GitHub Actions used the composite action's internal default Node version instead of the local runtime.
+
+Initial failed run: [34207278596](https://github.com/tigorlazuardi/pi-messaging-relay/actions/runs/34207278596). Follow-up run: [34311804750](https://github.com/tigorlazuardi/pi-messaging-relay/actions/runs/34311804750).
+
+## Offending code
+
+```yaml title=".github/workflows/docs.yml" showLineNumbers startLineNumber=18 {1-3}
+      - uses: withastro/action@v3
+        with:
+          path: ./docs # action silently defaults node-version to 20
+```
+
+## Root cause
+
+`withastro/action@v3` declares its `node-version` input with default value `20`. Astro 7 requires Node `>=22.12.0`, so dependency installation completed with engine warnings and `astro build` then exited immediately.
+
+A separate `setup-node` step would not be authoritative because the composite action runs its own `actions/setup-node` using its input.
+
+Once the build passed, `actions/deploy-pages@v4` returned HTTP 404 because the repository did not yet have a Pages site configured with `build_type: workflow`. The workflow can upload an artifact before Pages is enabled, but cannot create a deployment.
+
+## Fix
+
+Pass the supported runtime directly to the Astro action:
+
+```diff
+       - uses: withastro/action@v3
+         with:
+           path: ./docs
++          node-version: 24
+```
+
+Enable the repository Pages site with GitHub Actions as its build source, either in Settings → Pages or through:
+
+```sh
+gh api --method POST repos/OWNER/REPO/pages -f build_type=workflow
+```
+
+Then rerun the failed deployment job.
+
+## Lesson
+
+A new Astro Pages site needs two explicit bootstrap settings: pin a Node version supported by Astro on `withastro/action`, and enable repository Pages with `build_type: workflow`. Neither the action default nor the presence of a deployment workflow establishes these prerequisites.
+
+## Recurrence log
+
+| Date | Where | Trace ID | Notes |
+|---|---|---|---|
+| 2026-09-09 | GitHub Pages build run 34207278596 | — | Build failed because the action defaulted to Node 20. |
+| 2026-09-09 | GitHub Pages deploy run 34311804750 | — | Build passed; deploy returned 404 until Pages was enabled. |

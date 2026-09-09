@@ -35,9 +35,9 @@ export default defineConfig({
               paths: ['developer/**'],
             },
             {
-              label: 'Report: Astro action Node version (2026-09)',
-              description: 'GitHub Pages build fails because withastro/action v3 defaults to unsupported Node 20.',
-              paths: ['developer/reports/2026-09-astro-action-node-version'],
+              label: 'Report: GitHub Pages deployment bootstrap (2026-09)',
+              description: 'Astro Pages fails on Node 20, then deployment returns 404 until Pages is enabled.',
+              paths: ['developer/reports/2026-09-github-pages-deployment'],
             },
           ],
         }),
