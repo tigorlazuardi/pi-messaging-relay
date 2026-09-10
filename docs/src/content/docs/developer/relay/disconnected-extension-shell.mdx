@@ -1,6 +1,6 @@
 ---
 title: Pi extension shell
-description: Registration, pairing-command, fake-host, and disconnected model-tool boundaries for the relay extension.
+description: Registration, pairing, session-authentication lifecycle, fake-host, and disconnected model-tool boundaries for the relay extension.
 status: accepted
 date: 2026-09-10
 ---
@@ -10,24 +10,27 @@ import Decision from '../../../../components/Decision.astro';
 
 The extension package in `extension/` establishes the Pi-facing surface. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
 
-<Aside type="note" title="Pairing only">
-The command now performs installation pairing and persists an extension-local Ed25519 private key. Connection state, WebSockets, session authentication, routing, delivery, and reconnect are not implemented. Loading the factory still requires no relay server and no model call.
+<Aside type="note" title="Authenticated transport, disconnected tools">
+The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers can authenticate and retain one WebSocket, but roster, routing, delivery, and reconnect are not implemented. Loading the factory still requires no relay server and no model call, and `list_peers` and `agent_send` remain disconnected.
 </Aside>
 
-## Registration boundary
+## Registration and lifecycle boundary
 
 ```mermaid
-flowchart LR
-    P[Pi loads factory] --> C[Register relay-pair]
+flowchart TD
+    P[Pi loads factory] --> E[Register session_start and session_shutdown]
+    E --> C[Register relay-pair]
     C --> L[Register list_peers]
     L --> S[Register agent_send]
-    S --> D[Return disconnected]
+    S --> D[Return with no network resource]
+    D --> A[session_start: attempt authentication when configured and paired]
+    A --> X[session_shutdown: settle in-flight or retained socket]
 ```
 
-The synchronous factory performs registration only. It does not subscribe to lifecycle events, start timers, open sockets, call `fetch`, inspect a model, or inject session content. Only an explicit `/relay-pair CODE` invocation performs bounded file and HTTP work.
+The synchronous factory registers the command, both tools, and the two lifecycle handlers. Factory execution does not start timers, open sockets, call `fetch`, inspect a model, or inject session content. `session_start` makes one bounded authentication attempt when both endpoint and installation key exist. A successful `/relay-pair CODE` invocation performs bounded file and HTTP work and, when the session is already active, makes one pairing-owned authentication attempt. `session_shutdown` idempotently closes an in-flight or retained socket.
 
-<Decision title="Keep the initial factory inert" status="accepted">
-The shell cannot start a resource that outlives a Pi invocation which only loads extensions. A later connection ticket must choose an explicit runtime lifecycle and shutdown owner rather than extending this load-time boundary implicitly.
+<Decision title="Keep factory loading inert and give session lifecycle socket ownership" status="accepted">
+Loading only registers surfaces and lifecycle handlers, so it creates no resource that outlives a factory invocation. `session_start`, successful pairing during an active session, and `session_shutdown` explicitly own authentication attempts and transport settlement.
 </Decision>
 
 The schemas preserve the accepted model intents:
@@ -52,10 +55,10 @@ Tool handlers throw an `Error`. Throwing is Pi's tool-error mechanism and produc
 Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
 ```
 
-The command validates explicit loopback endpoint configuration, creates or loads the installation key, calls the real HTTP endpoint, and reports the accepted client identity. It never sends a user or custom message into the Pi session. Pairing does not imply a live messaging connection.
+The command validates explicit loopback endpoint configuration, creates or loads the installation key, calls the real HTTP endpoint, and reports the accepted client identity. It never sends a user or custom message into the Pi session. Pairing during an active session may authenticate a live transport, but does not make either model tool available.
 
-<Decision title="Keep model tools disconnected after pairing" status="accepted">
-Pairing establishes installation identity only. The shell does not return an empty peer roster or fabricate a message status before ticket #11 supplies an authenticated connection lifecycle.
+<Decision title="Keep model tools disconnected after authentication" status="accepted">
+Authentication establishes a live session identity and retains its socket. The shell does not return an empty peer roster or fabricate a message status while roster behavior and delivery remain deferred.
 </Decision>
 
 ### I/O examples
@@ -99,15 +102,16 @@ Handlers execute directly through the recorded registrations. The acceptance ass
 - closed input schemas, including invalid edge shapes;
 - one command-to-real-HTTP success notification with no raw pairing code or private key in telemetry;
 - thrown errors from both disconnected model tools;
-- no Pi message injection or live context access; and
-- no timer, fetch, or WebSocket creation during factory execution.
+- no Pi message injection or live context access;
+- no timer, fetch, or WebSocket creation during factory execution or a keyless lifecycle startup; and
+- one retained authenticated socket from either lifecycle ordering, followed by idempotent shutdown settlement.
 
 The primary pairing acceptance additionally starts the real Go child, invokes the registered command, and inspects only observable permission, public metadata, persistence, notification, injection, and process-log boundaries.
 
 ## Runtime dependency and telemetry
 
 <Decision title="Keep runtime dependencies beside the Nix-loaded extension" status="accepted">
-The package declares TypeBox as an extension-local runtime dependency and pins it through `extension/package-lock.json`; `npm ci` installs it beside the extension. This avoids assuming that a Nix-installed Pi exposes its internal package tree to a user extension at runtime. Pi core remains a type-only import and is erased before runtime, so the extension does not resolve Pi internals at runtime.
+The package declares TypeBox 1.3.7 and `ws` 8.21.3 as pinned extension-local runtime dependencies through `extension/package-lock.json`; `npm ci` installs both beside the extension. TypeBox owns tool schemas. The `ws` client enforces the authentication payload ceiling and supports bounded hard transport termination. This avoids assuming that a Nix-installed Pi exposes its internal package tree to a user extension at runtime. Pi core remains a type-only import and is erased before runtime, so the extension does not resolve Pi internals at runtime.
 </Decision>
 
-Disconnected model-tool attempts write one structured warning with `event: "relay_operation_failed"`. Pairing writes one settled `relay_pair_accepted` or `relay_pair_rejected` event with latency and stable result or reason. Pairing-code and private-key field names contain `<redacted>`; message bodies remain absent. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.
+Disconnected model-tool attempts write one structured warning with `event: "relay_operation_failed"`. Pairing writes one settled `relay_pair_accepted` or `relay_pair_rejected` event with latency and stable result or reason. Session lifecycle emits `relay_auth_accepted`, `relay_auth_rejected`, and `relay_session_disconnected`; accepted and disconnected events carry available public client, route, and address correlation fields. Pairing-code, nonce, signature, and private-key field names contain `<redacted>`; message bodies remain absent. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.

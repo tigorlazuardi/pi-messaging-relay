@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
 
@@ -141,6 +144,84 @@ test("loads and runs disconnected handlers without starting resources", { concur
   assert.deepEqual(host.sendUserMessageAttempts, []);
   assert.equal(logs.lines.some((line) => line.includes(VALID_PAIRING_CODE)), false);
   assert.equal(logs.lines.some((line) => line.includes("sensitive-message-body")), false);
+});
+
+test("unpaired session lifecycle stays disconnected without opening resources", { concurrency: false }, async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-relay-unpaired-session-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateDirectory = join(root, "missing-state");
+  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
+  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
+  process.env.PI_MESSAGING_RELAY_URL = "http://127.0.0.1:31415";
+  process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
+  const resourceAttempts: string[] = [];
+  const restoreResources = installResourceGuards(resourceAttempts);
+  const host = new FakePiHost();
+
+  try {
+    const relayExtension = await loadRelayExtension();
+    relayExtension(host.api as never);
+    await host.emit("session_start");
+    await host.emit("session_shutdown");
+    await host.emit("session_shutdown");
+  } finally {
+    restoreResources();
+    if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
+    else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
+    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
+    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
+  }
+
+  assert.deepEqual(resourceAttempts, []);
+  await assert.rejects(stat(stateDirectory), { code: "ENOENT" });
+  assert.deepEqual(host.sendMessageAttempts, []);
+  assert.deepEqual(host.sendUserMessageAttempts, []);
+});
+
+test("configured key with missing endpoint rejects startup before WebSocket creation", { concurrency: false }, async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-relay-unconfigured-session-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateDirectory = join(root, "state");
+  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
+  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
+  const originalFetch = globalThis.fetch;
+  process.env.PI_MESSAGING_RELAY_URL = "http://127.0.0.1:31415";
+  process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
+  globalThis.fetch = async () => new Response('{"client_id":"cli_0123456789abcdef"}', {
+    status: 201,
+    headers: { "Content-Type": "application/json" },
+  });
+  const host = new FakePiHost();
+  const logs = captureStructuredErrors();
+
+  try {
+    const relayExtension = await loadRelayExtension();
+    relayExtension(host.api as never);
+    await host.executeCommand("relay-pair", VALID_PAIRING_CODE);
+    delete process.env.PI_MESSAGING_RELAY_URL;
+    const resourceAttempts: string[] = [];
+    const restoreResources = installResourceGuards(resourceAttempts);
+    try {
+      await host.emit("session_start");
+      await host.emit("session_shutdown");
+    } finally {
+      restoreResources();
+    }
+    assert.deepEqual(resourceAttempts, []);
+  } finally {
+    logs.restore();
+    globalThis.fetch = originalFetch;
+    if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
+    else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
+    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
+    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
+  }
+
+  const events = logs.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(events.some((event) =>
+    event.event === "relay_auth_rejected" && event.reason === "endpoint_not_configured"), true);
+  assert.deepEqual(host.sendMessageAttempts, []);
+  assert.deepEqual(host.sendUserMessageAttempts, []);
 });
 
 test("publishes closed tool schemas matching the accepted model intents", { concurrency: false }, async () => {

@@ -38,6 +38,11 @@ type logEvent struct {
 	PrivateKey      string `json:"private_key,omitempty"`
 	ClientPublicKey string `json:"client_public_key,omitempty"`
 	ClientID        string `json:"client_id,omitempty"`
+	RouteID         string `json:"route_id,omitempty"`
+	Hostname        string `json:"hostname,omitempty"`
+	CWD             string `json:"cwd,omitempty"`
+	Nonce           string `json:"nonce,omitempty"`
+	Signature       string `json:"signature,omitempty"`
 	ExpiresAt       string `json:"expires_at,omitempty"`
 	LatencyMS       *int64 `json:"latency_ms,omitempty"`
 }
@@ -225,6 +230,19 @@ func runWithContext(
 			runErr = errors.Join(runErr, err)
 		}
 	}()
+	connections := newSessionConnectionRegistry()
+	connectionsClosed := false
+	defer func() {
+		if connectionsClosed {
+			return
+		}
+		closeContext, cancelClose := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancelClose()
+		if err := connections.closeAndWait(closeContext); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}()
+	authentication := newSessionAuthService(pairing, connections, logger, runtimeFailures.report)
 
 	listener, err := net.Listen("tcp", *listenAddress)
 	if err != nil {
@@ -234,6 +252,7 @@ func runWithContext(
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pair", pairing.handlePair)
+	mux.HandleFunc("/v1/connect", authentication.handleConnect)
 	server := newRelayHTTPServer(mux)
 	serveResult := make(chan error, 1)
 	go func() {
@@ -275,7 +294,7 @@ func runWithContext(
 		}
 		return errors.New("server stopped before a termination signal")
 	case <-runtimeFailures.reported:
-		terminalErr = fmt.Errorf("fatal pairing runtime failure: %w", runtimeFailures.err())
+		terminalErr = fmt.Errorf("fatal relay runtime failure: %w", runtimeFailures.err())
 	case <-terminationContext.Done():
 	}
 
@@ -289,6 +308,10 @@ func runWithContext(
 	if err := <-serveResult; err != nil {
 		return errors.Join(terminalErr, fmt.Errorf("serve during shutdown: %w", err))
 	}
+	if err := connections.closeAndWait(shutdownContext); err != nil {
+		return errors.Join(terminalErr, err)
+	}
+	connectionsClosed = true
 	if temporaryState {
 		stateCleanupAttempted = true
 		if err := os.RemoveAll(stateDir); err != nil {
@@ -296,7 +319,7 @@ func runWithContext(
 		}
 	}
 	if fatalErr := runtimeFailures.err(); fatalErr != nil {
-		terminalErr = fmt.Errorf("fatal pairing runtime failure: %w", fatalErr)
+		terminalErr = fmt.Errorf("fatal relay runtime failure: %w", fatalErr)
 	}
 	if terminalErr != nil {
 		return terminalErr

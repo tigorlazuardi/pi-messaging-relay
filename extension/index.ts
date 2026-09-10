@@ -14,6 +14,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { syncDirectory } from "./internal/directory-durability.ts";
+import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
 
 const DISCONNECTED_ERROR =
   "Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.";
@@ -247,7 +248,7 @@ function encodedPublicKey(privateKey: KeyObject): string {
   return `ed25519:${Buffer.from(jwk.x, "base64url").toString("base64")}`;
 }
 
-function pairEndpoint(): URL {
+function relayOrigin(): URL {
   const configured = process.env[ENDPOINT_ENV];
   if (!configured) {
     throw new PairingError(
@@ -284,7 +285,34 @@ function pairEndpoint(): URL {
       `Pairing failed: ${ENDPOINT_ENV} must be an HTTP loopback origin such as http://127.0.0.1:8080.`,
     );
   }
-  return new URL("/v1/pair", endpoint);
+  return endpoint;
+}
+
+function pairEndpoint(): URL {
+  return new URL("/v1/pair", relayOrigin());
+}
+
+function connectEndpoint(): URL {
+  const endpoint = new URL("/v1/connect", relayOrigin());
+  endpoint.protocol = "ws:";
+  return endpoint;
+}
+
+async function loadExistingInstallationKey(): Promise<KeyObject | undefined> {
+  const stateDirectory = resolve(extensionStateDirectory());
+  try {
+    await lstat(stateDirectory);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
+  await ensurePrivateStateDirectory(stateDirectory);
+  try {
+    return await readInstallationKey(join(stateDirectory, PRIVATE_KEY_FILENAME));
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
 }
 
 async function readBoundedText(response: Response): Promise<string> {
@@ -398,7 +426,9 @@ function parseExactStringObject(text: string, expectedFields: readonly string[])
   }
 }
 
-async function pairInstallation(code: string): Promise<{ clientID: string; clientPublicKey: string }> {
+async function pairInstallation(
+  code: string,
+): Promise<{ clientID: string; clientPublicKey: string; privateKey: KeyObject }> {
   const endpoint = pairEndpoint();
   const privateKey = await loadOrCreateInstallationKey();
   const clientPublicKey = encodedPublicKey(privateKey);
@@ -441,7 +471,7 @@ async function pairInstallation(code: string): Promise<{ clientID: string; clien
       "Pairing failed: relay response did not contain one valid client_id.",
     );
   }
-  return { clientID: payload.client_id, clientPublicKey };
+  return { clientID: payload.client_id, clientPublicKey, privateKey };
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {
@@ -472,6 +502,150 @@ function validatePairingCodeArgument(argument: string): string {
 }
 
 export default function relayExtension(pi: ExtensionAPI): void {
+  let sessionStarted = false;
+  let sessionRouteID: string | undefined;
+  let sessionCWD: string | undefined;
+  let startupAttempted = false;
+  let pairingAttempted = false;
+  let activeAttempt: SessionSocketAttempt | undefined;
+  let activeConnection: Awaited<SessionSocketAttempt["result"]> | undefined;
+
+  const logAuthentication = (
+    level: "info" | "warn",
+    result: "accepted" | "rejected" | "disconnected",
+    fields: { reason?: string; address?: string; routeID?: string; clientPublicKey?: string; latencyMS?: number },
+  ) => {
+    console.error(JSON.stringify({
+      level,
+      event: result === "accepted"
+        ? "relay_auth_accepted"
+        : result === "rejected"
+          ? "relay_auth_rejected"
+          : "relay_session_disconnected",
+      result,
+      ...(fields.reason ? { reason: fields.reason } : {}),
+      ...(fields.address ? { address: fields.address } : {}),
+      ...(fields.routeID ? { route_id: fields.routeID } : {}),
+      ...(fields.clientPublicKey ? { client_public_key: fields.clientPublicKey } : {}),
+      nonce: REDACTED,
+      signature: REDACTED,
+      private_key: REDACTED,
+      ...(fields.latencyMS === undefined ? {} : { latency_ms: fields.latencyMS }),
+    }));
+  };
+
+  const connectOnce = async (cause: "startup" | "pairing", pairedKey?: KeyObject): Promise<void> => {
+    if (!sessionStarted || activeConnection) return;
+    if (cause === "startup") {
+      if (startupAttempted) return;
+    } else if (pairingAttempted) {
+      return;
+    }
+    if (activeAttempt) {
+      await activeAttempt.result.catch(() => undefined);
+      if (!sessionStarted || activeConnection) return;
+    }
+
+    let privateKey: KeyObject | undefined;
+    try {
+      privateKey = pairedKey ?? await loadExistingInstallationKey();
+      if (!privateKey) return;
+    } catch {
+      logAuthentication("warn", "rejected", {
+        reason: "installation_key_unavailable",
+        routeID: sessionRouteID,
+      });
+      return;
+    }
+    if (cause === "startup") startupAttempted = true;
+    else pairingAttempted = true;
+
+    const started = Date.now();
+    let clientPublicKey: string;
+    let endpoint: URL;
+    try {
+      clientPublicKey = encodedPublicKey(privateKey);
+      endpoint = connectEndpoint();
+    } catch (error) {
+      const reason = error instanceof PairingError ? error.reason : "configuration_invalid";
+      logAuthentication("warn", "rejected", {
+        reason,
+        routeID: sessionRouteID,
+        latencyMS: Date.now() - started,
+      });
+      return;
+    }
+    const routeID = sessionRouteID;
+    const cwd = sessionCWD;
+    if (!routeID || !cwd) return;
+
+    const attempt = new SessionSocketAttempt({
+      endpoint,
+      privateKey,
+      clientPublicKey,
+      routeID,
+      cwd,
+      onDisconnected: () => {
+        if (activeConnection?.socket === connection?.socket) activeConnection = undefined;
+        logAuthentication("info", "disconnected", {
+          address: connection?.address,
+          routeID,
+          clientPublicKey,
+        });
+      },
+    });
+    activeAttempt = attempt;
+    let connection: Awaited<typeof attempt.result> | undefined;
+    try {
+      connection = await attempt.result;
+      if (!sessionStarted || sessionRouteID !== routeID) {
+        await connection.closeAndWait();
+        return;
+      }
+      activeConnection = connection;
+      logAuthentication("info", "accepted", {
+        address: connection.address,
+        routeID,
+        clientPublicKey,
+        latencyMS: Date.now() - started,
+      });
+    } catch (error) {
+      const reason = error !== null && typeof error === "object" && "reason" in error &&
+          typeof (error as { reason?: unknown }).reason === "string"
+        ? (error as { reason: string }).reason
+        : "connection_failed";
+      logAuthentication("warn", "rejected", {
+        reason,
+        routeID,
+        clientPublicKey,
+        latencyMS: Date.now() - started,
+      });
+    } finally {
+      if (activeAttempt === attempt) activeAttempt = undefined;
+    }
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (activeConnection) await activeConnection.closeAndWait();
+    activeAttempt?.close();
+    sessionStarted = true;
+    sessionRouteID = generateUUIDv7();
+    sessionCWD = ctx.cwd;
+    startupAttempted = false;
+    pairingAttempted = false;
+    await connectOnce("startup");
+  });
+
+  pi.on("session_shutdown", async () => {
+    sessionStarted = false;
+    const pendingAttempt = activeAttempt?.result;
+    activeAttempt?.close();
+    if (pendingAttempt) await pendingAttempt.catch(() => undefined);
+    const connection = activeConnection;
+    activeConnection = undefined;
+    if (connection) await connection.closeAndWait();
+  });
+
   pi.registerCommand("relay-pair", {
     description: "Pair this Pi installation with the configured relay server",
     handler: async (args, ctx) => {
@@ -485,6 +659,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
           latencyMS: Date.now() - started,
         });
         ctx.ui.notify(`Relay pairing accepted client identity ${paired.clientID}.`, "success");
+        if (sessionStarted) await connectOnce("pairing", paired.privateKey);
       } catch (error) {
         const pairingError =
           error instanceof PairingError

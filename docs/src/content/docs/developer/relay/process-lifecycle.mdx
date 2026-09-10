@@ -8,7 +8,7 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and now hosts the installation-pairing endpoint. WebSocket messaging, session authentication, and routing remain unimplemented.
+The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and implements installation pairing and session authentication. Roster responses, routing, and delivery remain deferred.
 
 ## Startup boundary
 
@@ -49,16 +49,17 @@ SIGINT and SIGTERM run cleanup. A forced kill or host crash cannot run in-proces
 ```mermaid
 flowchart TD
     S[SIGINT or SIGTERM] --> A[Stop accepting connections]
-    A --> D[Drain HTTP server within five seconds]
+    A --> D[Shut down HTTP and settle serve within shared five-second deadline]
     D --> R[Release listener]
-    R --> C[Remove temporary state; retain explicit durable state]
+    R --> W[Force-close and settle every reserved or authenticated registry WebSocket within shared deadline]
+    W --> C[Remove temporary state; retain explicit durable state]
     C --> E[Emit server_stopped with graceful result]
     E --> X[Exit zero]
 ```
 
-The five-second bound prevents graceful shutdown from waiting forever on a process resource. Every HTTP response has a two-second write deadline. Structured event delivery uses one worker per stdout or stderr sink, no queued buffer, and a one-second handoff/acknowledgement deadline. Logger close also waits at most one second. A stalled output therefore cannot retain request handlers or process exit indefinitely.
+The shared five-second bound owns HTTP shutdown and serve settlement, then force-closing and settling every reserved or authenticated registry-owned WebSocket. It prevents graceful shutdown from waiting forever on either HTTP or registry-owned process resources. Every HTTP response has a two-second write deadline. Structured event delivery uses one worker per stdout or stderr sink, no queued buffer, and a one-second handoff/acknowledgement deadline. Logger close also waits at most one second. A stalled output therefore cannot retain request handlers or process exit indefinitely.
 
-A pairing audit failure is stored in a queryable first-error latch and enters the bounded HTTP drain. Main checks that latch again after drain and before any successful stop event, so concurrent SIGINT, SIGTERM, or injected cancellation cannot mask it. Main then attempts `server_failed` through the separately bounded stderr worker and exits non-zero; explicit durable state is retained, and an accepted handler still returns its already-persisted identity.
+A relay audit failure is stored in a queryable first-error latch and enters the bounded HTTP drain. Main checks that latch again after drain and before any successful stop event, so concurrent SIGINT, SIGTERM, or injected cancellation cannot mask it. Main then attempts `server_failed` through the separately bounded stderr worker and exits non-zero. For a pairing audit failure, explicit durable state is retained and an accepted handler still returns its already-persisted identity.
 
 <Aside type="note" title="Blocked writer boundary">
 Go cannot cancel an arbitrary `io.Writer` call. If an external writer never returns, process shutdown records the logger-close timeout but does not wait beyond it. That single worker remains blocked only until operating-system process exit. Tests release their fake writer and verify worker completion.
@@ -68,8 +69,8 @@ Go cannot cancel an arbitrary `io.Writer` call. If an external writer never retu
 Pair responses are tiny and local. A two-second write deadline leaves operational margin while releasing a non-reading client well before the five-second process drain ceiling.
 </Decision>
 
-<Decision title="Bound event sinks and latch pairing audit failure" status="accepted">
-One writer worker per sink preserves event order without an unbounded queue. One-second write acknowledgement and close deadlines bound handlers and shutdown. The first fatal audit error remains queryable after notification, so termination races cannot produce `server_stopped` or exit zero.
+<Decision title="Bound event sinks and latch relay audit failures" status="accepted">
+One writer worker per sink preserves event order without an unbounded queue. One-second write acknowledgement and close deadlines bound handlers and shutdown. The first fatal relay audit error remains queryable after notification, so termination races cannot produce `server_stopped` or exit zero.
 </Decision>
 
 Ponytail: event writes and logger close are fixed to one second, response writes to two seconds, and shutdown drain to five seconds; make them configurable when operational evidence requires different deadlines.
@@ -102,7 +103,7 @@ Ponytail: event writes and logger close are fixed to one second, response writes
   </TabItem>
   <TabItem label="Blocked audit sink stderr">
     ```text
-    {"level":"error","event":"server_failed","reason":"fatal pairing runtime failure: write pair_accepted pairing audit event: write pair_accepted event within 1s: context deadline exceeded\nclose stdout event logger: stop event logger worker within 1s: context deadline exceeded"}
+    {"level":"error","event":"server_failed","reason":"fatal relay runtime failure: write pair_accepted pairing audit event: write pair_accepted event within 1s: context deadline exceeded\nclose stdout event logger: stop event logger worker within 1s: context deadline exceeded"}
     exit code: 1
     ```
   </TabItem>

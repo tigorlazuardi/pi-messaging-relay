@@ -18,6 +18,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 type writerFunc func([]byte) (int, error)
@@ -142,6 +145,77 @@ func (listener *singleConnListener) Close() error {
 
 func (listener *singleConnListener) Addr() net.Addr {
 	return listener.connection.LocalAddr()
+}
+
+func TestSessionAuthAuditFailureReportsFatalRelayRuntimeClassification(t *testing.T) {
+	auditFailure := errors.New("injected auth audit failure")
+	terminationContext, cancelTermination := context.WithCancel(context.Background())
+	defer cancelTermination()
+	output := &failOnceAfterWriter{
+		failWrite: 3,
+		failure:   auditFailure,
+		onFailure: cancelTermination,
+		events:    make(chan []byte, 4),
+	}
+	var fallback bytes.Buffer
+	runDone := make(chan error, 1)
+	go func() {
+		runErr := runWithContext(nil, output, syncDirectory, terminationContext)
+		runDone <- reportServerFailure(runErr, &fallback)
+	}()
+
+	readEvent := func() logEvent {
+		t.Helper()
+		select {
+		case data := <-output.events:
+			var event logEvent
+			if err := json.Unmarshal(data, &event); err != nil {
+				t.Fatalf("decode startup event: %v", err)
+			}
+			return event
+		case <-time.After(eventWriteTimeout):
+			t.Fatal("timed out waiting for startup event")
+			return logEvent{}
+		}
+	}
+	ready := readEvent()
+	if ready.Event != "server_ready" {
+		t.Fatalf("first event = %q, want server_ready", ready.Event)
+	}
+	if created := readEvent(); created.Event != "pairing_code_created" {
+		t.Fatalf("second event = %q, want pairing_code_created", created.Event)
+	}
+
+	dialContext, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	defer cancelDial()
+	connection, _, err := websocket.Dial(dialContext, "ws://"+ready.Address+"/v1/connect", nil)
+	if err != nil {
+		t.Fatalf("dial auth audit fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.CloseNow() })
+	var challenge challengeEnvelope
+	if err := wsjson.Read(dialContext, connection, &challenge); err != nil {
+		t.Fatalf("read auth challenge: %v", err)
+	}
+	if err := wsjson.Write(dialContext, connection, map[string]any{}); err != nil {
+		t.Fatalf("write invalid hello: %v", err)
+	}
+
+	select {
+	case runErr := <-runDone:
+		if !errors.Is(runErr, auditFailure) {
+			t.Fatalf("run error = %v, want auth audit failure", runErr)
+		}
+	case <-time.After(shutdownTimeout + eventWriteTimeout):
+		t.Fatal("server did not settle fatal auth audit failure")
+	}
+	failureOutput := fallback.String()
+	if !strings.Contains(failureOutput, `"event":"server_failed"`) ||
+		!strings.Contains(failureOutput, "fatal relay runtime failure") ||
+		!strings.Contains(failureOutput, "write auth_rejected session audit event") ||
+		strings.Contains(failureOutput, "fatal pairing runtime failure") {
+		t.Fatalf("server failure classification is inaccurate: %s", failureOutput)
+	}
 }
 
 func TestNewDurableStateDirectoryMustSyncBeforeServerReadiness(t *testing.T) {

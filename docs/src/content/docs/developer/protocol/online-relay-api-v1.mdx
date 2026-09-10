@@ -71,6 +71,26 @@ flowchart TD
 
 The pairing code and nonce are authentication material and are always redacted from logs. The server writes the current raw pairing code only when `--pairing-code-file PATH` explicitly requests an exclusively created mode-`0600` operator file. If the flag is omitted, the raw code remains undisclosed; ordinary structured logs contain only `<redacted>`. A startup pairing code is exactly 32 URL-safe Base64 characters encoding 24 random bytes. It is valid only before its ten-minute `expires_at` timestamp: the exact deadline and every later instant are expired. The server persists allowlisted public keys and minimal pairing metadata, but never messages or pending sends. Pair requests are bounded to 4,096 bytes and use a closed two-string JSON object; the extension's fixed accepted code and public-key forms produce a 126-byte request. `client_public_key` is `ed25519:` followed by canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. `client_id` is `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes.
 
+The server reserves one of 1,024 tracked slots before WebSocket upgrade. At capacity it returns bounded HTTP `503` without upgrading. Each upgraded connection receives a fresh 32-byte cryptographic nonce encoded as 43-character unpadded URL-safe Base64. Challenge write, hello read, verification, and welcome write share a five-second authentication deadline. The general frame ceiling remains 512 KiB, while hello uses a narrower 16 KiB read ceiling. Cwd is bounded to 4,096 UTF-8 bytes and hostname to 255 UTF-8 bytes; both must be non-empty. These values are signed display metadata, not authorization identity.
+
+The Ed25519 signature covers this exact UTF-8 transcript, in order, where each length is the decimal UTF-8 byte length and each shown `\n` is one LF byte:
+
+```text
+pi-messaging-relay-auth-v1\n
+nonce:<length>:<nonce>\n
+request_id:<length>:<request_id>\n
+client_public_key:<length>:<client_public_key>\n
+route_id:<length>:<route_id>\n
+hostname:<length>:<hostname>\n
+cwd:<length>:<cwd>\n
+```
+
+The signature field is excluded. Both request and route IDs are canonical lowercase UUIDv7. Authorization succeeds only when the submitted key is allowlisted and that same key verifies the complete transcript. Welcome echoes the signed metadata as `<cwd>@<hostname>#<route_id>`; the composite address is never parsed for authorization. While an authenticated entry is active, both its route UUID and complete opaque address are unique. A same-key or different-key collision closes without a welcome and cannot replace the original entry. Route reuse after disconnect and reconnect ownership remain deferred to ticket #26.
+
+<Decision title="Sign one deterministic domain-separated hello transcript" status="accepted">
+Length-prefixed values bind the fresh nonce, request, installation key, and complete route metadata without delimiter ambiguity. Go and TypeScript produce identical bytes, and changing display metadata invalidates the signature without making that metadata an authorization identity.
+</Decision>
+
 <Decision title="Separate trust bootstrap from messaging" status="accepted">
 One-time pairing uses `POST /v1/pair`. Authenticated live traffic uses WebSocket `/v1/connect`.
 </Decision>
@@ -135,7 +155,7 @@ A well-formed incorrect, expired, or already consumed code returns HTTP `401` wi
       "type": "hello",
       "request_id": "01993c79-8ad7-79fa-83e3-9789dcaca168",
       "payload": {
-        "client_public_key": "ed25519:base64-public-key",
+        "client_public_key": "ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E=",
         "route_id": "01993ca1-1111-7aaa-8aaa-111111111111",
         "hostname": "workstation-a",
         "cwd": "/srv/frontend",

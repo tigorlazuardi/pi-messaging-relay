@@ -239,6 +239,21 @@ func (service *pairingService) accept(input pairRequest, now time.Time) (string,
 	return clientID, nil
 }
 
+func (service *pairingService) authorizedKey(encoded string) (string, ed25519.PublicKey, bool) {
+	publicKey, err := decodeEd25519PublicKey(encoded)
+	if err != nil {
+		return "", nil, false
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	for _, client := range service.allowlist.Clients {
+		if client.PublicKey == encoded {
+			return client.ClientID, publicKey, true
+		}
+	}
+	return "", nil, false
+}
+
 func (service *pairingService) logPairFailure(reason string, started time.Time, publicKey string) {
 	service.writeAudit(logEvent{
 		Level:           "warn",

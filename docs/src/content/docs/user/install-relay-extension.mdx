@@ -5,10 +5,10 @@ description: Load the Pi extension, configure its loopback endpoint and private 
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. Pairing is implemented; authenticated WebSocket connection and messaging are not. A successful pair records this installation's public identity but both model tools remain explicitly disconnected.
+The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. A paired Pi session now authenticates one WebSocket automatically and receives its opaque route address. Roster and delivery are not implemented, so both model tools remain explicitly disconnected.
 
-<Aside type="caution" title="No messaging yet">
-Do not interpret pairing success as an online session. Tickets #11 and later own connection, roster, and delivery behavior. `list_peers` and `agent_send` continue to fail with the stable disconnected error.
+<Aside type="caution" title="Authentication only">
+An `auth_accepted` event means the session proved possession of an allowlisted installation key. It does not enable peer listing or delivery. Tickets #13 and later own those behaviors; `list_peers` and `agent_send` continue to fail with the stable disconnected error.
 </Aside>
 
 ## Requirements
@@ -19,7 +19,7 @@ Do not interpret pairing success as an online session. Tickets #11 and later own
 - A trusted checkout of this repository
 - A running relay and its current operator-only pairing code
 
-Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependency before installation.
+Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and `typebox` v1.3.7 (MIT) for tool schemas.
 
 ## Install from a checkout
 
@@ -50,12 +50,12 @@ Pi extensions execute with the user's full system permissions. Review `extension
 
 | Environment variable | Required | Meaning |
 |---|---|---|
-| `PI_MESSAGING_RELAY_URL` | For pairing | HTTP loopback origin, for example `http://127.0.0.1:43127`. The extension appends `/v1/pair`. |
+| `PI_MESSAGING_RELAY_URL` | For pairing and connection | HTTP loopback origin, for example `http://127.0.0.1:43127`. The extension selects `/v1/pair` or the `/v1/connect` WebSocket. |
 | `PI_MESSAGING_RELAY_STATE_DIR` | No | Installation-key directory. Default: `~/.pi/agent/pi-messaging-relay`. |
 
 The endpoint must be an HTTP origin using a numeric loopback IP. Credentials, extra paths, query strings, fragments, HTTPS, hostnames, and non-loopback addresses fail closed. Use the localhost end of a trusted VPN or SSH forward for cross-machine operation.
 
-The state directory must be owned by the current user with mode `0700`. The extension durably publishes `installation-ed25519.pem` with mode `0600` before contacting the relay, or safely loads an existing Ed25519 PKCS#8 key. The key is installation-wide and independent from future per-session route IDs.
+The state directory must be owned by the current user with mode `0700`. The extension durably publishes `installation-ed25519.pem` with mode `0600` before contacting the relay, or safely loads an existing Ed25519 PKCS#8 key. The key is installation-wide and independent from per-session route IDs. Exactly two connection paths exist: pairing successfully during an already-started session causes one pairing-owned attempt, while pairing before lifecycle begins stores the key and the later `session_start` causes one startup-owned attempt. A missing key leaves startup disconnected without creating state. There is no reconnect or backoff yet.
 
 To isolate a temporary test installation:
 
@@ -107,6 +107,11 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 </Tabs>
 
 <Tabs>
+  <TabItem label="Authenticated session log">
+    ```json
+    {"level":"info","event":"relay_auth_accepted","result":"accepted","address":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","route_id":"01993ca1-1111-7aaa-8aaa-111111111111","client_public_key":"ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E=","nonce":"<redacted>","signature":"<redacted>","private_key":"<redacted>","latency_ms":18}
+    ```
+  </TabItem>
   <TabItem label="Model tool input">
     ```json
     {}
@@ -121,23 +126,26 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 
 ## Security
 
-- The installation private key never leaves the extension directory and never appears in a notification or structured log.
+- The installation private key never leaves the extension directory and never appears in a notification or structured log. WebSocket authentication signs a fresh server nonce; nonce, signature, and private-key log fields always contain `<redacted>`.
 - Pairing-code and private-key log fields retain their names but always contain `<redacted>`.
 - Public key and accepted client ID may appear in logs for support correlation.
 - The extension accepts only an exact 32-character URL-safe code. It rejects malformed or oversized command input locally before creating key state or contacting the relay; an accepted request is 126 bytes, below the 4,096-byte server limit.
 - A syntactically valid code is usable only before its ten-minute deadline and only until its first successful pairing. The exact deadline is expired. Incorrect, expired, and reused codes all receive the same rejection and add no relay allowlist entry.
 - The raw code is present in the localhost request because the relay must verify it. Pairing failure output omits the code entirely, and structured logs use `<redacted>` authentication fields rather than echoing the submitted or current value.
-- The extension reads at most 4,096 response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
+- The extension reads at most 4,096 pairing-response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
+- Its pinned WebSocket client enforces a 16 KiB authentication-message ceiling before complete message delivery. Shutdown requests graceful close for at most one second, then destroys and settles an unresponsive transport.
 - Pairing failures do not invoke a model, inject a Pi message, or silently claim success.
 - Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
 
 ## Troubleshooting
 
-- **`Cannot find module 'typebox'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`.
+- **`Cannot find module 'typebox'` or `Cannot find module 'ws'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`. This local package resolution is required for Nix-installed Pi too.
 - **Command or tools absent** — confirm Pi loaded `extension/index.ts`; retry with the temporary `-e` command above and inspect Pi's extension issues.
 - **Endpoint not configured or invalid** — set `PI_MESSAGING_RELAY_URL` to the exact numeric loopback origin printed in `server_ready`, with no `/v1/pair` suffix.
 - **Unsafe state permissions** — verify the configured path is the intended dedicated key directory, then set its mode to `0700`; set the key file to `0600` only after verifying ownership.
 - **Relay could not be reached** — verify the server is still running at the configured address and the ten-second request deadline was not exceeded.
 - **Pairing code format rejected locally** — paste the exact 32-character URL-safe value with no surrounding whitespace. The extension has not created key state or contacted the relay.
 - **Pairing code rejected by the relay** — the code was incorrect, reached its ten-minute deadline, or was already accepted once; the relay deliberately returns the same message for all three. Obtain a fresh code by restarting the server with a new unused private code-file path.
-- **Pairing succeeded but tools are disconnected** — expected. WebSocket/session authentication is not implemented in this slice.
+- **Authentication rejected after pairing** — confirm Pi still uses the state directory that owns the paired key and the same running relay process. Restart authorization acceptance belongs to ticket #27.
+- **Connection drops after authentication** — the extension remains safely disconnected. Automatic reconnect and backoff belong to ticket #26; start a new Pi session or pair successfully during the current session for the currently supported one-attempt flow.
+- **Pairing and authentication succeeded but tools are disconnected** — expected. Roster and delivery are not implemented in this slice.

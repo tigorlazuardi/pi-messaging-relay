@@ -16,6 +16,8 @@ type Notification = {
   level: string | undefined;
 };
 
+type EventHandler = (event: unknown, context: unknown) => Promise<unknown> | unknown;
+
 export class FakePiHost {
   readonly commands = new Map<string, CommandRegistration>();
   readonly tools = new Map<string, ToolRegistration>();
@@ -24,9 +26,16 @@ export class FakePiHost {
   readonly sendMessageAttempts: unknown[] = [];
   readonly sendUserMessageAttempts: unknown[] = [];
   readonly liveAccessAttempts: string[] = [];
+  readonly events = new Map<string, EventHandler[]>();
+  cwd = "/tmp/fake-pi-session";
 
   readonly api = new Proxy(
     {
+      on: (name: string, handler: EventHandler) => {
+        const handlers = this.events.get(name) ?? [];
+        handlers.push(handler);
+        this.events.set(name, handlers);
+      },
       registerCommand: (name: string, registration: CommandRegistration) => {
         this.registrations.push({ kind: "command", name });
         this.commands.set(name, registration);
@@ -58,6 +67,12 @@ export class FakePiHost {
     const command = this.commands.get(name);
     if (!command) throw new Error(`Command not registered: ${name}`);
     await command.handler(args, this.createContext());
+  }
+
+  async emit(name: string, event: unknown = {}): Promise<void> {
+    for (const handler of this.events.get(name) ?? []) {
+      await handler(event, this.createContext());
+    }
   }
 
   async executeTool(name: string, params: unknown): Promise<unknown> {
@@ -92,7 +107,7 @@ export class FakePiHost {
     );
 
     return new Proxy(
-      { ui },
+      { ui, cwd: this.cwd },
       {
         get: (target, property, receiver) => {
           if (Reflect.has(target, property)) {

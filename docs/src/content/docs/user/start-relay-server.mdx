@@ -53,9 +53,11 @@ Do not paste the code into logs, shell history, chat, issue text, or screenshots
 
 A well-formed incorrect, expired, or already used code receives the same `pairing_code_invalid` rejection and never adds an allowlist entry. The raw submitted code crosses only into the localhost request; the response omits it rather than echoing a redacted copy, while structured logs keep `pairing_code` and `private_key` as `<redacted>`. A wrong code does not consume the current code. Success consumes it and removes the code file. An expired file can remain until shutdown, but its contents no longer authorize pairing; stop and restart the relay with a new unused file path to obtain a fresh code.
 
-Every structured stdout or stderr event has a one-second delivery deadline, and every HTTP response write has a two-second deadline. A stopped log reader or non-reading local client therefore cannot retain request handling indefinitely. If stdout cannot record a settled pairing event, the process stops accepting work, drains for at most five seconds, attempts `server_failed` on stderr, and exits non-zero even when SIGINT or SIGTERM arrives concurrently. An identity already returned as accepted remains in explicit durable state; do not retry it as though acceptance had rolled back.
+Every structured stdout or stderr event has a one-second delivery deadline, and every HTTP response write has a two-second deadline. A stopped log reader or non-reading local client therefore cannot retain request handling indefinitely. If stdout cannot record a settled pairing or authentication event, the process stops accepting work, drains for at most five seconds, attempts `server_failed` on stderr, and exits non-zero even when SIGINT or SIGTERM arrives concurrently. An identity already returned as accepted remains in explicit durable state; do not retry it as though acceptance had rolled back.
 
-Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, response writes to two seconds, and shutdown drain to five seconds.
+`/v1/connect` reserves one of 1,024 tracked session slots before WebSocket upgrade, sends one fresh nonce, and requires signed authentication within five seconds. At capacity, it returns HTTP `503` without upgrading and emits `session_capacity_rejected`. Unknown keys and invalid signatures receive `not_authorized` and a policy close. An active duplicate route UUID or opaque address is rejected; authenticated entries bind the installation key and route UUID without parsing the address. Graceful shutdown force-closes and settles every reserved or upgraded socket before `server_stopped`.
+
+Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, authentication to five seconds, hello frames to 16 KiB, tracked sessions to 1,024, response writes to two seconds, and shutdown drain to five seconds.
 
 ## Select a port
 
@@ -105,7 +107,7 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
   </TabItem>
   <TabItem label="Runtime log timeout">
     ```text
-    {"level":"error","event":"server_failed","reason":"fatal pairing runtime failure: write pair_accepted pairing audit event: write pair_accepted event within 1s: context deadline exceeded\nclose stdout event logger: stop event logger worker within 1s: context deadline exceeded"}
+    {"level":"error","event":"server_failed","reason":"fatal relay runtime failure: write pair_accepted pairing audit event: write pair_accepted event within 1s: context deadline exceeded\nclose stdout event logger: stop event logger worker within 1s: context deadline exceeded"}
     exit code: 1
     ```
   </TabItem>
@@ -116,8 +118,8 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
 - Keep the server listener on `127.0.0.0/8` or `::1`; never place it directly on a LAN or public interface.
 - Keep both state and code-file parent directories owned by the relay operator.
 - Do not weaken `0700` state-directory or `0600` file modes.
-- Structured logs may contain public client IDs and public keys, but pairing-code and private-key fields must remain `<redacted>`.
-- Durable allowlist storage does not yet mean WebSocket authentication or restart restoration is complete; those are tickets #11 and #27.
+- Structured logs may contain public client IDs, public keys, and display route metadata, but pairing-code, nonce, signature, and private-key fields must remain `<redacted>`.
+- Authentication uses the in-memory allowlist loaded by this process. Full child-process restart acceptance remains ticket #27 and is not claimed here.
 
 ## Troubleshooting
 
@@ -129,4 +131,4 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
 - **`remove incomplete pairing code file`** — startup failed after creating the selected private file and could not remove it. Treat that exact path as authentication material, verify it is the intended path, then remove it manually before retrying.
 - **No raw code in stdout** — expected. Read only the exact file passed with `--pairing-code-file`.
 - **No `server_ready` event** — inspect the structured `server_failed` event on stderr. The process exits non-zero when startup cannot complete.
-- **`fatal pairing runtime failure`** — repair or redirect the broken or unread stdout destination before restarting. Preserve the explicit state directory: a client identity already returned with HTTP 201 remains accepted there. If stderr is also blocked, its failure event is bounded and may not reach the operator before exit.
+- **`fatal relay runtime failure`** — a pairing or live-session audit event could not reach stdout. Repair or redirect the broken or unread destination before restarting. Preserve the explicit state directory: a client identity already returned with HTTP 201 remains accepted there. If stderr is also blocked, its failure event is bounded and may not reach the operator before exit.
