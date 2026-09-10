@@ -57,7 +57,9 @@ Every structured stdout or stderr event has a one-second delivery deadline, and 
 
 `/v1/connect` reserves one of 1,024 tracked session slots before WebSocket upgrade, sends one fresh nonce, and requires signed authentication within five seconds. At capacity, it returns HTTP `503` without upgrading and emits `session_capacity_rejected`. Unknown keys and invalid signatures receive `not_authorized` and a policy close. An active duplicate route UUID or opaque address is rejected; authenticated entries bind the installation key and route UUID without parsing the address. Graceful shutdown force-closes and settles every reserved or upgraded socket before `server_stopped`.
 
-Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, authentication to five seconds, hello frames to 16 KiB, tracked sessions to 1,024, response writes to two seconds, and shutdown drain to five seconds.
+After authentication, each complete WebSocket message has a 512 KiB ceiling across all fragments. Only text containing one valid UTF-8 JSON object is accepted. `invalid_frame`, `invalid_envelope`, and `unsupported_protocol` errors set `close: true`; the relay attempts one bounded error response and then hard-closes. A malformed frame may close before an error can be delivered. Operation-level denials are different: they return a normal operation result and keep the session open. Production roster and delivery results remain deferred to tickets #13, #14, and #18, and ticket #24 owns the separate 256 KiB body check.
+
+Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, authentication to five seconds, hello frames to 16 KiB, post-authentication messages to 512 KiB, tracked sessions to 1,024, response writes to two seconds, and shutdown drain to five seconds.
 
 ## Select a port
 
@@ -131,4 +133,8 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
 - **`remove incomplete pairing code file`** — startup failed after creating the selected private file and could not remove it. Treat that exact path as authentication material, verify it is the intended path, then remove it manually before retrying.
 - **No raw code in stdout** — expected. Read only the exact file passed with `--pairing-code-file`.
 - **No `server_ready` event** — inspect the structured `server_failed` event on stderr. The process exits non-zero when startup cannot complete.
+- **`invalid_frame` followed by disconnect** — the client sent binary data, invalid UTF-8, malformed or trailing JSON, or more than 512 KiB in one reassembled message. Fix framing before reconnecting; fragmented messages share the same total ceiling.
+- **`invalid_envelope` followed by disconnect** — the JSON object had duplicate or unknown fields, a missing or mistyped operation field, an invalid UUIDv7, or a server-to-client/unknown type. Do not retry the same envelope unchanged.
+- **`unsupported_protocol` followed by disconnect** — the client's integer protocol major is not `1`. Use a v1-compatible client.
+- **Operation denial without disconnect** — expected for a structurally valid request rejected by an operation handler. The same authenticated socket remains usable.
 - **`fatal relay runtime failure`** — a pairing or live-session audit event could not reach stdout. Repair or redirect the broken or unread destination before restarting. Preserve the explicit state directory: a client identity already returned with HTTP 201 remains accepted there. If stderr is also blocked, its failure event is bounded and may not reach the operator before exit.

@@ -8,10 +8,10 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-This slice implements `/v1/connect` from challenge through welcome. It retains one authenticated socket for the Pi session but does not add roster responses, delivery, reconnect, or restart acceptance.
+This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop. Neither seam adds production roster responses, delivery, reconnect, or restart acceptance.
 
 <Aside type="note" title="Ticket boundaries">
-Ticket #12 owns the complete malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Ticket #13 owns roster behavior. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This seam performs only the strict parsing and bounded reads needed to authenticate safely.
+Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Ticket #13 owns roster behavior. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
 </Aside>
 
 ## Authentication flow

@@ -72,7 +72,7 @@ type welcomePayload struct {
 type websocketErrorEnvelope struct {
 	Version   int                   `json:"v"`
 	Type      string                `json:"type"`
-	RequestID string                `json:"request_id"`
+	RequestID string                `json:"request_id,omitempty"`
 	Payload   websocketErrorPayload `json:"payload"`
 }
 
@@ -215,11 +215,12 @@ func (registry *sessionConnectionRegistry) closeAndWait(ctx context.Context) err
 }
 
 type sessionAuthService struct {
-	pairing     *pairingService
-	connections *sessionConnectionRegistry
-	logger      *eventLogger
-	reportFatal func(error)
-	authTimeout time.Duration
+	pairing           *pairingService
+	connections       *sessionConnectionRegistry
+	logger            *eventLogger
+	reportFatal       func(error)
+	dispatchOperation operationDispatcher
+	authTimeout       time.Duration
 }
 
 func newSessionAuthService(
@@ -229,11 +230,12 @@ func newSessionAuthService(
 	reportFatal func(error),
 ) *sessionAuthService {
 	return &sessionAuthService{
-		pairing:     pairing,
-		connections: connections,
-		logger:      logger,
-		reportFatal: reportFatal,
-		authTimeout: authDeadline,
+		pairing:           pairing,
+		connections:       connections,
+		logger:            logger,
+		reportFatal:       reportFatal,
+		dispatchOperation: noOperationDispatcher,
+		authTimeout:       authDeadline,
 	}
 }
 
@@ -346,14 +348,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	})
 	cancelAuth()
 
-	for {
-		_, _, err := connection.Reader(context.Background())
-		if err != nil {
-			break
-		}
-		_ = connection.CloseNow()
-		break
-	}
+	service.serveAuthenticated(connection, session)
 	service.writeAudit(logEvent{
 		Level:           "info",
 		Event:           "session_disconnected",

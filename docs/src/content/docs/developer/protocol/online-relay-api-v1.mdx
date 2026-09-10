@@ -50,7 +50,17 @@ Every WebSocket text frame is one JSON object:
 - `delivery_id` identifies one server offer to a recipient and is used only for the recipient extension ACK.
 - `body` is either a string or a JSON object. The recipient extension converts an object to canonical compact JSON before Pi injection.
 
-Unknown fields and duplicate JSON keys are rejected. Canonical addresses have the form `<full-cwd>@<hostname>#<uuidv7>`, but clients treat the whole value as opaque and copy it verbatim. Cwd and hostname are display metadata, never authorization inputs. Framing, malformed-envelope, protocol-major, and authentication failures close the socket; operation-level rejection returns a result and preserves the connection.
+Unknown fields are rejected at the envelope and typed-payload levels. Duplicate JSON keys are rejected at every accepted depth, including inside application-owned object bodies, before any map or typed value can erase the ambiguity. JSON is limited to 64 nested object or array containers, counting the outer envelope as depth 1; a container at depth 65 or greater is rejected as `invalid_frame`. Canonical addresses have the form `<full-cwd>@<hostname>#<uuidv7>`, but clients treat the whole value as opaque and copy it verbatim. Cwd and hostname are display metadata, never authorization inputs.
+
+After authentication, the only accepted client-to-server `type` values are `list`, `send`, and `received`. Their payloads are closed objects: `list` is exactly empty; `send` requires `message_id`, `to`, and `body` and permits only optional `re`; and `received` requires exactly `delivery_id` and `message_id`. Every ID is a canonical lowercase UUIDv7. `to` is a non-empty opaque UTF-8 string bounded to the largest server-issued v1 address. `body` is only a JSON string or object. The 512 KiB ceiling applies to the complete reassembled WebSocket message's UTF-8 bytes, whether it arrived in one fragment or many, before JSON decoding. Compression is disabled. Ticket #24 separately owns the 256 KiB serialized-body limit.
+
+A post-authentication parser starts at a message boundary and either dispatches one complete valid operation or enters a terminal protocol-error state. Binary messages, invalid UTF-8, malformed or trailing JSON, and over-limit messages use `invalid_frame`. A syntax-valid value that is not the closed operation envelope, including duplicate or unknown fields and wrong-direction types, uses `invalid_envelope`. An otherwise shaped envelope whose integer major is not `1` uses `unsupported_protocol`. These stable errors have `close: true`; the server makes one bounded best-effort error write and then hard-closes promptly. `request_id` is included only when the complete JSON has exactly one valid top-level request ID that can be recovered without ambiguity. Error messages and logs never include raw frame or body data; logs omit unrecognized submitted types.
+
+Operation-level denial is a different state transition: a structurally valid operation reaches the operation dispatcher, a canonical result may be returned, and the parser returns to the next message boundary without closing. Tickets #13, #14, and #18 own production roster, delivery, and offline outcomes, so the boundary implementation does not invent a temporary result while those handlers remain disconnected.
+
+<Decision title="Fail closed on protocol ambiguity but keep operation denials recoverable" status="accepted">
+Malformed framing or envelope state makes subsequent interpretation unsafe, so one stable error ends the connection. A valid operation with a business denial remains unambiguous and leaves the authenticated session usable.
+</Decision>
 
 ## Pairing and live connection flow
 
@@ -187,6 +197,47 @@ A well-formed incorrect, expired, or already consumed code returns HTTP `401` wi
       "payload": {
         "code": "not_authorized",
         "message": "Client key is not authorized",
+        "close": true
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Invalid envelope">
+    ```json
+    {
+      "v": 1,
+      "type": "error",
+      "request_id": "01993c84-5d38-7d75-8bc1-f945bfa42cdf",
+      "payload": {
+        "code": "invalid_envelope",
+        "message": "Invalid protocol envelope",
+        "close": true
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Invalid frame without safe correlation">
+    ```json
+    {
+      "v": 1,
+      "type": "error",
+      "payload": {
+        "code": "invalid_frame",
+        "message": "Invalid WebSocket frame",
+        "close": true
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Unsupported major">
+    ```json
+    {
+      "v": 1,
+      "type": "error",
+      "request_id": "01993c84-5d38-7d75-8bc1-f945bfa42cdf",
+      "payload": {
+        "code": "unsupported_protocol",
+        "message": "Unsupported protocol version",
         "close": true
       }
     }

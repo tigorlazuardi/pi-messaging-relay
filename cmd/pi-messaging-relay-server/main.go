@@ -34,6 +34,9 @@ type logEvent struct {
 	StateDir        string `json:"state_dir,omitempty"`
 	Result          string `json:"result,omitempty"`
 	Reason          string `json:"reason,omitempty"`
+	Code            string `json:"code,omitempty"`
+	Type            string `json:"type,omitempty"`
+	RequestID       string `json:"request_id,omitempty"`
 	PairingCode     string `json:"pairing_code,omitempty"`
 	PrivateKey      string `json:"private_key,omitempty"`
 	ClientPublicKey string `json:"client_public_key,omitempty"`
