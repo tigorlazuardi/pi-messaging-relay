@@ -20,12 +20,14 @@ import (
 const acceptanceTimeout = 10 * time.Second
 
 type processEvent struct {
-	Level    string `json:"level"`
-	Event    string `json:"event"`
-	Address  string `json:"address"`
-	StateDir string `json:"state_dir"`
-	Result   string `json:"result"`
-	Reason   string `json:"reason"`
+	Level       string `json:"level"`
+	Event       string `json:"event"`
+	Address     string `json:"address"`
+	StateDir    string `json:"state_dir"`
+	Result      string `json:"result"`
+	Reason      string `json:"reason"`
+	PairingCode string `json:"pairing_code"`
+	PrivateKey  string `json:"private_key"`
 }
 
 func TestRelayProcessLifecycle(t *testing.T) {
@@ -126,6 +128,13 @@ func assertGracefulLifecycle(t *testing.T, binary string, terminationSignal os.S
 	}
 	if ready.Level != "info" || ready.Event != "server_ready" {
 		t.Fatalf("unexpected readiness event: %+v", ready)
+	}
+	pairingCreated := readEvent(t, scanner, acceptanceTimeout)
+	if pairingCreated.Level != "info" || pairingCreated.Event != "pairing_code_created" {
+		t.Fatalf("unexpected pairing-code lifecycle event: %+v", pairingCreated)
+	}
+	if pairingCreated.PairingCode != "<redacted>" || pairingCreated.PrivateKey != "<redacted>" {
+		t.Fatalf("pairing-code lifecycle event did not redact authentication fields: %+v", pairingCreated)
 	}
 	host, _, err := net.SplitHostPort(ready.Address)
 	if err != nil {

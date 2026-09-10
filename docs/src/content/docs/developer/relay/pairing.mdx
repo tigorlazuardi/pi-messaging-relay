@@ -1,0 +1,112 @@
+---
+title: Installation pairing seam
+description: How one relay startup code authorizes one Ed25519 extension installation through the real HTTP boundary.
+status: accepted
+date: 2026-09-10
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Decision from '../../../../components/Decision.astro';
+
+This slice implements trust bootstrap only: a real `/relay-pair CODE` command calls `POST /v1/pair`, and the relay persists the accepted installation's public identity. It does not open a WebSocket, authenticate a session, restore authorization after restart, or enable either model tool.
+
+<Aside type="note" title="Ticket boundaries">
+Ticket #10 owns deterministic invalid, expired, and reused-code behavior coverage. Ticket #11 owns nonce/signature WebSocket authentication. Ticket #27 owns restart restoration acceptance. This slice includes only fail-closed rejection plumbing and the minimum successful-code consumption needed to prevent two success owners.
+</Aside>
+
+## Startup code ownership
+
+Every process generates 24 cryptographically random bytes and encodes them as exactly 32 URL-safe Base64 characters with a fixed ten-minute lifetime. A raw code is never written to stdout, stderr, a structured log, or server state. The operator must deliberately provide `--pairing-code-file PATH`; the server exclusively creates that file with mode `0600`, refuses to overwrite an existing path, and removes it after successful pairing or process shutdown. If write, fsync, or close fails after creation, the server closes and removes the incomplete file; an unlink failure is joined to the primary contextual startup error without exposing the code.
+
+Normal stdout remains one JSON object per line. `server_ready` is still first, followed by `pairing_code_created`. Authentication fields named `pairing_code` and `private_key` contain the literal `<redacted>` marker.
+
+<Decision title="Use an explicit private file as the operator code channel" status="accepted">
+A startup flag makes disclosure deliberate and testable without mixing raw authentication material into the structured lifecycle stream. Exclusive creation protects an operator-owned path from silent overwrite, and joined incomplete-file cleanup errors tell the operator when residual authentication material needs manual handling.
+</Decision>
+
+## HTTP trust boundary
+
+`POST /v1/pair` accepts at most 4,096 bytes with media type `application/json`. Its top-level object is closed and contains exactly two string fields: `pairing_code` and `client_public_key`. Unknown fields, duplicate fields, missing fields, wrong types, malformed JSON, trailing JSON, oversized input, and invalid public keys fail before allowlist mutation.
+
+Before state-directory or key work, the extension measures the raw `/relay-pair` argument as UTF-8 and requires the exact 32-character URL-safe syntax. With the fixed 52-character public-key spelling and closed JSON shape, every accepted extension request is exactly 126 UTF-8 bytes, safely within the server ceiling. Local format rejection does not decide whether a well-formed code is invalid, expired, or reused; those acceptance cases remain ticket #10.
+
+The public key spelling is `ed25519:<base64>`, where `<base64>` is canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. A successful request returns HTTP `201` with one client identity: `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes. Every HTTP response write has a two-second deadline.
+
+<Decision title="Bound pairing HTTP work before code ownership" status="accepted">
+The relay bounds and closes the request before comparing authentication material or mutating state, then bounds its tiny response write to two seconds. Pairing-code comparison is constant-time for equal-length values, and persistence completes before the code is consumed.
+</Decision>
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Request">
+    ```http
+    POST /v1/pair HTTP/1.1
+    Content-Type: application/json
+
+    {"pairing_code":"<REDACTED>","client_public_key":"ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E="}
+    ```
+  </TabItem>
+  <TabItem label="Response 201">
+    ```http
+    HTTP/1.1 201 Created
+    Content-Type: application/json
+
+    {"client_id":"cli_tkPj7VgbR2HdLQyH"}
+    ```
+  </TabItem>
+  <TabItem label="Invalid key response">
+    ```http
+    HTTP/1.1 400 Bad Request
+    Content-Type: application/json
+
+    {"error":"invalid_client_public_key","message":"client_public_key must be an Ed25519 public key encoded as ed25519:<base64>"}
+    ```
+  </TabItem>
+  <TabItem label="Local malformed command">
+    ```text
+    /relay-pair short
+    Pairing failed: code must contain exactly 32 URL-safe characters.
+    ```
+  </TabItem>
+</Tabs>
+
+## Allowlist state
+
+The existing default remains temporary: without `--state-dir`, the process creates and removes its unique temporary directory. Supplying `--state-dir PATH` explicitly selects durable state. The directory must be mode `0700`; unsafe existing paths fail startup. When the server creates this directory, it fsyncs the parent before reporting readiness or accepting pairing. `allowlist.json` is mode `0600`; success requires file fsync, atomic rename, and state-directory fsync.
+
+The allowlist contains only a format version and client entries with `client_id`, `client_public_key`, and `paired_at`. It never contains a pairing code, private key, message body, pending send, dedupe record, or offline inbox.
+
+<Decision title="Make durable server state opt-in" status="accepted">
+The lifecycle established by ticket #7 remains temporary by default. Pairing operators opt into retention with one explicit directory flag. A newly created directory entry and each allowlist replacement cross their filesystem durability boundaries before HTTP success, without claiming ticket #27 restart authentication.
+</Decision>
+
+## Extension key state
+
+The extension reads `PI_MESSAGING_RELAY_URL` as an HTTP loopback origin and posts to `/v1/pair`. It rejects credentials, paths, query strings, fragments, non-HTTP schemes, hostnames, and non-loopback IPs. `PI_MESSAGING_RELAY_STATE_DIR` optionally selects the installation state directory; the default is `~/.pi/agent/pi-messaging-relay`.
+
+The state directory must be owned by the current user with mode `0700`. When recursive path components are missing, the extension fsyncs each containing directory after creation. It publishes `installation-ed25519.pem` through a mode-`0600` temporary file and hard link, removes the temporary name, then fsyncs the state directory before any HTTP POST. Existing keys are current-user regular files with mode `0600` and valid Ed25519 PKCS#8 content; their containing directory is also synced before submission.
+
+The package entry default export accepts exactly one `ExtensionAPI` argument. Durability tests import the clearly internal async-scoped observer from `extension/internal/directory-durability.ts`; production callers cannot inject behavior through the Pi factory, and observer state cannot escape the wrapped command execution.
+
+The extension accepts a response only when its media type is exactly `application/json` with an optional UTF-8 charset, its UTF-8 body is at most 4,096 bytes, and its fixed string-object shape has no duplicate, unknown, missing, nonstring, or trailing members. A 201 identity must match the server's `cli_` plus 16-character token syntax. Only the derived raw public key crosses HTTP. The private key is never returned, notified, or logged.
+
+<Decision title="Make key durability precede trust submission" status="accepted">
+One installation key is shared across Pi sessions and survives extension reloads. Filesystem state avoids model context and Pi runtime imports, while directory fsync ordering prevents the server from accepting a public identity whose local private-key name was not durably published.
+</Decision>
+
+## Evidence and telemetry
+
+The extension success notification names the accepted `client_id`. Server and extension operation logs include result, latency, public key, and client ID where available. Authentication field names remain present with `<redacted>` values. The accepted v1 observability contract selects structured logs only; it does not add an OpenTelemetry exporter, metrics endpoint, or public health API.
+
+Each event sink owns exactly one writer worker. Calls cross an unbuffered handoff and wait for a per-event acknowledgement for at most one second, so concurrent handlers cannot build an event queue or one writer goroutine each. The worker serializes successful events in receive order and writes each handed-off event exactly once. Startup, pairing audit, graceful-stop, and stderr failure events all use this bound.
+
+A writer call is not cancellable through Go's `io.Writer` contract. If external stdout or stderr never returns, logger close waits one additional second, preserves a close-deadline error, and lets process exit proceed without waiting for that worker. The operating system then discards the blocked worker with the process. Deterministic tests release their blocking writer after the boundary assertion and verify the owned worker can finish.
+
+A pairing audit error is stored in a concurrency-safe, first-error terminal latch before its notification channel closes. If cancellation wins the initial select, main rechecks the latch after HTTP drain and before `server_stopped`; a concurrent fatal audit can therefore never become a successful exit. If stdout stalls after durable acceptance, the one-second audit deadline still leaves one second under the response write deadline for the handler to return the already-owned `client_id`. The server retains explicit durable state without rollback and attempts `server_failed` through the separately bounded stderr sink. Rejection and pairing-code cleanup audit failures use the same route.
+
+<Decision title="Bound audit delivery and latch its first failure" status="accepted">
+Authorization mutation without its settled audit event is an unhealthy runtime, not a recoverable logging omission. One worker per sink preserves ordering without an unbounded queue; one-second handoff/acknowledgement and close bounds prevent handlers or process exit from waiting forever. A queryable first-error latch gives audit failure precedence over concurrent termination while preserving an already-accepted identity.
+</Decision>
+
+The primary Node acceptance test builds and starts the real Go child on an ephemeral loopback port, reads the raw code from the explicit private channel, invokes the real command through the strict fake Pi host, and verifies both private key and allowlist security boundaries. Focused command tests reject malformed and over-limit code arguments before key work, inject a post-fsync failure to prove no HTTP submission can precede durable key publication, and reject duplicate response keys, malformed media types, and invalid identity tokens. Server tests inject parent-sync failures, block startup and stderr sinks, settle four concurrent malformed-request handlers under one blocked worker, and hold a post-persistence accepted audit through its deadline while preserving HTTP 201. A separate one-shot accepted-audit failure cancels the injected termination context and proves the terminal latch wins the race. Tests also use a non-reading in-memory connection to prove response write-deadline release. Child cleanup has independent three-second SIGTERM and SIGKILL waits with captured-output diagnostics.

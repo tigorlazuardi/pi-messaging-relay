@@ -1,14 +1,14 @@
 ---
-title: Install the disconnected relay extension
-description: Load the current Pi extension shell safely and understand its pairing and messaging limitations.
+title: Install and pair the relay extension
+description: Load the Pi extension, configure its loopback endpoint and private key directory, and pair one installation safely.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The current extension is a disconnected shell for validating the Pi command and tool surface. It does not pair with or connect to the relay server yet.
+The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. Pairing is implemented; authenticated WebSocket connection and messaging are not. A successful pair records this installation's public identity but both model tools remain explicitly disconnected.
 
-<Aside type="caution" title="No messaging in this release">
-`/relay-pair`, `list_peers`, and `agent_send` are visible after loading, but every operation remains disconnected. The command does not accept or persist a key, and no message is sent.
+<Aside type="caution" title="No messaging yet">
+Do not interpret pairing success as an online session. Tickets #11 and later own connection, roster, and delivery behavior. `list_peers` and `agent_send` continue to fail with the stable disconnected error.
 </Aside>
 
 ## Requirements
@@ -17,10 +17,11 @@ The current extension is a disconnected shell for validating the Pi command and 
 - Node.js 24 or newer
 - npm
 - A trusted checkout of this repository
+- A running relay and its current operator-only pairing code
 
 Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependency before installation.
 
-## Try from a checkout
+## Install from a checkout
 
 <Steps>
 1. Install the extension's local runtime dependency from the lockfile:
@@ -29,20 +30,41 @@ Pi extensions execute with the user's full system permissions. Review `extension
    $ npm --prefix extension ci
    ```
 
-2. Load only this extension for one Pi invocation:
+2. Load only this extension for one Pi invocation, replacing the example address with the relay's `server_ready.address`:
 
    ```console
-   $ pi --no-extensions -e ./extension/index.ts
+   $ PI_MESSAGING_RELAY_URL=http://127.0.0.1:43127 \
+       pi --no-extensions -e ./extension/index.ts
    ```
 
-3. In Pi, run the pairing command with a redacted placeholder:
+3. In Pi, enter the current 32-character URL-safe code obtained from the server's private operator channel:
 
    ```text
-   /relay-pair <REDACTED>
+   /relay-pair CODE
    ```
+
+4. Confirm Pi reports the accepted public client identity. Do not copy the raw code into diagnostics.
 </Steps>
 
-Loading the shell does not require a running relay server or configured model. TypeBox is installed beneath `extension/node_modules/`, so a Nix-installed Pi does not need to resolve that runtime import from Pi's internal package tree.
+## Configuration
+
+| Environment variable | Required | Meaning |
+|---|---|---|
+| `PI_MESSAGING_RELAY_URL` | For pairing | HTTP loopback origin, for example `http://127.0.0.1:43127`. The extension appends `/v1/pair`. |
+| `PI_MESSAGING_RELAY_STATE_DIR` | No | Installation-key directory. Default: `~/.pi/agent/pi-messaging-relay`. |
+
+The endpoint must be an HTTP origin using a numeric loopback IP. Credentials, extra paths, query strings, fragments, HTTPS, hostnames, and non-loopback addresses fail closed. Use the localhost end of a trusted VPN or SSH forward for cross-machine operation.
+
+The state directory must be owned by the current user with mode `0700`. The extension durably publishes `installation-ed25519.pem` with mode `0600` before contacting the relay, or safely loads an existing Ed25519 PKCS#8 key. The key is installation-wide and independent from future per-session route IDs.
+
+To isolate a temporary test installation:
+
+```console
+$ install -d -m 700 /tmp/my-relay-extension-state
+$ PI_MESSAGING_RELAY_STATE_DIR=/tmp/my-relay-extension-state \
+    PI_MESSAGING_RELAY_URL=http://127.0.0.1:43127 \
+    pi --no-extensions -e ./extension/index.ts
+```
 
 ## Install as a local Pi package
 
@@ -52,9 +74,7 @@ After `npm --prefix extension ci`, add the extension directory to user settings:
 $ pi install "$PWD/extension"
 ```
 
-Pi reads the package manifest and loads `extension/index.ts` in future sessions. Use `pi list` to inspect the configured package. The local-path installation references this checkout rather than copying it, so keep the checkout and its installed dependency available.
-
-## Current behavior
+Pi reads the package manifest and loads `extension/index.ts` in future sessions. Set `PI_MESSAGING_RELAY_URL` in the environment that launches Pi. The local-path installation references this checkout rather than copying it, so keep the checkout and its installed dependency available.
 
 ### I/O examples
 
@@ -64,9 +84,19 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
     /relay-pair <REDACTED>
     ```
   </TabItem>
-  <TabItem label="Visible notification">
+  <TabItem label="Success notification">
     ```text
-    Pairing unavailable: no pairing occurred and the relay remains disconnected. Install a relay-enabled release before retrying.
+    Relay pairing accepted client identity cli_tkPj7VgbR2HdLQyH.
+    ```
+  </TabItem>
+  <TabItem label="Missing config">
+    ```text
+    Pairing failed: set PI_MESSAGING_RELAY_URL to the relay loopback origin, then retry /relay-pair CODE.
+    ```
+  </TabItem>
+  <TabItem label="Malformed code">
+    ```text
+    Pairing failed: code must contain exactly 32 URL-safe characters.
     ```
   </TabItem>
 </Tabs>
@@ -79,20 +109,28 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
   </TabItem>
   <TabItem label="list_peers error">
     ```text
-    Relay is disconnected. /relay-pair is unavailable in this shell; install a relay-enabled release before retrying.
+    Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
     ```
   </TabItem>
 </Tabs>
 
-`agent_send` produces the same error. It never returns `received`, `denied`, or `timeout` while this disconnected shell is installed. An empty peer list would incorrectly imply a successful connected query, so `list_peers` also fails explicitly.
+## Security
 
-## Security and telemetry
-
-The shell does not create keys, persist pairing data, contact an endpoint, open a WebSocket, or inject a message into Pi. Failed operations emit structured warnings containing only the operation and stable reason. Pairing command text and message bodies are not logged.
+- The installation private key never leaves the extension directory and never appears in a notification or structured log.
+- Pairing-code and private-key log fields retain their names but always contain `<redacted>`.
+- Public key and accepted client ID may appear in logs for support correlation.
+- The extension accepts only an exact 32-character URL-safe code. It rejects malformed or oversized command input locally before creating key state or contacting the relay; an accepted request is 126 bytes, below the 4,096-byte server limit.
+- The extension reads at most 4,096 response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
+- Pairing failures do not invoke a model, inject a Pi message, or silently claim success.
+- Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
 
 ## Troubleshooting
 
 - **`Cannot find module 'typebox'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`.
 - **Command or tools absent** — confirm Pi loaded `extension/index.ts`; retry with the temporary `-e` command above and inspect Pi's extension issues.
-- **Pairing remains unavailable** — expected for this shell. Starting the lifecycle-only Go server does not enable pairing or connection.
-- **Need to send a message** — no workaround exists in this release; install a future relay-enabled extension release when one is available.
+- **Endpoint not configured or invalid** — set `PI_MESSAGING_RELAY_URL` to the exact numeric loopback origin printed in `server_ready`, with no `/v1/pair` suffix.
+- **Unsafe state permissions** — verify the configured path is the intended dedicated key directory, then set its mode to `0700`; set the key file to `0600` only after verifying ownership.
+- **Relay could not be reached** — verify the server is still running at the configured address and the ten-second request deadline was not exceeded.
+- **Pairing code format rejected locally** — paste the exact 32-character URL-safe value with no surrounding whitespace. The extension has not created key state or contacted the relay.
+- **Pairing code rejected by the relay** — obtain the current code through the server's private operator channel. Detailed invalid, expired, and reuse acceptance behavior remains ticket #10.
+- **Pairing succeeded but tools are disconnected** — expected. WebSocket/session authentication is not implemented in this slice.

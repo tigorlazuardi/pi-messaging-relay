@@ -8,6 +8,6 @@ sidebar:
 
 This namespace documents the service from an operator's and user's perspective.
 
-Use **[Start the relay server](./start-relay-server/)** to build the Go process, select a loopback port, observe readiness, and stop it cleanly.
+Use **[Start and configure the relay server](./start-relay-server/)** to build the Go process, select a loopback port, choose temporary or durable allowlist state, and obtain a startup code through a private operator file.
 
-Use **[Install the disconnected relay extension](./install-relay-extension/)** to load the current Pi command and model-tool shell from a trusted checkout. The shell exposes `/relay-pair`, `list_peers`, and `agent_send`, but pairing, connection, and messaging are not implemented yet.
+Use **[Install and pair the relay extension](./install-relay-extension/)** to configure the loopback endpoint and establish one Ed25519 installation identity with `/relay-pair CODE`. The extension still leaves `list_peers` and `agent_send` disconnected until authenticated WebSocket work lands.

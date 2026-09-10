@@ -6,9 +6,10 @@ import { Value } from "typebox/value";
 import { FakePiHost } from "./fake-pi-host.ts";
 
 const EXPECTED_DISCONNECTED_ERROR =
-  "Relay is disconnected. /relay-pair is unavailable in this shell; install a relay-enabled release before retrying.";
-const EXPECTED_PAIRING_UNAVAILABLE =
-  "Pairing unavailable: no pairing occurred and the relay remains disconnected. Install a relay-enabled release before retrying.";
+  "Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.";
+const EXPECTED_PAIRING_UNCONFIGURED =
+  "Pairing failed: set PI_MESSAGING_RELAY_URL to the relay loopback origin, then retry /relay-pair CODE.";
+const VALID_PAIRING_CODE = "0123456789abcdefghijklmnopqrstuv";
 
 async function loadRelayExtension() {
   return (await import("../index.ts")).default;
@@ -91,15 +92,18 @@ test("loads and runs disconnected handlers without starting resources", { concur
   const resourceAttempts: string[] = [];
   const restoreResources = installResourceGuards(resourceAttempts);
   const logs = captureStructuredErrors();
+  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
+  delete process.env.PI_MESSAGING_RELAY_URL;
 
   try {
     const extensionUrl = new URL("../index.ts", import.meta.url);
     extensionUrl.searchParams.set("resource-guard", randomUUID());
     const relayExtension = (await import(extensionUrl.href)).default;
+    assert.equal(relayExtension.length, 1);
 
     const result = relayExtension(host.api as never);
     assert.equal(result, undefined);
-    await host.executeCommand("relay-pair", "sensitive-pairing-code");
+    await host.executeCommand("relay-pair", VALID_PAIRING_CODE);
     await assert.rejects(host.executeTool("list_peers", {}), {
       name: "Error",
       message: EXPECTED_DISCONNECTED_ERROR,
@@ -116,6 +120,8 @@ test("loads and runs disconnected handlers without starting resources", { concur
       logs.restore();
     } finally {
       restoreResources();
+      if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
+      else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
     }
   }
 
@@ -127,13 +133,13 @@ test("loads and runs disconnected handlers without starting resources", { concur
   assert.deepEqual([...host.commands.keys()], ["relay-pair"]);
   assert.deepEqual([...host.tools.keys()], ["list_peers", "agent_send"]);
   assert.deepEqual(host.notifications, [
-    { message: EXPECTED_PAIRING_UNAVAILABLE, level: "error" },
+    { message: EXPECTED_PAIRING_UNCONFIGURED, level: "error" },
   ]);
   assert.deepEqual(resourceAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);
   assert.deepEqual(host.sendMessageAttempts, []);
   assert.deepEqual(host.sendUserMessageAttempts, []);
-  assert.equal(logs.lines.some((line) => line.includes("sensitive-pairing-code")), false);
+  assert.equal(logs.lines.some((line) => line.includes(VALID_PAIRING_CODE)), false);
   assert.equal(logs.lines.some((line) => line.includes("sensitive-message-body")), false);
 });
 
@@ -167,32 +173,42 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: null }), false);
 });
 
-test("relay-pair reports that pairing did not occur without injection", { concurrency: false }, async () => {
+test("relay-pair fails closed when endpoint configuration is absent", { concurrency: false }, async () => {
+  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
+  delete process.env.PI_MESSAGING_RELAY_URL;
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
   relayExtension(host.api as never);
   const logs = captureStructuredErrors();
 
   try {
-    await host.executeCommand("relay-pair", "sensitive-pairing-code");
+    await host.executeCommand("relay-pair", VALID_PAIRING_CODE);
   } finally {
     logs.restore();
+    if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
+    else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
   }
 
   assert.deepEqual(host.notifications, [
-    { message: EXPECTED_PAIRING_UNAVAILABLE, level: "error" },
+    { message: EXPECTED_PAIRING_UNCONFIGURED, level: "error" },
   ]);
   assert.deepEqual(host.sendMessageAttempts, []);
   assert.deepEqual(host.sendUserMessageAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);
   assert.equal(logs.lines.length, 1);
-  assert.deepEqual(JSON.parse(logs.lines[0]), {
+  const event = JSON.parse(logs.lines[0]);
+  assert.deepEqual({ ...event, latency_ms: 0 }, {
     level: "warn",
-    event: "relay_operation_failed",
+    event: "relay_pair_rejected",
     operation: "relay-pair",
-    reason: "not_implemented",
+    result: "rejected",
+    reason: "endpoint_not_configured",
+    pairing_code: "<redacted>",
+    private_key: "<redacted>",
+    latency_ms: 0,
   });
-  assert.equal(logs.lines[0].includes("sensitive-pairing-code"), false);
+  assert.equal(typeof event.latency_ms, "number");
+  assert.equal(logs.lines[0].includes(VALID_PAIRING_CODE), false);
 });
 
 test("both tools fail through Pi's thrown-error path while disconnected", { concurrency: false }, async () => {

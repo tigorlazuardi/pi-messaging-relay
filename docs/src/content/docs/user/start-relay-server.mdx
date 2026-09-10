@@ -1,11 +1,11 @@
 ---
-title: Start the relay server
-description: Build and run the Go relay on a loopback-only selected or ephemeral port, then stop it cleanly.
+title: Start and configure the relay server
+description: Build the loopback relay, choose temporary or durable allowlist state, and disclose a startup code through a private operator file.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The current relay process provides the local server lifecycle boundary. Pairing, extension connections, and message routing are not available in this slice.
+The relay binds only to a loopback IP literal. Each startup creates one cryptographically random pairing code with a ten-minute lifetime. The raw code is available only when you explicitly select a private file; normal JSON logs always show `<redacted>`.
 
 ## Build and start
 
@@ -17,73 +17,105 @@ The current relay process provides the local server lifecycle boundary. Pairing,
    $ go build -o bin/pi-messaging-relay-server ./cmd/pi-messaging-relay-server
    ```
 
-2. Start it on an operating-system-selected loopback port:
+2. Create a private durable state directory if paired installations must remain recorded after shutdown:
 
    ```console
-   $ ./bin/pi-messaging-relay-server
+   $ install -d -m 700 "$HOME/.local/state/pi-messaging-relay"
    ```
 
-3. Read the `address` field from the `server_ready` JSON line:
+3. In the server terminal, choose a pairing-code path that does not already exist and start on an operating-system-selected port:
 
-   ```json
-   {"level":"info","event":"server_ready","address":"127.0.0.1:43127","state_dir":"/tmp/pi-messaging-relay-2486170958"}
+   ```console
+   $ ./bin/pi-messaging-relay-server \
+       --state-dir "$HOME/.local/state/pi-messaging-relay" \
+       --pairing-code-file "$HOME/.local/state/pi-messaging-relay/pairing-code"
    ```
+
+4. Read the `address` field from the first `server_ready` JSON line. The next `pairing_code_created` line confirms code creation but contains only redacted authentication fields.
+
+5. In a second trusted terminal, read the exact code file named in step 3, use it once with `/relay-pair CODE`, then confirm the server removed the file after acceptance.
 </Steps>
 
-The readiness line means the listener exists and the selected address is available to local clients. Port `0` in the default `127.0.0.1:0` asks the operating system to choose an unused port.
+<Aside type="caution" title="Treat the code file as authentication material">
+Do not paste the code into logs, shell history, chat, issue text, or screenshots. The server creates the selected path with mode `0600` and refuses to overwrite an existing file. It removes its own file after successful pairing or normal shutdown.
+</Aside>
+
+## State choices
+
+| Flag | Behavior |
+|---|---|
+| Omit `--state-dir` | Create unique temporary state and remove it on graceful shutdown, preserving the original default lifecycle. |
+| `--state-dir PATH` | Create or use a mode-`0700` durable directory and retain `allowlist.json` after shutdown. |
+| Omit `--pairing-code-file` | Generate a code but do not disclose its raw value. Pairing cannot be completed from that startup. |
+| `--pairing-code-file PATH` | Exclusively create a mode-`0600` operator channel containing the current raw code. |
+
+`allowlist.json` is mode `0600`. It stores client ID, Ed25519 public key, and pairing time only. It does not contain raw pairing codes, private keys, messages, pending sends, or replay data. New durable state is committed before readiness, and an allowlist update is committed before HTTP success.
+
+Every structured stdout or stderr event has a one-second delivery deadline, and every HTTP response write has a two-second deadline. A stopped log reader or non-reading local client therefore cannot retain request handling indefinitely. If stdout cannot record a settled pairing event, the process stops accepting work, drains for at most five seconds, attempts `server_failed` on stderr, and exits non-zero even when SIGINT or SIGTERM arrives concurrently. An identity already returned as accepted remains in explicit durable state; do not retry it as though acceptance had rolled back.
+
+Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, response writes to two seconds, and shutdown drain to five seconds.
 
 ## Select a port
 
 Pass a loopback IP literal and port with `--listen`:
 
 ```console
-$ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080
+$ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080 --pairing-code-file /private/path/new-code-file
 ```
 
-IPv6 loopback is also accepted, for example `--listen '[::1]:8080'`. Hostnames such as `localhost`, wildcard addresses such as `0.0.0.0`, and non-loopback IPs are rejected. This prevents the process from being exposed to another host by a listen-address mistake.
+IPv6 loopback is also accepted, for example `--listen '[::1]:8080'`. Hostnames such as `localhost`, wildcard addresses such as `0.0.0.0`, and non-loopback IPs are rejected.
 
 <Aside type="caution" title="Local transport only">
-Do not treat this process as a public internet endpoint. Built-in TLS and public listener support are outside relay v1. Use only the loopback boundary described here.
+Do not treat this process as a public internet endpoint. Built-in TLS and public listener support are outside relay v1. Cross-machine operators must provide a trusted VPN or SSH loopback forward.
 </Aside>
 
 ## Stop cleanly
 
-Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process supervisor. A successful stop prints:
-
-```json
-{"level":"info","event":"server_stopped","address":"127.0.0.1:43127","result":"graceful"}
-```
-
-The process stops accepting connections, releases its listener, removes its process-specific temporary state directory, and exits with code `0`. A forced kill or machine failure cannot run this cleanup.
+Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process supervisor. A successful stop releases the listener, removes temporary state, retains explicit durable state, removes the startup code file, and exits with code `0`.
 
 ### I/O examples
 
 <Tabs>
-  <TabItem label="Selected port input">
+  <TabItem label="Startup input">
     ```console
-    $ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080
+    $ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080 --state-dir /home/operator/.local/state/pi-messaging-relay --pairing-code-file /home/operator/.local/state/pi-messaging-relay/pairing-code
     ```
   </TabItem>
-  <TabItem label="Ready output">
+  <TabItem label="Startup output">
     ```json
-    {"level":"info","event":"server_ready","address":"127.0.0.1:8080","state_dir":"/tmp/pi-messaging-relay-2486170958"}
-    ```
-  </TabItem>
-  <TabItem label="Rejected input">
-    ```console
-    $ ./bin/pi-messaging-relay-server --listen 0.0.0.0:8080
+    {"level":"info","event":"server_ready","address":"127.0.0.1:8080","state_dir":"/home/operator/.local/state/pi-messaging-relay"}
+    {"level":"info","event":"pairing_code_created","pairing_code":"<redacted>","private_key":"<redacted>","expires_at":"2026-09-10T14:10:00Z"}
     ```
   </TabItem>
   <TabItem label="Failure output">
     ```text
-    {"level":"error","event":"server_failed","reason":"listen address must use a loopback IP literal"}
+    {"level":"error","event":"server_failed","reason":"create pairing code file without overwrite: open /home/operator/.local/state/pi-messaging-relay/pairing-code: file exists"}
+    exit code: 1
+    ```
+  </TabItem>
+  <TabItem label="Runtime log timeout">
+    ```text
+    {"level":"error","event":"server_failed","reason":"fatal pairing runtime failure: write pair_accepted pairing audit event: write pair_accepted event within 1s: context deadline exceeded\nclose stdout event logger: stop event logger worker within 1s: context deadline exceeded"}
     exit code: 1
     ```
   </TabItem>
 </Tabs>
 
+## Security checks
+
+- Keep the server listener on `127.0.0.0/8` or `::1`; never place it directly on a LAN or public interface.
+- Keep both state and code-file parent directories owned by the relay operator.
+- Do not weaken `0700` state-directory or `0600` file modes.
+- Structured logs may contain public client IDs and public keys, but pairing-code and private-key fields must remain `<redacted>`.
+- Durable allowlist storage does not yet mean WebSocket authentication or restart restoration is complete; those are tickets #11 and #27.
+
 ## Troubleshooting
 
 - **`listen: bind: address already in use`** — choose another fixed port or use port `0`.
 - **`listen address must use a loopback IP literal`** — use `127.0.0.1` or `::1`, not a hostname, wildcard, LAN, or public address.
+- **`durable state directory must be ... 0700`** — make the dedicated directory private with `chmod 700 PATH`, after verifying it is the intended relay directory.
+- **Pairing-code file exists** — choose a different new path. The server intentionally never overwrites an existing file.
+- **`remove incomplete pairing code file`** — startup failed after creating the selected private file and could not remove it. Treat that exact path as authentication material, verify it is the intended path, then remove it manually before retrying.
+- **No raw code in stdout** — expected. Read only the exact file passed with `--pairing-code-file`.
 - **No `server_ready` event** — inspect the structured `server_failed` event on stderr. The process exits non-zero when startup cannot complete.
+- **`fatal pairing runtime failure`** — repair or redirect the broken or unread stdout destination before restarting. Preserve the explicit state directory: a client identity already returned with HTTP 201 remains accepted there. If stderr is also blocked, its failure event is bounded and may not reach the operator before exit.

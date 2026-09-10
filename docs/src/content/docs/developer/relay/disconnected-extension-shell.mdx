@@ -1,6 +1,6 @@
 ---
-title: Disconnected Pi extension shell
-description: Registration, fake-host, failure, and dependency boundaries for the relay command and two model tools before pairing exists.
+title: Pi extension shell
+description: Registration, pairing-command, fake-host, and disconnected model-tool boundaries for the relay extension.
 status: accepted
 date: 2026-09-10
 ---
@@ -8,10 +8,10 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The extension package in `extension/` establishes the Pi-facing surface without implementing a relay client. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
+The extension package in `extension/` establishes the Pi-facing surface. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
 
-<Aside type="note" title="Disconnected slice only">
-Pairing, keys, connection state, WebSockets, routing, delivery, reconnect, and persistence are not part of this shell. Loading or invoking it requires no relay server and no model call.
+<Aside type="note" title="Pairing only">
+The command now performs installation pairing and persists an extension-local Ed25519 private key. Connection state, WebSockets, session authentication, routing, delivery, and reconnect are not implemented. Loading the factory still requires no relay server and no model call.
 </Aside>
 
 ## Registration boundary
@@ -24,7 +24,7 @@ flowchart LR
     S --> D[Return disconnected]
 ```
 
-The synchronous factory performs registration only. It does not subscribe to lifecycle events, start timers, open sockets, call `fetch`, inspect a model, or inject session content.
+The synchronous factory performs registration only. It does not subscribe to lifecycle events, start timers, open sockets, call `fetch`, inspect a model, or inject session content. Only an explicit `/relay-pair CODE` invocation performs bounded file and HTTP work.
 
 <Decision title="Keep the initial factory inert" status="accepted">
 The shell cannot start a resource that outlives a Pi invocation which only loads extensions. A later connection ticket must choose an explicit runtime lifecycle and shutdown owner rather than extending this load-time boundary implicitly.
@@ -34,7 +34,7 @@ The schemas preserve the accepted model intents:
 
 | Surface | Input |
 |---|---|
-| `relay-pair` | Human command argument reserved for a future pairing code |
+| `relay-pair` | Human-supplied current startup pairing code |
 | `list_peers` | Closed empty object |
 | `agent_send` | Closed object with required opaque `to`, required string-or-JSON-object `body`, and optional `re` |
 
@@ -49,13 +49,13 @@ Ticket #8 shape-validates model-tool input and always returns the disconnected o
 Tool handlers throw an `Error`. Throwing is Pi's tool-error mechanism and produces an error tool result; returning an object with an `isError` field would not. Both tools use the same stable actionable message:
 
 ```text
-Relay is disconnected. /relay-pair is unavailable in this shell; install a relay-enabled release before retrying.
+Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
 ```
 
-The command cannot pair yet. Its handler emits an error notification that states no pairing occurred and recommends a relay-enabled release. It never sends a user or custom message into the Pi session.
+The command validates explicit loopback endpoint configuration, creates or loads the installation key, calls the real HTTP endpoint, and reports the accepted client identity. It never sends a user or custom message into the Pi session. Pairing does not imply a live messaging connection.
 
-<Decision title="Fail closed instead of simulating relay success" status="accepted">
-Every exposed operation reports the disconnected boundary. The shell does not return an empty peer roster, fabricate a message status, persist a key, or claim that pairing succeeded.
+<Decision title="Keep model tools disconnected after pairing" status="accepted">
+Pairing establishes installation identity only. The shell does not return an empty peer roster or fabricate a message status before ticket #11 supplies an authenticated connection lifecycle.
 </Decision>
 
 ### I/O examples
@@ -68,7 +68,7 @@ Every exposed operation reports the disconnected boundary. The shell does not re
   </TabItem>
   <TabItem label="Pair notification">
     ```text
-    Pairing unavailable: no pairing occurred and the relay remains disconnected. Install a relay-enabled release before retrying.
+    Relay pairing accepted client identity cli_tkPj7VgbR2HdLQyH.
     ```
   </TabItem>
 </Tabs>
@@ -84,7 +84,7 @@ Every exposed operation reports the disconnected boundary. The shell does not re
   </TabItem>
   <TabItem label="Pi tool error">
     ```text
-    Relay is disconnected. /relay-pair is unavailable in this shell; install a relay-enabled release before retrying.
+    Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
     ```
   </TabItem>
 </Tabs>
@@ -97,10 +97,12 @@ Handlers execute directly through the recorded registrations. The acceptance ass
 
 - exact registration order and names;
 - closed input schemas, including invalid edge shapes;
-- one command notification with no raw pairing code in telemetry;
+- one command-to-real-HTTP success notification with no raw pairing code or private key in telemetry;
 - thrown errors from both disconnected model tools;
 - no Pi message injection or live context access; and
 - no timer, fetch, or WebSocket creation during factory execution.
+
+The primary pairing acceptance additionally starts the real Go child, invokes the registered command, and inspects only observable permission, public metadata, persistence, notification, injection, and process-log boundaries.
 
 ## Runtime dependency and telemetry
 
@@ -108,4 +110,4 @@ Handlers execute directly through the recorded registrations. The acceptance ass
 The package declares TypeBox as an extension-local runtime dependency and pins it through `extension/package-lock.json`; `npm ci` installs it beside the extension. This avoids assuming that a Nix-installed Pi exposes its internal package tree to a user extension at runtime. Pi core remains a type-only import and is erased before runtime, so the extension does not resolve Pi internals at runtime.
 </Decision>
 
-Each attempted operation writes one structured warning with `event: "relay_operation_failed"`, its operation name, and stable reason `disconnected` or `not_implemented`. Pairing codes and message bodies are never included. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.
+Disconnected model-tool attempts write one structured warning with `event: "relay_operation_failed"`. Pairing writes one settled `relay_pair_accepted` or `relay_pair_rejected` event with latency and stable result or reason. Pairing-code and private-key field names contain `<redacted>`; message bodies remain absent. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.

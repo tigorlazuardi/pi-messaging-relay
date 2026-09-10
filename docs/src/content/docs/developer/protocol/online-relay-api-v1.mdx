@@ -56,7 +56,7 @@ Unknown fields and duplicate JSON keys are rejected. Canonical addresses have th
 
 ```mermaid
 flowchart TD
-    O[Operator starts localhost server] --> C[Server prints one-time pairing code]
+    O[Operator starts localhost server] --> C[Server exclusively writes current one-time code to requested mode-0600 operator file]
     C --> P[Operator enters /relay-pair CODE in Pi]
     P --> K[Extension generates or loads Ed25519 install key]
     K --> R[Extension sends POST /v1/pair]
@@ -69,7 +69,7 @@ flowchart TD
     G -->|rejected| Z[Server sends auth error and closes socket]
 ```
 
-The pairing code and nonce are authentication material and are always redacted from logs. The server persists allowlisted public keys and minimal pairing metadata, but never messages or pending sends.
+The pairing code and nonce are authentication material and are always redacted from logs. The server writes the current raw pairing code only when `--pairing-code-file PATH` explicitly requests an exclusively created mode-`0600` operator file. If the flag is omitted, the raw code remains undisclosed; ordinary structured logs contain only `<redacted>`. A startup pairing code is exactly 32 URL-safe Base64 characters encoding 24 random bytes. The server persists allowlisted public keys and minimal pairing metadata, but never messages or pending sends. Pair requests are bounded to 4,096 bytes and use a closed two-string JSON object; the extension's fixed accepted code and public-key forms produce a 126-byte request. `client_public_key` is `ed25519:` followed by canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. `client_id` is `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes.
 
 <Decision title="Separate trust bootstrap from messaging" status="accepted">
 One-time pairing uses `POST /v1/pair`. Authenticated live traffic uses WebSocket `/v1/connect`.
@@ -85,7 +85,7 @@ One-time pairing uses `POST /v1/pair`. Authenticated live traffic uses WebSocket
 
     {
       "pairing_code": "<REDACTED>",
-      "client_public_key": "ed25519:base64-public-key"
+      "client_public_key": "ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E="
     }
     ```
   </TabItem>
@@ -95,7 +95,7 @@ One-time pairing uses `POST /v1/pair`. Authenticated live traffic uses WebSocket
     Content-Type: application/json
 
     {
-      "client_id": "cli_01J7K8M4Y9Z3"
+      "client_id": "cli_01J7K8M4Y9Z3abcd"
     }
     ```
   </TabItem>
