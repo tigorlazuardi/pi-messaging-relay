@@ -8,6 +8,6 @@ sidebar:
 
 This namespace documents the service from an operator's and user's perspective.
 
-Start with **[Start the relay server](./start-relay-server/)** to build the Go process, select a loopback port, observe readiness, and stop it cleanly.
+Use **[Start the relay server](./start-relay-server/)** to build the Go process, select a loopback port, observe readiness, and stop it cleanly.
 
-The accepted relay v1 contract also covers future client extension installation, pairing, peer discovery, message sending, security, and operational limits. Those capabilities are not implemented by the current process lifecycle slice.
+Use **[Install the disconnected relay extension](./install-relay-extension/)** to load the current Pi command and model-tool shell from a trusted checkout. The shell exposes `/relay-pair`, `list_peers`, and `agent_send`, but pairing, connection, and messaging are not implemented yet.

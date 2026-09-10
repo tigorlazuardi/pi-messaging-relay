@@ -1,0 +1,98 @@
+---
+title: Install the disconnected relay extension
+description: Load the current Pi extension shell safely and understand its pairing and messaging limitations.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The current extension is a disconnected shell for validating the Pi command and tool surface. It does not pair with or connect to the relay server yet.
+
+<Aside type="caution" title="No messaging in this release">
+`/relay-pair`, `list_peers`, and `agent_send` are visible after loading, but every operation remains disconnected. The command does not accept or persist a key, and no message is sent.
+</Aside>
+
+## Requirements
+
+- Pi 0.85.1
+- Node.js 24 or newer
+- npm
+- A trusted checkout of this repository
+
+Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependency before installation.
+
+## Try from a checkout
+
+<Steps>
+1. Install the extension's local runtime dependency from the lockfile:
+
+   ```console
+   $ npm --prefix extension ci
+   ```
+
+2. Load only this extension for one Pi invocation:
+
+   ```console
+   $ pi --no-extensions -e ./extension/index.ts
+   ```
+
+3. In Pi, run the pairing command with a redacted placeholder:
+
+   ```text
+   /relay-pair <REDACTED>
+   ```
+</Steps>
+
+Loading the shell does not require a running relay server or configured model. TypeBox is installed beneath `extension/node_modules/`, so a Nix-installed Pi does not need to resolve that runtime import from Pi's internal package tree.
+
+## Install as a local Pi package
+
+After `npm --prefix extension ci`, add the extension directory to user settings:
+
+```console
+$ pi install "$PWD/extension"
+```
+
+Pi reads the package manifest and loads `extension/index.ts` in future sessions. Use `pi list` to inspect the configured package. The local-path installation references this checkout rather than copying it, so keep the checkout and its installed dependency available.
+
+## Current behavior
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Pair input">
+    ```text
+    /relay-pair <REDACTED>
+    ```
+  </TabItem>
+  <TabItem label="Visible notification">
+    ```text
+    Pairing unavailable: no pairing occurred and the relay remains disconnected. Install a relay-enabled release before retrying.
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Model tool input">
+    ```json
+    {}
+    ```
+  </TabItem>
+  <TabItem label="list_peers error">
+    ```text
+    Relay is disconnected. /relay-pair is unavailable in this shell; install a relay-enabled release before retrying.
+    ```
+  </TabItem>
+</Tabs>
+
+`agent_send` produces the same error. It never returns `received`, `denied`, or `timeout` while this disconnected shell is installed. An empty peer list would incorrectly imply a successful connected query, so `list_peers` also fails explicitly.
+
+## Security and telemetry
+
+The shell does not create keys, persist pairing data, contact an endpoint, open a WebSocket, or inject a message into Pi. Failed operations emit structured warnings containing only the operation and stable reason. Pairing command text and message bodies are not logged.
+
+## Troubleshooting
+
+- **`Cannot find module 'typebox'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`.
+- **Command or tools absent** — confirm Pi loaded `extension/index.ts`; retry with the temporary `-e` command above and inspect Pi's extension issues.
+- **Pairing remains unavailable** — expected for this shell. Starting the lifecycle-only Go server does not enable pairing or connection.
+- **Need to send a message** — no workaround exists in this release; install a future relay-enabled extension release when one is available.
