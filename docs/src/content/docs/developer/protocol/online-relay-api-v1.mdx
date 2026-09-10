@@ -69,10 +69,14 @@ flowchart TD
     G -->|rejected| Z[Server sends auth error and closes socket]
 ```
 
-The pairing code and nonce are authentication material and are always redacted from logs. The server writes the current raw pairing code only when `--pairing-code-file PATH` explicitly requests an exclusively created mode-`0600` operator file. If the flag is omitted, the raw code remains undisclosed; ordinary structured logs contain only `<redacted>`. A startup pairing code is exactly 32 URL-safe Base64 characters encoding 24 random bytes. The server persists allowlisted public keys and minimal pairing metadata, but never messages or pending sends. Pair requests are bounded to 4,096 bytes and use a closed two-string JSON object; the extension's fixed accepted code and public-key forms produce a 126-byte request. `client_public_key` is `ed25519:` followed by canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. `client_id` is `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes.
+The pairing code and nonce are authentication material and are always redacted from logs. The server writes the current raw pairing code only when `--pairing-code-file PATH` explicitly requests an exclusively created mode-`0600` operator file. If the flag is omitted, the raw code remains undisclosed; ordinary structured logs contain only `<redacted>`. A startup pairing code is exactly 32 URL-safe Base64 characters encoding 24 random bytes. It is valid only before its ten-minute `expires_at` timestamp: the exact deadline and every later instant are expired. The server persists allowlisted public keys and minimal pairing metadata, but never messages or pending sends. Pair requests are bounded to 4,096 bytes and use a closed two-string JSON object; the extension's fixed accepted code and public-key forms produce a 126-byte request. `client_public_key` is `ed25519:` followed by canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. `client_id` is `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes.
 
 <Decision title="Separate trust bootstrap from messaging" status="accepted">
 One-time pairing uses `POST /v1/pair`. Authenticated live traffic uses WebSocket `/v1/connect`.
+</Decision>
+
+<Decision title="Use one closed stale-code rejection" status="accepted">
+A well-formed incorrect, expired, or already consumed code returns HTTP `401` with `pairing_code_invalid` and adds no allowlist entry. The submitted code crosses into the request trust boundary, but the response omits it entirely and structured logs preserve only redacted authentication fields.
 </Decision>
 
 ### I/O examples
@@ -382,7 +386,7 @@ flowchart TD
 
 Reconnect uses exponential backoff with jitter and a cap. The same Pi session reclaims its address; a new or forked session receives a new address. Pending messages are never replayed automatically after server restart.
 
-Fixed v1 ceilings are a 256 KiB body, 512 KiB frame, 5-second ACK deadline, 128 pending sends per sender connection, 1,024 dedupe message IDs per recipient session, and a single-use pairing code that expires after 10 minutes.
+Fixed v1 ceilings are a 256 KiB body, 512 KiB frame, 5-second ACK deadline, 128 pending sends per sender connection, 1,024 dedupe message IDs per recipient session, and a single-use pairing code whose exact 10-minute deadline is the first expired instant.
 
 ### I/O examples
 

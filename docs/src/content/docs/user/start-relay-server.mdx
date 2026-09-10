@@ -5,7 +5,7 @@ description: Build the loopback relay, choose temporary or durable allowlist sta
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The relay binds only to a loopback IP literal. Each startup creates one cryptographically random pairing code with a ten-minute lifetime. The raw code is available only when you explicitly select a private file; normal JSON logs always show `<redacted>`.
+The relay binds only to a loopback IP literal. Each startup creates one cryptographically random pairing code with a ten-minute lifetime. It works only before the `expires_at` time in `pairing_code_created`; at that exact time it is expired. The raw code is available only when you explicitly select a private file; normal JSON logs always show `<redacted>`.
 
 ## Build and start
 
@@ -51,6 +51,8 @@ Do not paste the code into logs, shell history, chat, issue text, or screenshots
 
 `allowlist.json` is mode `0600`. It stores client ID, Ed25519 public key, and pairing time only. It does not contain raw pairing codes, private keys, messages, pending sends, or replay data. New durable state is committed before readiness, and an allowlist update is committed before HTTP success.
 
+A well-formed incorrect, expired, or already used code receives the same `pairing_code_invalid` rejection and never adds an allowlist entry. The raw submitted code crosses only into the localhost request; the response omits it rather than echoing a redacted copy, while structured logs keep `pairing_code` and `private_key` as `<redacted>`. A wrong code does not consume the current code. Success consumes it and removes the code file. An expired file can remain until shutdown, but its contents no longer authorize pairing; stop and restart the relay with a new unused file path to obtain a fresh code.
+
 Every structured stdout or stderr event has a one-second delivery deadline, and every HTTP response write has a two-second deadline. A stopped log reader or non-reading local client therefore cannot retain request handling indefinitely. If stdout cannot record a settled pairing event, the process stops accepting work, drains for at most five seconds, attempts `server_failed` on stderr, and exits non-zero even when SIGINT or SIGTERM arrives concurrently. An identity already returned as accepted remains in explicit durable state; do not retry it as though acceptance had rolled back.
 
 Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, response writes to two seconds, and shutdown drain to five seconds.
@@ -93,6 +95,14 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
     exit code: 1
     ```
   </TabItem>
+  <TabItem label="Stale-code HTTP response">
+    ```http
+    HTTP/1.1 401 Unauthorized
+    Content-Type: application/json
+
+    {"error":"pairing_code_invalid","message":"Pairing code is invalid or expired"}
+    ```
+  </TabItem>
   <TabItem label="Runtime log timeout">
     ```text
     {"level":"error","event":"server_failed","reason":"fatal pairing runtime failure: write pair_accepted pairing audit event: write pair_accepted event within 1s: context deadline exceeded\nclose stdout event logger: stop event logger worker within 1s: context deadline exceeded"}
@@ -115,6 +125,7 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
 - **`listen address must use a loopback IP literal`** — use `127.0.0.1` or `::1`, not a hostname, wildcard, LAN, or public address.
 - **`durable state directory must be ... 0700`** — make the dedicated directory private with `chmod 700 PATH`, after verifying it is the intended relay directory.
 - **Pairing-code file exists** — choose a different new path. The server intentionally never overwrites an existing file.
+- **`pairing_code_invalid`** — the submitted code was incorrect, expired, or already used. The relay intentionally does not distinguish these cases. If the current startup code may be older than ten minutes or was accepted once, stop the server and restart it with a new unused code-file path.
 - **`remove incomplete pairing code file`** — startup failed after creating the selected private file and could not remove it. Treat that exact path as authentication material, verify it is the intended path, then remove it manually before retrying.
 - **No raw code in stdout** — expected. Read only the exact file passed with `--pairing-code-file`.
 - **No `server_ready` event** — inspect the structured `server_failed` event on stderr. The process exits non-zero when startup cannot complete.

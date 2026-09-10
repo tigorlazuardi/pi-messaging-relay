@@ -11,12 +11,12 @@ import Decision from '../../../../components/Decision.astro';
 This slice implements trust bootstrap only: a real `/relay-pair CODE` command calls `POST /v1/pair`, and the relay persists the accepted installation's public identity. It does not open a WebSocket, authenticate a session, restore authorization after restart, or enable either model tool.
 
 <Aside type="note" title="Ticket boundaries">
-Ticket #10 owns deterministic invalid, expired, and reused-code behavior coverage. Ticket #11 owns nonce/signature WebSocket authentication. Ticket #27 owns restart restoration acceptance. This slice includes only fail-closed rejection plumbing and the minimum successful-code consumption needed to prevent two success owners.
+Ticket #10 adds deterministic invalid, expired, and reused-code behavior coverage to the successful pairing seam from #9. Ticket #11 owns nonce/signature WebSocket authentication. Ticket #27 owns restart restoration acceptance. Pairing remains limited to trust bootstrap and does not expand either neighboring seam.
 </Aside>
 
 ## Startup code ownership
 
-Every process generates 24 cryptographically random bytes and encodes them as exactly 32 URL-safe Base64 characters with a fixed ten-minute lifetime. A raw code is never written to stdout, stderr, a structured log, or server state. The operator must deliberately provide `--pairing-code-file PATH`; the server exclusively creates that file with mode `0600`, refuses to overwrite an existing path, and removes it after successful pairing or process shutdown. If write, fsync, or close fails after creation, the server closes and removes the incomplete file; an unlink failure is joined to the primary contextual startup error without exposing the code.
+Every process generates 24 cryptographically random bytes and encodes them as exactly 32 URL-safe Base64 characters with a fixed ten-minute lifetime. The code is valid before its `expires_at` timestamp and expired at that exact timestamp; the validity interval excludes the deadline. A raw code is never written to stdout, stderr, a structured log, or server state. The operator must deliberately provide `--pairing-code-file PATH`; the server exclusively creates that file with mode `0600`, refuses to overwrite an existing path, and removes it after successful pairing or process shutdown. If write, fsync, or close fails after creation, the server closes and removes the incomplete file; an unlink failure is joined to the primary contextual startup error without exposing the code.
 
 Normal stdout remains one JSON object per line. `server_ready` is still first, followed by `pairing_code_created`. Authentication fields named `pairing_code` and `private_key` contain the literal `<redacted>` marker.
 
@@ -28,12 +28,22 @@ A startup flag makes disclosure deliberate and testable without mixing raw authe
 
 `POST /v1/pair` accepts at most 4,096 bytes with media type `application/json`. Its top-level object is closed and contains exactly two string fields: `pairing_code` and `client_public_key`. Unknown fields, duplicate fields, missing fields, wrong types, malformed JSON, trailing JSON, oversized input, and invalid public keys fail before allowlist mutation.
 
-Before state-directory or key work, the extension measures the raw `/relay-pair` argument as UTF-8 and requires the exact 32-character URL-safe syntax. With the fixed 52-character public-key spelling and closed JSON shape, every accepted extension request is exactly 126 UTF-8 bytes, safely within the server ceiling. Local format rejection does not decide whether a well-formed code is invalid, expired, or reused; those acceptance cases remain ticket #10.
+Before state-directory or key work, the extension measures the raw `/relay-pair` argument as UTF-8 and requires the exact 32-character URL-safe syntax. With the fixed 52-character public-key spelling and closed JSON shape, every accepted extension request is exactly 126 UTF-8 bytes, safely within the server ceiling. Local format rejection does not decide whether a well-formed code is invalid, expired, or reused; the relay decides those cases uniformly as documented below.
 
 The public key spelling is `ed25519:<base64>`, where `<base64>` is canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. A successful request returns HTTP `201` with one client identity: `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes. Every HTTP response write has a two-second deadline.
 
 <Decision title="Bound pairing HTTP work before code ownership" status="accepted">
 The relay bounds and closes the request before comparing authentication material or mutating state, then bounds its tiny response write to two seconds. Pairing-code comparison is constant-time for equal-length values, and persistence completes before the code is consumed.
+</Decision>
+
+## Invalid, expired, and consumed codes
+
+A well-formed but incorrect code, a code submitted at or after its ten-minute deadline, and a code submitted again after one successful use all return the same closed response: HTTP `401` with `pairing_code_invalid`. Rejection never appends an allowlist client. Successful persistence consumes the code while holding the pairing state lock, so concurrent or later reuse cannot create a second identity.
+
+The submitted raw code necessarily enters the localhost HTTP request trust boundary. It is omitted entirely from every response. Structured audit events retain the `pairing_code` and `private_key` field names only with `<redacted>` values; no event contains either the submitted code or the server's current code.
+
+<Decision title="Expire at the deadline and collapse stale-code outcomes" status="accepted">
+The exact `expires_at` instant is the first invalid instant. Invalid, expired, and consumed codes share one status, reason, and message so callers cannot use the endpoint to distinguish pairing-code state, while deterministic tests control an internal clock without exposing an operator clock override.
 </Decision>
 
 ### I/O examples
@@ -61,6 +71,14 @@ The relay bounds and closes the request before comparing authentication material
     Content-Type: application/json
 
     {"error":"invalid_client_public_key","message":"client_public_key must be an Ed25519 public key encoded as ed25519:<base64>"}
+    ```
+  </TabItem>
+  <TabItem label="Invalid, expired, or reused response">
+    ```http
+    HTTP/1.1 401 Unauthorized
+    Content-Type: application/json
+
+    {"error":"pairing_code_invalid","message":"Pairing code is invalid or expired"}
     ```
   </TabItem>
   <TabItem label="Local malformed command">

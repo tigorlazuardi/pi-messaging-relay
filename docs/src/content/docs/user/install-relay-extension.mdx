@@ -43,7 +43,7 @@ Pi extensions execute with the user's full system permissions. Review `extension
    /relay-pair CODE
    ```
 
-4. Confirm Pi reports the accepted public client identity. Do not copy the raw code into diagnostics.
+4. Confirm Pi reports the accepted public client identity. Do not copy the raw code into diagnostics. The code is consumed by that success and cannot pair a second installation.
 </Steps>
 
 ## Configuration
@@ -99,6 +99,11 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
     Pairing failed: code must contain exactly 32 URL-safe characters.
     ```
   </TabItem>
+  <TabItem label="Invalid, expired, or reused code">
+    ```text
+    Pairing failed (pairing_code_invalid): Pairing code is invalid or expired.
+    ```
+  </TabItem>
 </Tabs>
 
 <Tabs>
@@ -120,6 +125,8 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - Pairing-code and private-key log fields retain their names but always contain `<redacted>`.
 - Public key and accepted client ID may appear in logs for support correlation.
 - The extension accepts only an exact 32-character URL-safe code. It rejects malformed or oversized command input locally before creating key state or contacting the relay; an accepted request is 126 bytes, below the 4,096-byte server limit.
+- A syntactically valid code is usable only before its ten-minute deadline and only until its first successful pairing. The exact deadline is expired. Incorrect, expired, and reused codes all receive the same rejection and add no relay allowlist entry.
+- The raw code is present in the localhost request because the relay must verify it. Pairing failure output omits the code entirely, and structured logs use `<redacted>` authentication fields rather than echoing the submitted or current value.
 - The extension reads at most 4,096 response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
 - Pairing failures do not invoke a model, inject a Pi message, or silently claim success.
 - Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
@@ -132,5 +139,5 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - **Unsafe state permissions** — verify the configured path is the intended dedicated key directory, then set its mode to `0700`; set the key file to `0600` only after verifying ownership.
 - **Relay could not be reached** — verify the server is still running at the configured address and the ten-second request deadline was not exceeded.
 - **Pairing code format rejected locally** — paste the exact 32-character URL-safe value with no surrounding whitespace. The extension has not created key state or contacted the relay.
-- **Pairing code rejected by the relay** — obtain the current code through the server's private operator channel. Detailed invalid, expired, and reuse acceptance behavior remains ticket #10.
+- **Pairing code rejected by the relay** — the code was incorrect, reached its ten-minute deadline, or was already accepted once; the relay deliberately returns the same message for all three. Obtain a fresh code by restarting the server with a new unused private code-file path.
 - **Pairing succeeded but tools are disconnected** — expected. WebSocket/session authentication is not implemented in this slice.

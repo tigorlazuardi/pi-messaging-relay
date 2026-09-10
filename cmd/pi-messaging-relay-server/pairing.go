@@ -30,6 +30,7 @@ type pairingService struct {
 	mu             sync.Mutex
 	code           string
 	expiresAt      time.Time
+	now            func() time.Time
 	stateDir       string
 	allowlist      allowlist
 	logger         *eventLogger
@@ -67,8 +68,20 @@ func newPairingService(
 	logger *eventLogger,
 	reportFatal func(error),
 ) (*pairingService, error) {
+	return newPairingServiceWithClock(stateDir, codeFilePath, logger, reportFatal, time.Now)
+}
+
+func newPairingServiceWithClock(
+	stateDir, codeFilePath string,
+	logger *eventLogger,
+	reportFatal func(error),
+	now func() time.Time,
+) (*pairingService, error) {
 	if reportFatal == nil {
 		return nil, errors.New("pairing service requires a fatal runtime reporter")
+	}
+	if now == nil {
+		return nil, errors.New("pairing service requires a clock")
 	}
 	if codeFilePath != "" {
 		absoluteCodePath, err := filepath.Abs(codeFilePath)
@@ -94,7 +107,8 @@ func newPairingService(
 
 	service := &pairingService{
 		code:        code,
-		expiresAt:   time.Now().Add(pairingCodeLifetime),
+		expiresAt:   now().Add(pairingCodeLifetime),
+		now:         now,
 		stateDir:    stateDir,
 		allowlist:   stored,
 		logger:      logger,
@@ -157,7 +171,7 @@ func (service *pairingService) handlePair(response http.ResponseWriter, request 
 		return
 	}
 
-	clientID, err := service.accept(input, time.Now())
+	clientID, err := service.accept(input, service.now())
 	if errors.Is(err, errPairingCodeInvalid) {
 		service.logPairFailure("pairing_code_invalid", started, input.ClientPublicKey)
 		writeJSON(response, http.StatusUnauthorized, errorResponse{
@@ -192,7 +206,7 @@ func (service *pairingService) accept(input pairRequest, now time.Time) (string,
 	service.mu.Lock()
 	defer service.mu.Unlock()
 
-	if service.code == "" || now.After(service.expiresAt) || !equalSecret(service.code, input.PairingCode) {
+	if service.code == "" || !now.Before(service.expiresAt) || !equalSecret(service.code, input.PairingCode) {
 		return "", errPairingCodeInvalid
 	}
 	clientIDToken, err := randomToken(12)
