@@ -1,0 +1,89 @@
+---
+title: Start the relay server
+description: Build and run the Go relay on a loopback-only selected or ephemeral port, then stop it cleanly.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The current relay process provides the local server lifecycle boundary. Pairing, extension connections, and message routing are not available in this slice.
+
+## Build and start
+
+<Steps>
+1. From the repository root, build the command:
+
+   ```console
+   $ mkdir -p bin
+   $ go build -o bin/pi-messaging-relay-server ./cmd/pi-messaging-relay-server
+   ```
+
+2. Start it on an operating-system-selected loopback port:
+
+   ```console
+   $ ./bin/pi-messaging-relay-server
+   ```
+
+3. Read the `address` field from the `server_ready` JSON line:
+
+   ```json
+   {"level":"info","event":"server_ready","address":"127.0.0.1:43127","state_dir":"/tmp/pi-messaging-relay-2486170958"}
+   ```
+</Steps>
+
+The readiness line means the listener exists and the selected address is available to local clients. Port `0` in the default `127.0.0.1:0` asks the operating system to choose an unused port.
+
+## Select a port
+
+Pass a loopback IP literal and port with `--listen`:
+
+```console
+$ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080
+```
+
+IPv6 loopback is also accepted, for example `--listen '[::1]:8080'`. Hostnames such as `localhost`, wildcard addresses such as `0.0.0.0`, and non-loopback IPs are rejected. This prevents the process from being exposed to another host by a listen-address mistake.
+
+<Aside type="caution" title="Local transport only">
+Do not treat this process as a public internet endpoint. Built-in TLS and public listener support are outside relay v1. Use only the loopback boundary described here.
+</Aside>
+
+## Stop cleanly
+
+Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process supervisor. A successful stop prints:
+
+```json
+{"level":"info","event":"server_stopped","address":"127.0.0.1:43127","result":"graceful"}
+```
+
+The process stops accepting connections, releases its listener, removes its process-specific temporary state directory, and exits with code `0`. A forced kill or machine failure cannot run this cleanup.
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Selected port input">
+    ```console
+    $ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080
+    ```
+  </TabItem>
+  <TabItem label="Ready output">
+    ```json
+    {"level":"info","event":"server_ready","address":"127.0.0.1:8080","state_dir":"/tmp/pi-messaging-relay-2486170958"}
+    ```
+  </TabItem>
+  <TabItem label="Rejected input">
+    ```console
+    $ ./bin/pi-messaging-relay-server --listen 0.0.0.0:8080
+    ```
+  </TabItem>
+  <TabItem label="Failure output">
+    ```text
+    {"level":"error","event":"server_failed","reason":"listen address must use a loopback IP literal"}
+    exit code: 1
+    ```
+  </TabItem>
+</Tabs>
+
+## Troubleshooting
+
+- **`listen: bind: address already in use`** — choose another fixed port or use port `0`.
+- **`listen address must use a loopback IP literal`** — use `127.0.0.1` or `::1`, not a hostname, wildcard, LAN, or public address.
+- **No `server_ready` event** — inspect the structured `server_failed` event on stderr. The process exits non-zero when startup cannot complete.
