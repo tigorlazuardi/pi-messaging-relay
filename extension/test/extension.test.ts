@@ -262,6 +262,8 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   assert.equal(Value.Check(sendSchema as never, stringSend), true);
   assert.equal(Value.Check(sendSchema as never, objectSend), true);
   assert.equal(Value.Check(sendSchema as never, { ...stringSend, message_id: "client-id" }), false);
+  assert.equal(Value.Check(sendSchema as never, { ...stringSend, deliverAs: "steer" }), false);
+  assert.equal(Value.Check(sendSchema as never, { ...stringSend, delivery_mode: "followUp" }), false);
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: ["not", "an", "object"] }), false);
   assert.equal(Value.Check(sendSchema as never, { to: "", body: "message" }), false);
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: null }), false);

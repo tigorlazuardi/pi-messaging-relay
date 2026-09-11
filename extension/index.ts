@@ -13,6 +13,7 @@ import {
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { createRecipientDelivery } from "./internal/delivery-policy.ts";
 import { syncDirectory } from "./internal/directory-durability.ts";
 import { RosterRequestError } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
@@ -518,6 +519,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
   let sessionCWD: string | undefined;
   let startupAttempted = false;
   let pairingAttempted = false;
+  let activeSessionIdle: (() => boolean) | undefined;
   let activeAttempt: SessionSocketAttempt | undefined;
   let activeConnection: Awaited<SessionSocketAttempt["result"]> | undefined;
 
@@ -588,7 +590,8 @@ export default function relayExtension(pi: ExtensionAPI): void {
     }
     const routeID = sessionRouteID;
     const cwd = sessionCWD;
-    if (!routeID || !cwd) return;
+    const sessionIdle = activeSessionIdle;
+    if (!routeID || !cwd || !sessionIdle) return;
 
     const attempt = new SessionSocketAttempt({
       endpoint,
@@ -596,7 +599,11 @@ export default function relayExtension(pi: ExtensionAPI): void {
       clientPublicKey,
       routeID,
       cwd,
-      deliverUserMessage: (body) => pi.sendUserMessage(body),
+      deliverUserMessage: createRecipientDelivery(
+        pi.sendUserMessage,
+        sessionIdle,
+        () => activeSessionIdle === sessionIdle,
+      ),
       onDisconnected: () => {
         if (activeConnection?.socket === connection?.socket) activeConnection = undefined;
         logAuthentication("info", "disconnected", {
@@ -638,11 +645,13 @@ export default function relayExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    activeSessionIdle = undefined;
     if (activeConnection) await activeConnection.closeAndWait();
     activeAttempt?.close();
     sessionStarted = true;
     sessionRouteID = generateUUIDv7();
     sessionCWD = ctx.cwd;
+    activeSessionIdle = () => ctx.isIdle();
     startupAttempted = false;
     pairingAttempted = false;
     await connectOnce("startup");
@@ -650,6 +659,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     sessionStarted = false;
+    sessionRouteID = undefined;
+    sessionCWD = undefined;
+    activeSessionIdle = undefined;
     const pendingAttempt = activeAttempt?.result;
     activeAttempt?.close();
     if (pendingAttempt) await pendingAttempt.catch(() => undefined);

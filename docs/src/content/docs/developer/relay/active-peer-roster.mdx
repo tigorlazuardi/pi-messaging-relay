@@ -56,7 +56,7 @@ Stable local errors are:
 | Socket closes | `Relay disconnected during list_peers.` |
 | Invalid or wrongly correlated response | `Relay returned an invalid list_peers response.` |
 
-A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain only `peers` and optional `next_cursor`. Successful idle text `agent_send` now shares this operation owner; see [authenticated idle text delivery](/developer/relay/message-delivery/).
+A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain only `peers` and optional `next_cursor`. Successful idle and busy text `agent_send` now shares this operation owner; see [authenticated text delivery](/developer/relay/message-delivery/).
 
 ### I/O examples
 

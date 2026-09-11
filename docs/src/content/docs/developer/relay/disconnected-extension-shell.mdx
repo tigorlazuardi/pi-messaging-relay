@@ -10,8 +10,8 @@ import Decision from '../../../../components/Decision.astro';
 
 The extension package in `extension/` establishes the Pi-facing surface. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
 
-<Aside type="note" title="Authenticated roster and idle text delivery">
-The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers authenticate and retain one WebSocket shared by bounded `list_peers`, `agent_send`, and recipient delivery. Successful idle text injection is connected; busy routing, final formatting/replies, failure results, and reconnect remain deferred. Loading the factory still requires no relay server and no model call.
+<Aside type="note" title="Authenticated roster and text delivery">
+The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers authenticate and retain one WebSocket shared by bounded `list_peers`, `agent_send`, and recipient delivery. Successful idle injection and busy follow-up injection are connected; final formatting/replies, failure results, and reconnect remain deferred. Loading the factory still requires no relay server and no model call.
 </Aside>
 
 ## Registration and lifecycle boundary
@@ -59,7 +59,7 @@ When no authenticated socket is retained, tool handlers throw an `Error`. Throwi
 Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
 ```
 
-The command validates explicit loopback endpoint configuration, creates or loads the installation key, calls the real HTTP endpoint, and reports the accepted client identity. It never sends a user or custom message into the Pi session. Pairing during an active session may authenticate a live transport and enable `list_peers`, successful online idle text `agent_send`, and recipient delivery.
+The command validates explicit loopback endpoint configuration, creates or loads the installation key, calls the real HTTP endpoint, and reports the accepted client identity. It never sends a user or custom message into the Pi session. Pairing during an active session may authenticate a live transport and enable `list_peers`, successful online text `agent_send`, and recipient-local idle or busy delivery.
 
 <Decision title="Share one retained socket without queuing operations" status="accepted">
 Authentication establishes a live session identity. One retained-socket owner correlates either `list_peers` or `agent_send`, accepts validated recipient pushes, and serializes writes. It never queues a second outgoing operation.
@@ -121,7 +121,7 @@ Authentication establishes a live session identity. One retained-socket owner co
 
 ## Fake Pi host seam
 
-The focused Node test loads the real extension factory behind a strict fake Pi host. The fake records command and tool registrations, notifications, `sendMessage` attempts, and `sendUserMessage` attempts. Unknown Pi or context access fails the test, so model registry, session, and other live capabilities cannot be consulted silently.
+The focused Node test loads the real extension factory behind a strict fake Pi host. The fake records command and tool registrations, notifications, `sendMessage` attempts, and `sendUserMessage` attempts. It exposes only a controlled idle/busy predicate for delivery tests; unknown Pi or context access fails the test, so model registry, session, and other live capabilities cannot be consulted silently.
 
 Handlers execute directly through the recorded registrations. The acceptance assertions cover:
 
@@ -133,7 +133,7 @@ Handlers execute directly through the recorded registrations. The acceptance ass
 - no timer, fetch, or WebSocket creation during factory execution or a keyless lifecycle startup; and
 - one retained authenticated socket from either lifecycle ordering, followed by idempotent shutdown settlement; and
 - real-server address-only roster membership, strict continuation, disconnect removal, hostile-response closure, shared local single-flight rejection, and abort/timeout/close cleanup; and
-- real-server idle text delivery through two extension instances, exact no-option `sendUserMessage`, unique IDs, exact ACK correlation, redacted logs, and deterministic `received` output.
+- real-server text delivery through two extension instances, exact no-option idle injection and busy `{ deliverAs: "followUp" }` injection, stale-session and idle-predicate failure safety, thrown-Pi-call best-effort ACK, sender schema rejection of delivery-mode fields, no steering, unique IDs, exact ACK correlation, redacted logs, and deterministic `received` output.
 
 The primary pairing acceptance additionally starts the real Go child, invokes the registered command, and inspects only observable permission, public metadata, persistence, notification, injection, and process-log boundaries.
 

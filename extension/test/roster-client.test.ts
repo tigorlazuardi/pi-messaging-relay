@@ -3,6 +3,7 @@ import test from "node:test";
 
 import WebSocket, { WebSocketServer } from "ws";
 
+import { createRecipientDelivery } from "../internal/delivery-policy.ts";
 import { RosterClient, RosterRequestError } from "../internal/roster-client.ts";
 
 const REQUEST_ID = "01993c84-5d38-7d75-8bc1-f945bfa42cdf";
@@ -34,15 +35,19 @@ async function socketPair(): Promise<{ client: WebSocket; server: WebSocket; clo
   };
 }
 
-function nextClientRequest(socket: WebSocket): Promise<Record<string, unknown>> {
+function nextClientFrame(socket: WebSocket): Promise<string> {
   return new Promise((resolve, reject) => socket.once("message", (data, isBinary) => {
     try {
       assert.equal(isBinary, false);
-      resolve(JSON.parse(data.toString("utf8")) as Record<string, unknown>);
+      resolve(data.toString("utf8"));
     } catch (error) {
       reject(error);
     }
   }));
+}
+
+async function nextClientRequest(socket: WebSocket): Promise<Record<string, unknown>> {
+  return JSON.parse(await nextClientFrame(socket)) as Record<string, unknown>;
 }
 
 function roster(requestID: string, payload: unknown): string {
@@ -308,6 +313,61 @@ test("message is injected without steering before a fresh exact received ACK", a
     delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
     message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
   });
+});
+
+test("retained socket fails safe after its recipient session identity is replaced", { timeout: 2_000 }, async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const oldSessionIdle = () => true;
+  let activeSessionIdle: (() => boolean) | undefined = oldSessionIdle;
+  let callAttempted = false;
+  const attempts: unknown[][] = [];
+  const deliverUserMessage = createRecipientDelivery(
+    (...args: unknown[]) => {
+      callAttempted = true;
+      attempts.push(args);
+    },
+    oldSessionIdle,
+    () => activeSessionIdle === oldSessionIdle,
+  );
+  const client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    selfAddress: "recipient",
+    deliverUserMessage,
+  });
+  void client;
+
+  activeSessionIdle = () => true;
+  const ackFramePromise = nextClientFrame(pair.server).then((frame) => {
+    assert.equal(callAttempted, true);
+    return frame;
+  });
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "message",
+    payload: {
+      delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
+      message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+      from: "sender",
+      to: "recipient",
+      body: "retained socket body",
+    },
+  }));
+
+  const ackFrame = await ackFramePromise;
+  const ack = JSON.parse(ackFrame) as Record<string, unknown>;
+  assert.deepEqual(attempts, [["retained socket body", { deliverAs: "followUp" }]]);
+  assert.equal(JSON.stringify(attempts).includes("steer"), false);
+  assert.match(String(ack.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(ackFrame, JSON.stringify({
+    v: 1,
+    type: "received",
+    request_id: ack.request_id,
+    payload: {
+      delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
+      message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+    },
+  }));
 });
 
 test("object message push closes without Pi injection or received ACK", { timeout: 2_000 }, async () => {

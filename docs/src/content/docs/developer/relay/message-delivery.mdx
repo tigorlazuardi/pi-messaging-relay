@@ -1,6 +1,6 @@
 ---
-title: Authenticated idle text delivery
-description: How one online text send is correlated, injected into an idle Pi session, acknowledged, bounded, and logged without overstating receipt.
+title: Authenticated text delivery
+description: How online text delivery selects idle or busy recipient-local Pi injection, acknowledges the attempt, and preserves active work.
 status: accepted
 date: 2026-09-11
 ---
@@ -8,7 +8,7 @@ date: 2026-09-11
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-This seam connects `agent_send` to one exact currently published authenticated destination. It implements successful idle text delivery only. Addresses remain whole opaque registry keys; cwd, hostname, route formatting, model input, and message identifiers never grant routing authority.
+This seam connects `agent_send` to one exact currently published authenticated destination. It implements successful text delivery for both idle and busy recipients. Addresses remain whole opaque registry keys; cwd, hostname, route formatting, model input, and message identifiers never grant routing authority.
 
 ## Successful flow
 
@@ -24,7 +24,12 @@ sequenceDiagram
     SE->>R: send
     R->>R: find exact published address; generate delivery_id
     R->>RE: message
-    RE->>P: sendUserMessage(text)
+    RE->>RE: read current ctx.isIdle()
+    alt recipient is idle
+        RE->>P: sendUserMessage(text)
+    else recipient is busy
+        RE->>P: sendUserMessage(text, followUp)
+    end
     RE->>R: received with fresh request_id
     R->>SE: correlated send_result(received)
     SE->>S: compact JSON result
@@ -32,7 +37,9 @@ sequenceDiagram
 
 The model supplies only `to`, `body`, and optional `re`; it cannot supply a request, message, or delivery ID. The extension generates fresh canonical lowercase UUIDv7 request and message IDs. The relay generates a fresh UUIDv7 delivery ID and retains only the minimum in-memory pending correlation: exact sender session, exact recipient session, sender request and message IDs, and delivery ID.
 
-The recipient validates the closed `message` envelope, duplicate keys, nesting, types, UUIDs, opaque string bounds, body text, and exact equality between `to` and its authenticated address. For this idle seam it calls `pi.sendUserMessage(body)` with no options. It never calls `sendMessage` and never accepts sender-selected steering. After the call is attempted—even if Pi throws—the extension sends a closed `received` operation with a fresh request ID and the matching delivery and message IDs.
+The recipient validates the closed `message` envelope, duplicate keys, nesting, types, UUIDs, opaque string bounds, body text, and exact equality between `to` and its authenticated address. Immediately before Pi injection, the retained connection reads the active session context's current `ctx.isIdle()` value. Only a true idle observation bracketed by matching active-session identity checks preserves the exact one-argument `pi.sendUserMessage(body)` call. Busy delivery uses exactly `pi.sendUserMessage(body, { deliverAs: "followUp" })`, which queues the message until all active work finishes rather than steering the current run. A missing or replaced identity, an idle-predicate exception, or an identity change during idle observation fails safe as a follow-up. Session restart and shutdown clear the retained predicate before connection cleanup.
+
+Delivery mode is recipient-local. Sender input remains the closed `to`, `body`, and optional `re` shape; no wire field, body value, or sender-controlled option can select `followUp` or `steer`. The extension never calls `sendMessage`, never passes `deliverAs: "steer"`, and leaves prompt-template expansion disabled. After the exact Pi call is attempted—even if Pi throws—the extension sends a closed `received` operation with a fresh request ID and the matching delivery and message IDs.
 
 <Decision title="Define received as an attempted Pi boundary call" status="accepted">
 `received` means only that the intended recipient extension validated the offer and attempted `pi.sendUserMessage`. It does not claim that Pi queued or persisted anything, that a model read the message, that work completed, or that a reply will arrive.
@@ -50,7 +57,7 @@ Complete frames are bounded to 512 KiB, JSON nesting to 64 containers, addresses
 Ticket #18 owns the offline sender result, #19 owns `ack_timeout`, #20 owns recipient-disconnected settlement, and #21 owns immediate sender-disconnect cleanup assertions. Until those tickets land, these paths may end without `send_result`; the extension's five-second response deadline then closes its socket. The relay still removes pending work at its five-second ceiling, on recipient removal, or on shutdown. There is no retry (#22), 256 KiB body rejection (#24), or 128-send pipelining (#25).
 </Aside>
 
-Busy follow-up routing is #15. Provenance headers and stable object rendering are #16. Reply behavior is #17. The final v1 schema still accepts object bodies and optional `re`, but #14 runtime delivery is text-only. A local object-body call fails with reason `object_body_unsupported` before IDs or a frame are created, leaving the retained socket available for later text or list operations. A raw-client object send remains syntactically valid at the protocol parser, then ends without an offer, pending state, or interim sender result. A recipient that receives an object push closes without calling Pi or acknowledging it. No object content enters an error or log. Ticket #16 removes these staged guards when it adds the provenance header and canonical compact object renderer.
+Busy follow-up routing is implemented by #15. Provenance headers and stable object rendering are #16. Reply behavior is #17. The final v1 schema still accepts object bodies and optional `re`, but the current runtime delivery is text-only. A local object-body call fails with reason `object_body_unsupported` before IDs or a frame are created, leaving the retained socket available for later text or list operations. A raw-client object send remains syntactically valid at the protocol parser, then ends without an offer, pending state, or interim sender result. A recipient that receives an object push closes without calling Pi or acknowledging it. No object content enters an error or log. Ticket #16 removes these staged guards when it adds the provenance header and canonical compact object renderer.
 
 ## Telemetry
 
@@ -64,9 +71,14 @@ One successful send produces one server-owned `send_settled` JSON event after th
     {"to":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222","body":"Review the API contract"}
     ```
   </TabItem>
-  <TabItem label="Recipient Pi call">
+  <TabItem label="Idle recipient Pi call">
     ```text
     pi.sendUserMessage("Review the API contract")
+    ```
+  </TabItem>
+  <TabItem label="Busy recipient Pi call">
+    ```text
+    pi.sendUserMessage("Review the API contract", { deliverAs: "followUp" })
     ```
   </TabItem>
   <TabItem label="Tool result">

@@ -5,10 +5,10 @@ description: Load the Pi extension, configure its loopback endpoint and private 
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. A paired Pi session authenticates one WebSocket automatically and receives its opaque route address. `list_peers` reads bounded live address-only roster pages; `agent_send` can deliver text to an online idle recipient and return extension-boundary `received`.
+The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. A paired Pi session authenticates one WebSocket automatically and receives its opaque route address. `list_peers` reads bounded live address-only roster pages; `agent_send` can deliver text to an online idle or busy recipient and return extension-boundary `received`.
 
 <Aside type="caution" title="Best-effort online delivery only">
-An `auth_accepted` event means the session proved possession of an allowlisted installation key and can use discovery plus successful idle text delivery. It does not enable offline delivery, replay, durable Pi acceptance, model completion, guaranteed replies, or reconnect.
+An `auth_accepted` event means the session proved possession of an allowlisted installation key and can use discovery plus successful idle and busy text delivery. It does not enable offline delivery, replay, durable Pi acceptance, model completion, guaranteed replies, or reconnect.
 </Aside>
 
 ## Requirements

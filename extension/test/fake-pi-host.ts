@@ -28,6 +28,9 @@ export class FakePiHost {
   readonly liveAccessAttempts: string[] = [];
   readonly events = new Map<string, EventHandler[]>();
   cwd = "/tmp/fake-pi-session";
+  private idle = true;
+  private nextIdleCheckError: Error | undefined;
+  private nextSendUserMessageError: Error | undefined;
 
   readonly api = new Proxy(
     {
@@ -49,6 +52,9 @@ export class FakePiHost {
       },
       sendUserMessage: (...args: unknown[]) => {
         this.sendUserMessageAttempts.push(args);
+        const error = this.nextSendUserMessageError;
+        this.nextSendUserMessageError = undefined;
+        if (error) throw error;
       },
     },
     {
@@ -62,6 +68,18 @@ export class FakePiHost {
       },
     },
   );
+
+  setIdle(idle: boolean): void {
+    this.idle = idle;
+  }
+
+  failNextIdleCheck(error: Error): void {
+    this.nextIdleCheckError = error;
+  }
+
+  failNextSendUserMessage(error: Error): void {
+    this.nextSendUserMessageError = error;
+  }
 
   async executeCommand(name: string, args = ""): Promise<void> {
     const command = this.commands.get(name);
@@ -107,7 +125,16 @@ export class FakePiHost {
     );
 
     return new Proxy(
-      { ui, cwd: this.cwd },
+      {
+        ui,
+        cwd: this.cwd,
+        isIdle: () => {
+          const error = this.nextIdleCheckError;
+          this.nextIdleCheckError = undefined;
+          if (error) throw error;
+          return this.idle;
+        },
+      },
       {
         get: (target, property, receiver) => {
           if (Reflect.has(target, property)) {

@@ -8,10 +8,10 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop, and the [active peer roster](/developer/relay/active-peer-roster/) consumes authenticated presence. The [authenticated idle text delivery](/developer/relay/message-delivery/) seam now consumes the same retained socket; reconnect and restart acceptance remain separate.
+This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop, and the [active peer roster](/developer/relay/active-peer-roster/) consumes authenticated presence. The [authenticated text delivery](/developer/relay/message-delivery/) seam now consumes the same retained socket and selects recipient-local idle or busy injection; reconnect and restart acceptance remain separate.
 
 <Aside type="note" title="Ticket boundaries">
-Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Tickets #36 and #13 own bounded live roster pagination, and #14 owns successful idle text delivery. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
+Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Tickets #36 and #13 own bounded live roster pagination, while #14 and #15 own successful idle and busy text delivery. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
 </Aside>
 
 ## Authentication flow

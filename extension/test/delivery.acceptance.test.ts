@@ -140,10 +140,49 @@ test("agent_send crosses real relay and two real extensions before settling rece
 
     const messageIDs: string[] = [];
     const deliveryIDs: string[] = [];
-    for (const [index, body] of ["Review exact idle text", "Second unique message"].entries()) {
-      const resultPromise = sender.executeTool("agent_send", { to: recipientAddress, body });
+    const deliveries = [
+      {
+        body: "Queue behind active recipient work",
+        idle: false,
+        expectedAttempt: [
+          "Queue behind active recipient work",
+          { deliverAs: "followUp" },
+        ],
+      },
+      {
+        body: "Review exact idle text",
+        idle: true,
+        expectedAttempt: ["Review exact idle text"],
+      },
+      {
+        body: "Attempt busy delivery even when Pi rejects it",
+        idle: false,
+        expectedAttempt: [
+          "Attempt busy delivery even when Pi rejects it",
+          { deliverAs: "followUp" },
+        ],
+        throwFromPi: true,
+      },
+      {
+        body: "Fail safe when recipient idle observation throws",
+        idle: true,
+        expectedAttempt: [
+          "Fail safe when recipient idle observation throws",
+          { deliverAs: "followUp" },
+        ],
+        throwFromIdleCheck: true,
+      },
+    ];
+    for (const [index, delivery] of deliveries.entries()) {
+      recipient.setIdle(delivery.idle);
+      if (delivery.throwFromIdleCheck) recipient.failNextIdleCheck(new Error("simulated stale context"));
+      if (delivery.throwFromPi) recipient.failNextSendUserMessage(new Error("simulated Pi rejection"));
+      const resultPromise = sender.executeTool("agent_send", {
+        to: recipientAddress,
+        body: delivery.body,
+      });
       await waitForAttempt(recipient, index + 1);
-      assert.deepEqual(recipient.sendUserMessageAttempts[index], [body]);
+      assert.deepEqual(recipient.sendUserMessageAttempts[index], delivery.expectedAttempt);
       const result = await within(resultPromise, "sender received result") as ToolResult;
       assert.deepEqual(Object.keys(result.details).sort(), ["message_id", "status"]);
       assert.match(result.details.message_id, UUID_V7);
@@ -163,19 +202,21 @@ test("agent_send crosses real relay and two real extensions before settling rece
       deliveryIDs.push(String(settled.delivery_id));
     }
 
-    assert.equal(new Set(messageIDs).size, 2);
-    assert.equal(new Set(deliveryIDs).size, 2);
+    assert.equal(new Set(messageIDs).size, deliveries.length);
+    assert.equal(new Set(deliveryIDs).size, deliveries.length);
     assert.deepEqual(recipient.sendMessageAttempts, []);
     assert.deepEqual(sender.sendMessageAttempts, []);
-    assert.equal(recipient.sendUserMessageAttempts.every((attempt) => attempt.length === 1), true);
-    assert.equal(extensionLogs.some((line) => line.includes("Review exact idle text")), false);
+    assert.equal(JSON.stringify(recipient.sendUserMessageAttempts).includes("steer"), false);
+    assert.equal(deliveries.some((delivery) =>
+      extensionLogs.some((line) => line.includes(delivery.body))), false);
     assert.equal(extensionLogs.some((line) => line.includes(objectMarker)), false);
     assert.equal(extensionLogs.some((line) => {
       const event = JSON.parse(line) as Record<string, unknown>;
       return event.event === "relay_operation_failed" &&
         event.operation === "agent_send" && event.reason === "object_body_unsupported";
     }), true);
-    assert.equal(output.lines.some((line) => line.includes("Review exact idle text")), false);
+    assert.equal(deliveries.some((delivery) =>
+      output.lines.some((line) => line.includes(delivery.body))), false);
     assert.equal(output.lines.some((line) => line.includes(objectMarker)), false);
     assert.equal(stderr.length, 0);
   } catch (error: unknown) {
