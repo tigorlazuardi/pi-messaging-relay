@@ -202,6 +202,40 @@ test("agent_send crosses real relay and two real extensions before settling rece
     assert.equal(extensionLogs.some((line) => line.includes(rejectedMarker)), false);
     assert.equal(output.lines.some((line) => line.includes(rejectedMarker)), false);
 
+    const bodyBoundaryMarker = "model-body-boundary-private-marker-\"-\n-💾";
+    const bodyBoundaryPrefixBytes = Buffer.byteLength(JSON.stringify(bodyBoundaryMarker), "utf8");
+    const atBodyLimit = bodyBoundaryMarker + "x".repeat((256 * 1024) - bodyBoundaryPrefixBytes);
+    assert.equal(Buffer.byteLength(JSON.stringify(atBodyLimit), "utf8"), 262_144);
+    const atLimitResult = await within(sender.executeTool("agent_send", {
+      to: recipientAddress,
+      body: atBodyLimit,
+    }), "sending exact body limit") as ToolResult;
+    assert.equal(atLimitResult.details.status, "received");
+    assert.equal(recipient.sendUserMessageAttempts.length, 1);
+    assert.equal(String(recipient.sendUserMessageAttempts[0][0]).endsWith(atBodyLimit), true);
+    await nextEvent(output, "send_settled", (event) => event.message_id === atLimitResult.details.message_id);
+
+    const attemptsAtBoundary = recipient.sendUserMessageAttempts.length;
+    await assert.rejects(
+      sender.executeTool("agent_send", { to: recipientAddress, body: atBodyLimit + "x" }),
+      (error: unknown) => error instanceof Error &&
+        error.name === "RosterRequestError" &&
+        (error as Error & { reason?: string }).reason === "body_too_large" &&
+        error.message === "Relay agent_send body exceeds 256 KiB." &&
+        !error.message.includes(bodyBoundaryMarker),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(recipient.sendUserMessageAttempts.length, attemptsAtBoundary);
+    assert.equal(extensionLogs.some((line) => line.includes(bodyBoundaryMarker)), false);
+    assert.equal(output.lines.some((line) => line.includes(bodyBoundaryMarker)), false);
+    assert.equal(extensionLogs.some((line) => line.includes('"reason":"body_too_large"')), true);
+    const rosterAfterBodyDenial = await within(
+      sender.executeTool("list_peers", {}),
+      "listing peers after local body denial",
+    ) as { details: { peers: Array<{ address: string }> } };
+    assert.deepEqual(rosterAfterBodyDenial.details, { peers: [{ address: recipientAddress }] });
+    recipient.sendUserMessageAttempts.length = 0;
+
     const objectMarker = "local-object-body-crosses-canonically";
     const messageIDs: string[] = [];
     const deliveryIDs: string[] = [];

@@ -18,6 +18,7 @@ import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 6. Treat `status: "timeout", reason: "recipient_disconnected"` as relay-observed loss of the selected recipient session or failure to write its offer before ACK; the sender connection remains usable.
 7. Treat `status: "timeout", reason: "ack_timeout"` as an offer written to a connected recipient that did not return the exact ACK within five seconds; both connections remain usable.
 8. Treat `status: "denied", reason: "message_id_conflict"` as safe rejection of changed immutable content under one generated logical ID; both healthy connections remain usable.
+9. If the tool throws `Relay agent_send body exceeds 256 KiB.`, reduce the serialized body. This local validation creates no message ID or network request and leaves the connection usable.
 </Steps>
 
 The extension creates the message ID. Do not add `message_id`, delivery options, or steering fields to tool input. Every recipient sees a provenance header containing the complete quoted sender address and generated message ID. The extension treats that address as opaque; copy it whole. Delivery mode comes only from the recipient's current local state: an idle recipient gets `pi.sendUserMessage(rendered)` with no options, while a busy recipient gets `pi.sendUserMessage(rendered, { deliverAs: "followUp" })`. A follow-up waits behind all active recipient work; it does not steer or change the current run.
@@ -45,6 +46,8 @@ The extension generates a new reply message ID; it never reuses the original ID.
 
 ## Retry and current limits
 
+A body may occupy at most 262,144 UTF-8 bytes after JSON serialization. This is not character count and is separate from the 524,288-byte complete-frame limit. String quotes and escapes count: `"abc"` is five bytes, while a newline becomes the two serialized bytes backslash and `n`; Unicode characters use their UTF-8 byte lengths. JSON objects are counted in canonical compact form with sorted keys. Exactly 262,144 bytes is accepted; 262,145 bytes throws the content-free local error above before IDs, timers, retry ownership, or socket write. Ponytail: both limits are fixed for v1; make them configurable only when another deployment profile needs different values.
+
 For each `agent_send`, the extension creates one logical message ID and one immutable payload. Its retry trigger starts with the logical operation and fires at exactly four seconds. It makes exactly one internal retry only when the first write has already completed successfully, no response settled, no write is unresolved, and that same socket remains current and open. An unresolved or failed first write is not retried and follows existing terminal failure or eight-second logical-deadline behavior. The retry does not reconnect, replay after disconnect, restart its trigger, wait behind a write, or extend the deadline. A result for either request frame settles the tool once; an exact paired late result is drained instead of damaging the next operation.
 
 The relay recognizes the retry by the exact authenticated sender session and message ID. An identical retained request never causes a second recipient injection. Changing destination, `re` presence/value, or semantic body under that ID returns `denied/message_id_conflict`; normal extension code retransmits its already-built payload, so this denial mainly identifies a faulty or hostile raw client.
@@ -55,7 +58,7 @@ Only one `list_peers` or `agent_send` request may be active on one extension con
 
 Recipient acknowledgements remain valid while that same authenticated session has its own outgoing operation pending; one session can act as sender and recipient. This ACK overlap adds no list/send pipelining promise and no ACK queue. After an offline, recipient-disconnected, ACK-timeout, or message-ID-conflict result, use the same sender connection for `list_peers` or another send. A disconnected sender must authenticate a subsequent session; its abandoned send is not retried or replayed. The extension allows five seconds for a list response, triggers one eligible retry at four seconds, and keeps eight seconds for the complete send response. The eight-second send deadline starts before relay processing and leaves room for the relay's bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender response write, and scheduling. It does not reduce the recipient's five seconds.
 
-The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each exact recipient session. The oldest settled insertion is evicted when entry 1,025 settles. IDs still inside that window return their known result or a stable conflict without another offer. Separately, one current logical result per exact sender session—including `offline` or `recipient_disconnected`—survives recipient cleanup only long enough to classify the permitted already-emitted retry. It clears after that retry response is reserved, when the next distinct list or send starts, on sender loss, or on server shutdown. Recipient-window eviction cannot remove this one sender-current result. Once neither owner remains, the ID is unknown and a later frame is a new logical send; models still cannot choose or reuse IDs. There is no offline inbox, persistence, reconnect replay, broadcast, delivery history, or proof that an absent route existed before. The final 256 KiB body rejection behavior belongs to #24; every complete transport frame is currently bounded to 512 KiB.
+The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each exact recipient session. The oldest settled insertion is evicted when entry 1,025 settles. IDs still inside that window return their known result or a stable conflict without another offer. Separately, one current logical result per exact sender session—including `offline` or `recipient_disconnected`—survives recipient cleanup only long enough to classify the permitted already-emitted retry. It clears after that retry response is reserved, when the next distinct list or send starts, on sender loss, or on server shutdown. Recipient-window eviction cannot remove this one sender-current result. Once neither owner remains, the ID is unknown and a later frame is a new logical send; models still cannot choose or reuse IDs. There is no offline inbox, persistence, reconnect replay, broadcast, delivery history, or proof that an absent route existed before. Every serialized body is bounded to 256 KiB and every complete transport frame to 512 KiB.
 
 ### I/O examples
 
@@ -111,6 +114,18 @@ The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each
     {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"message_id_conflict"}
     ```
   </TabItem>
+  <TabItem label="Oversized body tool error">
+    ```text
+    input serialized body: 262,145 UTF-8 bytes
+    thrown error: Relay agent_send body exceeds 256 KiB.
+    log reason: body_too_large; body omitted
+    ```
+  </TabItem>
+  <TabItem label="Raw-client denial">
+    ```json
+    {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"body_too_large"}
+    ```
+  </TabItem>
   <TabItem label="Automatic retry effect">
     ```text
     logical clock reaches 4s + first write already succeeded + no response → one same-socket frame with fresh request_id, unchanged message_id/body/to/re, original 8s deadline
@@ -152,13 +167,14 @@ The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each
 
 ## Security and troubleshooting
 
-Message bodies are not persisted or logged. Server telemetry includes public route, request, and message identifiers while the `body` field contains only `<redacted>`. Successful delivery also includes a delivery ID. Offline settlement includes `status: "timeout"`, `reason`/`code: "offline"`, and the exact requested destination, but no delivery ID. Recipient-disconnect and ACK-timeout settlements include the generated delivery ID, `status: "timeout"`, and exact `reason`/`code: "recipient_disconnected"` or `"ack_timeout"`; stale competing events emit no second settlement. Sender-abandoned work has no result or `send_settled`; use the existing `session_disconnected` event as lifecycle evidence.
+Message bodies are not persisted or logged. Server telemetry includes public route, request, and message identifiers while the `body` field contains only `<redacted>`. Successful delivery also includes a delivery ID. Offline settlement includes `status: "timeout"`, `reason`/`code: "offline"`, and the exact requested destination, but no delivery ID. A raw-client body denial includes request/message IDs, sender route, `status: "denied"`, and `reason`/`code: "body_too_large"`, but no recipient route or delivery ID because nothing is looked up or forwarded. Recipient-disconnect and ACK-timeout settlements include the generated delivery ID, `status: "timeout"`, and exact `reason`/`code: "recipient_disconnected"` or `"ack_timeout"`; stale competing events emit no second settlement. Sender-abandoned work has no result or `send_settled`; use the existing `session_disconnected` event as lifecycle evidence.
 
 - **Offline result:** refresh `list_peers` or choose another destination. The retained connection is still usable; retrying the same absent address does not create an inbox or history.
 - **Recipient-disconnected result:** the relay found the listed recipient but observed its exact session disappear or could not write the offer before ACK. Every affected pending slot is released once. The sender socket stays usable; a later recipient connection receives no old offer.
 - **ACK-timeout result:** the recipient was connected when the relay wrote the offer but no exact extension ACK arrived within five seconds. The pending slot is released and both sockets remain usable.
 - **Message-ID-conflict result:** the relay already knows that generated ID with different immutable content. Normal extension retries cannot create this because they resend the exact built payload. Keep the socket, record the request and message IDs, and inspect custom raw-client behavior; bodies and fingerprints remain redacted.
 - **Disconnected error:** pair and authenticate the installation, or start a new Pi session if the retained socket closed. The relay immediately releases pending work owned by that exact sender session, returns no unreachable result, and never reconnects or replays it. Reconnect is deferred.
+- **Body-too-large error:** reduce the complete serialized JSON value to at most 262,144 UTF-8 bytes. For strings, count JSON quotes and escapes rather than source characters. The same connection can be used immediately.
 - **Unsafe JSON object error:** use only JSON values in plain objects and dense arrays. Cycles, accessors, nonfinite numbers, `undefined`, bigint, symbols, functions, custom object prototypes, and malformed Unicode are rejected before transport without logging content.
 - **Concurrent request error:** wait for the current list or send operation to settle. The extension rejects this locally; a custom raw client that bypasses the extension is closed by the relay. No request is queued.
 - **Need proof of completion:** ask the recipient to send a later ordinary correlated reply. That reply is separate evidence, not a guarantee; either `received` result is intentionally not proof of model work.

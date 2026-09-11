@@ -29,11 +29,12 @@ type listOperationPayload struct {
 }
 
 type sendOperationPayload struct {
-	MessageID string
-	To        string
-	Body      json.RawMessage
-	Re        string
-	RePresent bool
+	MessageID    string
+	To           string
+	Body         json.RawMessage
+	Re           string
+	RePresent    bool
+	BodyTooLarge bool
 }
 
 type receivedOperationPayload struct {
@@ -337,7 +338,7 @@ func (service *sessionAuthService) serveAuthenticated(
 
 			operationStarted := time.Now()
 			operation.ObservedAt = operationStarted
-			if failure == nil && operation.Type == "send" {
+			if failure == nil && operation.Type == "send" && !operation.Send.BodyTooLarge {
 				if service.beforeRepeatedSendObservation != nil {
 					service.beforeRepeatedSendObservation(operation)
 				}
@@ -381,7 +382,7 @@ func (service *sessionAuthService) serveAuthenticated(
 				terminate()
 				return
 			}
-			if failure == nil && operation.Type == "send" {
+			if failure == nil && operation.Type == "send" && !operation.Send.BodyTooLarge {
 				if beginErr := service.connections.dedupe.begin(session, &operation); beginErr != nil {
 					service.reportFatal(fmt.Errorf("begin send dedupe record: %w", beginErr))
 					terminate()
@@ -676,7 +677,11 @@ func decodeSendPayload(data []byte) (sendOperationPayload, bool) {
 	default:
 		return sendOperationPayload{}, false
 	}
-	payload.Body = append(json.RawMessage(nil), body...)
+	if len(body) > maxBodyBytes {
+		payload.BodyTooLarge = true
+	} else {
+		payload.Body = append(json.RawMessage(nil), body...)
+	}
 	if re, exists := fields["re"]; exists {
 		if err := json.Unmarshal(re, &payload.Re); err != nil || !isUUIDv7(payload.Re) {
 			return sendOperationPayload{}, false

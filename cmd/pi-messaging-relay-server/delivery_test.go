@@ -426,7 +426,23 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 				close(offerInstalled)
 				<-releaseOffer
 			}
-			service.dispatchOperation = dispatcher.dispatch
+			var guardedBody json.RawMessage
+			// The public parser now rejects this legacy 512 KiB defense-in-depth
+			// scenario at the narrower body boundary. Clear only its internal flag
+			// at the injected dispatcher seam so this test still exercises outbound
+			// frame-guard ownership, which remains required but is unreachable from
+			// a conforming v1 body.
+			service.dispatchOperation = func(
+				ctx context.Context,
+				session *authenticatedSession,
+				operation clientOperation,
+			) (operationResponse, bool, error) {
+				if operation.Send != nil {
+					operation.Send.BodyTooLarge = false
+					operation.Send.Body = guardedBody
+				}
+				return dispatcher.dispatch(ctx, session, operation)
+			}
 			server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 			t.Cleanup(server.Close)
 			endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
@@ -482,6 +498,7 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode expected offer body: %v", err)
 			}
+			guardedBody = encodedBody
 			expectedOffer, err := json.Marshal(messageEnvelope{
 				Version: 1,
 				Type:    "message",

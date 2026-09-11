@@ -9,6 +9,8 @@ import {
 import { generateUUIDv7 } from "./uuid.ts";
 
 const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
+// ponytail: fixed to v1's 256 KiB serialized body; make configurable when another profile exists.
+const MAX_SEND_BODY_BYTES = 262_144;
 const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_ADDRESS_BYTES = 4_389;
 const MAX_CURSOR_CHARACTERS = 5_856;
@@ -41,7 +43,8 @@ export type SendResult =
   | { message_id: string; status: "timeout"; reason: "offline" }
   | { message_id: string; status: "timeout"; reason: "ack_timeout" }
   | { message_id: string; status: "timeout"; reason: "recipient_disconnected" }
-  | { message_id: string; status: "denied"; reason: "message_id_conflict" };
+  | { message_id: string; status: "denied"; reason: "message_id_conflict" }
+  | { message_id: string; status: "denied"; reason: "body_too_large" };
 
 type ResponseDeadline = {
   cancel(): void;
@@ -132,12 +135,12 @@ export class RosterClient {
     }
     let encodedBody: string;
     try {
-      encodedBody = canonicalCompactJSON(body, maximumSendBodyBytes(to, re));
+      encodedBody = canonicalCompactJSON(body, MAX_SEND_BODY_BYTES);
     } catch (error) {
       if (error instanceof CanonicalJSONError && error.failure === "maximum_bytes") {
         return Promise.reject(new RosterRequestError(
-          "invalid_arguments",
-          "Relay agent_send frame exceeds 512 KiB.",
+          "body_too_large",
+          "Relay agent_send body exceeds 256 KiB.",
         ));
       }
       return Promise.reject(new RosterRequestError(
@@ -497,20 +500,11 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
        payload.reason === "recipient_disconnected")) {
     return { message_id: messageID, status: "timeout", reason: payload.reason };
   }
-  if (hasExactKeys(payload, ["message_id", "status", "reason"]) &&
-      payload.status === "denied" && payload.reason === "message_id_conflict") {
-    return { message_id: messageID, status: "denied", reason: "message_id_conflict" };
+  if (hasExactKeys(payload, ["message_id", "status", "reason"]) && payload.status === "denied" &&
+      (payload.reason === "message_id_conflict" || payload.reason === "body_too_large")) {
+    return { message_id: messageID, status: "denied", reason: payload.reason };
   }
   throw new Error("invalid send result payload");
-}
-
-function maximumSendBodyBytes(to: string, re: string | undefined): number {
-  const uuidPlaceholder = "00000000-0000-7000-8000-000000000000";
-  const encodedRe = re === undefined ? "" : `,"re":${JSON.stringify(re)}`;
-  const frameWithoutBody = `{"v":1,"type":"send","request_id":${JSON.stringify(uuidPlaceholder)},` +
-    `"payload":{"message_id":${JSON.stringify(uuidPlaceholder)},"to":${JSON.stringify(to)},` +
-    `"body":${encodedRe}}}`;
-  return MAX_FRAME_BYTES - Buffer.byteLength(frameWithoutBody, "utf8");
 }
 
 function validCursor(cursor: string): boolean {

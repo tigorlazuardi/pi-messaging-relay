@@ -91,6 +91,21 @@ func (dispatcher *deliveryDispatcher) send(
 	sender *authenticatedSession,
 	operation clientOperation,
 ) (operationResponse, bool, error) {
+	if operation.Send.BodyTooLarge {
+		return operationResponse{
+			Type: "send_result",
+			Payload: sendResultPayload{
+				MessageID: operation.Send.MessageID,
+				Status:    "denied",
+				Reason:    "body_too_large",
+			},
+			Outcome:     "denied",
+			Code:        "body_too_large",
+			MessageID:   operation.Send.MessageID,
+			SenderRoute: sender.Address,
+			Status:      "denied",
+		}, true, nil
+	}
 	recipient, ok := dispatcher.registry.publishedSession(operation.Send.To)
 	if !ok {
 		return operationResponse{

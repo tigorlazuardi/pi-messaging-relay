@@ -26,6 +26,7 @@ const (
 	maxCWDBytes           = 4096
 	maxHostnameBytes      = 255
 	heartbeatMilliseconds = 30_000
+	// ponytail: fixed to v1's 256 KiB serialized body; make configurable when another profile exists.
 	maxBodyBytes          = 262_144
 	maxSessionConnections = 1024
 	authTranscriptDomain  = "pi-messaging-relay-auth-v1\n"

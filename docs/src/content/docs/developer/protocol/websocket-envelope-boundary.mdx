@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 This seam replaces the retained socket's one-read placeholder with a bounded post-authentication message loop. It validates the client operation language before any roster, routing, delivery, acknowledgment, or offline behavior can run.
 
 <Aside type="note" title="Implementation boundary">
-The production dispatcher now binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14–#18 connect successful delivery, acknowledgment, correlated replies, and immediate offline registry-miss outcomes. Ticket #24 adds the separate 256 KiB serialized-body rejection. This seam continues to define and test generic dispatch/result behavior without consuming those delivery tickets.
+The production dispatcher binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14–#24 connect delivery outcomes through the same strict parser, including the separate recoverable 256 KiB serialized-body denial. The generic 512 KiB frame boundary remains independent.
 </Aside>
 
 ## Parser states
@@ -42,14 +42,14 @@ The complete bytes must be valid UTF-8 and contain exactly one JSON value with n
 | Type | Required payload fields | Optional fields | Additional constraints |
 |---|---|---|---|
 | `list` | none | `cursor` | Payload is exactly `{}` or `{"cursor":"..."}`; a present cursor must satisfy the canonical bounded encoding below. |
-| `send` | `message_id`, `to`, `body` | `re` | IDs are UUIDv7; `to` is non-empty opaque UTF-8 and no larger than a server-issued v1 address; body is string or object. |
+| `send` | `message_id`, `to`, `body` | `re` | IDs are UUIDv7; `to` is non-empty opaque UTF-8 and no larger than a server-issued v1 address; body is structurally valid when it is a string or object independent of size. After strict validation, count its trimmed raw JSON bytes: values through 262,144 proceed and larger values remain valid operations denied as `body_too_large`. |
 | `received` | `delivery_id`, `message_id` | none | Both IDs are UUIDv7. |
 
 Envelope fields are exactly `v`, `type`, `request_id`, and `payload`. `v` is the JSON integer `1`, not a string, float, or exponent form. All request, message, correlation, and delivery IDs accepted by this boundary use canonical lowercase UUIDv7 text. Server-to-client types such as `message`, `roster`, `send_result`, `welcome`, and `error` are wrong-direction input and fail closed.
 
 A list cursor is `cur_` plus canonical unpadded Base64url of the last returned opaque address's raw UTF-8 bytes. Absence means the first page. A present cursor must be nonempty, no more than 5,856 ASCII characters, decode to valid UTF-8 of 1 through 4,389 bytes, and match exact canonical re-encoding. The parser retains only the decoded whole address as the operation's future navigation value. It never parses that value or consults the active registry, and it never treats a cursor as authorization.
 
-Application-owned body objects may contain arbitrary JSON field names and nested value types. They are not normalized here. Only duplicate object names are prohibited at every body depth. The general frame ceiling bounds string and object bodies in this seam; body-specific serialized-size enforcement remains ticket #24.
+Application-owned body objects may contain arbitrary JSON field names and nested value types. They are not normalized here. Only duplicate object names are prohibited at every body depth. After complete strict validation, the server trims JSON whitespace surrounding the raw `body` value and counts that value's UTF-8 bytes. Quotes and escape bytes are part of a string body's count; internal object whitespace is part of an object's count. At 262,144 bytes the operation proceeds normally. At 262,145 bytes it remains a valid `send` operation but carries a body-over-limit flag into recoverable denial. The separate complete-frame ceiling remains 524,288 bytes.
 
 <Decision title="Keep pagination decoding inside the protocol boundary" status="accepted">
 Malformed cursors fail terminally with other invalid typed payloads before the roster dispatcher can read presence state. Roster logic receives a bounded opaque navigation value rather than attacker-controlled encoding.
@@ -66,6 +66,7 @@ Duplicate keys are semantically ambiguous but ordinary map and struct decoding r
 | `invalid_frame` | Binary message, invalid UTF-8, malformed or trailing JSON, or message above 512 KiB | Best-effort error, then hard close |
 | `invalid_envelope` | Non-object JSON, duplicate or unknown fields, missing or mistyped fields, invalid UUIDv7, malformed typed payload, or unknown/wrong-direction type | Best-effort error, then hard close |
 | `unsupported_protocol` | Closed envelope shape with an integer major other than `1` | Best-effort error, then hard close |
+| `body_too_large` | Strictly valid `send` whose trimmed raw body JSON value exceeds 262,144 UTF-8 bytes | Correlated `send_result` denial; keep open |
 
 Every protocol error response is a server-created bounded object with `close: true`. Stable messages are `Invalid WebSocket frame`, `Invalid protocol envelope`, and `Unsupported protocol version`; no decoder diagnostic or attacker-controlled value is reflected. A canonical, unique top-level `request_id` is included only after complete JSON parsing proves it safe. Malformed JSON, duplicate top-level request IDs, binary messages, invalid UTF-8, and over-limit messages omit it.
 
@@ -79,7 +80,7 @@ The boundary owns framing, syntax, shape, and stable terminal errors. Operation 
 
 ## Telemetry
 
-`protocol_rejected` is a warning with `result: "rejected"`, stable `code` and `reason`, and validated request/type correlation when safe. Unknown submitted types, raw frames, parser diagnostics, addresses embedded in malformed operations, and bodies are omitted. Nesting beyond 64 containers is `invalid_frame`. `operation_denied` is a warning; `operation_settled` is informational. Both include only the validated client type, request ID, dispatcher-owned stable code, and outcome. Invalid dispatcher responses emit neither operation event; fatal diagnostics omit payload values and encoder details that could contain body data.
+`protocol_rejected` is a warning with `result: "rejected"`, stable `code` and `reason`, and validated request/type correlation when safe. Unknown submitted types, raw frames, parser diagnostics, addresses embedded in malformed operations, and bodies are omitted. Nesting beyond 64 containers is `invalid_frame`. `operation_denied` is a warning; `operation_settled` is informational. A body-limit denial includes request ID, message ID, authenticated sender route, `status: "denied"`, exact `reason`/`code: "body_too_large"`, and `body: "<redacted>"`. It omits recipient route because rejection precedes recipient lookup. Invalid dispatcher responses emit neither operation event; fatal diagnostics omit payload values and encoder details that could contain body data.
 
 The event sink remains part of settlement correctness. A failed event write reaches the fatal runtime latch, closes the affected socket, prevents a successful `server_stopped` report, and causes non-zero process termination. No protocol event contains authentication secrets, nonce, signature, private key, or message body.
 
@@ -135,6 +136,24 @@ The event sink remains part of settlement correctness. A failed event write reac
   <TabItem label="Denial event">
     ```json
     {"level":"warn","event":"operation_denied","result":"denied","reason":"not_authorized","code":"not_authorized","type":"send","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf"}
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Oversized body input">
+    ```text
+    send payload body: one valid JSON string value totaling 262,145 UTF-8 bytes, including its quotes and escapes
+    ```
+  </TabItem>
+  <TabItem label="Recoverable denial">
+    ```json
+    {"v":1,"type":"send_result","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","payload":{"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"body_too_large"}}
+    ```
+  </TabItem>
+  <TabItem label="Denial event">
+    ```json
+    {"level":"warn","event":"operation_denied","result":"denied","reason":"body_too_large","code":"body_too_large","type":"send","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","status":"denied","body":"<redacted>","latency_ms":0}
     ```
   </TabItem>
 </Tabs>

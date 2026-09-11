@@ -47,8 +47,8 @@ The retained connection permits one in-flight outgoing list or send request. Con
 
 The model cannot provide `message_id`, delivery policy, steering intent, or any other relay field. Addresses remain opaque strings. Schema validation rejects extra properties, an empty destination, array or null bodies, invalid `re`, and missing required fields before a connected implementation can own those values. Safe JSON objects now cross the retained transport. The retained client rejects proxies and unsafe descriptors without invoking traps or getters, snapshots the validated graph with `structuredClone`, then canonically encodes the snapshot once within an explicit complete-frame byte budget before creating IDs or operation state. The recipient injects the deterministic one-line provenance rendering documented in [authenticated message delivery](/developer/relay/message-delivery/).
 
-<Decision title="Defer the 256 KiB body outcome to ticket #24" status="accepted">
-The connected transport derives the canonical body budget from exact fixed send-frame overhead, rejects incrementally before output exceeds the general 512 KiB ceiling, and retains a final exact complete-frame check. This is not the distinct UTF-8 262,144-byte serialized-body boundary, stable operation-level rejection, and connection-reuse acceptance still owned by ticket #24.
+<Decision title="Reject oversized bodies before owning a send" status="accepted">
+The connected transport canonically serializes the body within a fixed 262,144 UTF-8-byte budget before generating request or message IDs, installing abort/deadline/retry ownership, or allocating and writing a send frame. The count is the complete serialized JSON value: string quotes and escapes count, multibyte characters count by UTF-8 bytes, and objects use the extension's canonical compact serialization. Exactly 262,144 bytes proceeds; one byte more throws content-free `RosterRequestError` reason `body_too_large` with message `Relay agent_send body exceeds 256 KiB.` through Pi's existing tool-error path. The retained socket stays reusable. A separate final 512 KiB complete-frame guard remains defense in depth.
 </Decision>
 
 ## Disconnected outcomes
@@ -117,6 +117,13 @@ Authentication establishes a live session identity. One retained-socket owner co
     {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"received"}
     ```
   </TabItem>
+  <TabItem label="Oversized local tool error">
+    ```text
+    input body: canonical serialized JSON value of 262,145 UTF-8 bytes
+    thrown error: Relay agent_send body exceeds 256 KiB.
+    telemetry reason: body_too_large; body content omitted
+    ```
+  </TabItem>
 </Tabs>
 
 ## Fake Pi host seam
@@ -143,4 +150,4 @@ The primary pairing acceptance additionally starts the real Go child, invokes th
 The package declares TypeBox 1.3.7 and `ws` 8.21.3 as pinned extension-local runtime dependencies through `extension/package-lock.json`; `npm ci` installs both beside the extension. TypeBox owns tool schemas. The `ws` client enforces the 512 KiB socket-wide pre-materialization ceiling; the authentication handler separately enforces 16 KiB challenge and welcome semantics and supports bounded hard transport termination. This avoids assuming that a Nix-installed Pi exposes its internal package tree to a user extension at runtime. Pi core remains a type-only import and is erased before runtime, so the extension does not resolve Pi internals at runtime.
 </Decision>
 
-Successful sends are logged once by the server owner with correlation IDs, route addresses, latency, and `body: "<redacted>"`; the extension emits no duplicate success log. Failed model-tool attempts write one structured warning with `event: "relay_operation_failed"` and a stable bounded reason, never a cursor or roster. Pairing writes one settled `relay_pair_accepted` or `relay_pair_rejected` event with latency and stable result or reason. Session lifecycle emits `relay_auth_accepted`, `relay_auth_rejected`, and `relay_session_disconnected`; accepted and disconnected events carry available public client, route, and address correlation fields. Pairing-code, nonce, signature, and private-key field names contain `<redacted>`; message bodies remain absent. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.
+Successful sends are logged once by the server owner with correlation IDs, route addresses, latency, and `body: "<redacted>"`; the extension emits no duplicate success log. Failed model-tool attempts—including local `body_too_large`—write one structured warning with `event: "relay_operation_failed"` and a stable bounded reason, never a body, cursor, or roster. Pairing writes one settled `relay_pair_accepted` or `relay_pair_rejected` event with latency and stable result or reason. Session lifecycle emits `relay_auth_accepted`, `relay_auth_rejected`, and `relay_session_disconnected`; accepted and disconnected events carry available public client, route, and address correlation fields. Pairing-code, nonce, signature, and private-key field names contain `<redacted>`; message bodies remain absent. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.

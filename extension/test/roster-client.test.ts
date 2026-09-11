@@ -9,6 +9,7 @@ import { RosterClient, RosterRequestError } from "../internal/roster-client.ts";
 
 const REQUEST_ID = "01993c84-5d38-7d75-8bc1-f945bfa42cdf";
 const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
+const MAX_BODY_BYTES = 256 * 1024;
 const MAX_FRAME_BYTES = 512 * 1024;
 
 async function socketPair(): Promise<{ client: WebSocket; server: WebSocket; close(): Promise<void> }> {
@@ -391,7 +392,70 @@ test("send does not queue a retry behind an unresolved first write", async (cont
   assert.equal((await resultPromise).status, "received");
 });
 
-test("send accepts only exact message_id_conflict denial and keeps the socket usable", async (context) => {
+test("send enforces exact serialized-body bytes locally before operation ownership", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  let responseDeadlines = 0;
+  let retryDeadlines = 0;
+  const client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    responseDeadlineFactory: (expire, durationMS) => {
+      responseDeadlines += 1;
+      const timer = setTimeout(expire, durationMS);
+      return { cancel: () => clearTimeout(timer) };
+    },
+    retryDeadlineFactory: (expire, durationMS) => {
+      retryDeadlines += 1;
+      const timer = setTimeout(expire, durationMS);
+      return { cancel: () => clearTimeout(timer) };
+    },
+  });
+  const marker = "body-boundary-private-marker-\"-\n-💾";
+  const prefixBytes = Buffer.byteLength(JSON.stringify(marker), "utf8");
+  const atLimit = marker + "x".repeat(MAX_BODY_BYTES - prefixBytes);
+  assert.equal(Buffer.byteLength(JSON.stringify(atLimit), "utf8"), MAX_BODY_BYTES);
+
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send("destination", atLimit, undefined, new AbortController().signal);
+  const request = await requestPromise;
+  const payload = request.payload as Record<string, unknown>;
+  assert.equal(Buffer.byteLength(JSON.stringify(payload.body), "utf8"), MAX_BODY_BYTES);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: request.request_id,
+    payload: { message_id: payload.message_id, status: "received" },
+  }));
+  assert.equal((await resultPromise).status, "received");
+  assert.equal(responseDeadlines, 1);
+  assert.equal(retryDeadlines, 1);
+
+  const unexpectedFrames: string[] = [];
+  const overLimitController = new AbortController();
+  pair.server.on("message", (data) => unexpectedFrames.push(data.toString("utf8")));
+  await assert.rejects(
+    client.send("destination", atLimit + "x", undefined, overLimitController.signal),
+    (error: unknown) => error instanceof RosterRequestError &&
+      error.reason === "body_too_large" &&
+      error.message === "Relay agent_send body exceeds 256 KiB." &&
+      !error.message.includes(marker),
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(unexpectedFrames, []);
+  assert.equal(responseDeadlines, 1);
+  assert.equal(retryDeadlines, 1);
+  assert.equal(getEventListeners(overLimitController.signal, "abort").length, 0);
+  assert.equal(pair.client.readyState, WebSocket.OPEN);
+  assert.equal(pair.server.readyState, WebSocket.OPEN);
+
+  const listRequestPromise = nextClientRequest(pair.server);
+  const listResultPromise = client.list(undefined, new AbortController().signal);
+  const listRequest = await listRequestPromise;
+  pair.server.send(roster(String(listRequest.request_id), { peers: [] }));
+  assert.deepEqual(await listResultPromise, { peers: [] });
+});
+
+test("send accepts exact server denials and keeps the socket usable", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);
   const client = new RosterClient(pair.client, {
@@ -412,6 +476,22 @@ test("send accepts only exact message_id_conflict denial and keeps the socket us
     message_id: messageID,
     status: "denied",
     reason: "message_id_conflict",
+  });
+
+  const bodyRequestPromise = nextClientRequest(pair.server);
+  const bodyResultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  const bodyRequest = await bodyRequestPromise;
+  const bodyMessageID = String((bodyRequest.payload as Record<string, unknown>).message_id);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: bodyRequest.request_id,
+    payload: { message_id: bodyMessageID, status: "denied", reason: "body_too_large" },
+  }));
+  assert.deepEqual(await bodyResultPromise, {
+    message_id: bodyMessageID,
+    status: "denied",
+    reason: "body_too_large",
   });
 
   const listRequestPromise = nextClientRequest(pair.server);
@@ -574,7 +654,7 @@ test("response deadline factory failure rejects generically without writing or l
   assert.equal(pair.server.readyState, WebSocket.OPEN);
 });
 
-test("send accepts canonical objects and rejects unsafe or over-transport-limit input without consuming the connection", async (context) => {
+test("send accepts canonical objects and rejects unsafe or over-body-limit input without consuming the connection", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);
   const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
@@ -603,32 +683,6 @@ test("send accepts canonical objects and rejects unsafe or over-transport-limit 
     message_id: objectPayload.message_id,
     status: "received",
   });
-
-  const uuidPlaceholder = "00000000-0000-7000-8000-000000000000";
-  const exactFrameWithoutBody = `{"v":1,"type":"send","request_id":${JSON.stringify(uuidPlaceholder)},` +
-    `"payload":{"message_id":${JSON.stringify(uuidPlaceholder)},"to":"destination","body":}}`;
-  const exactObjectShell = '{"value":""}';
-  const exactValueLength = MAX_FRAME_BYTES -
-    Buffer.byteLength(exactFrameWithoutBody, "utf8") -
-    Buffer.byteLength(exactObjectShell, "utf8");
-  const exactRequestPromise = nextClientFrame(pair.server);
-  const exactResultPromise = client.send(
-    "destination",
-    { value: "x".repeat(exactValueLength) },
-    undefined,
-    new AbortController().signal,
-  );
-  const exactFrame = await exactRequestPromise;
-  assert.equal(Buffer.byteLength(exactFrame, "utf8"), MAX_FRAME_BYTES);
-  const exactRequest = JSON.parse(exactFrame) as Record<string, unknown>;
-  const exactPayload = exactRequest.payload as Record<string, unknown>;
-  pair.server.send(JSON.stringify({
-    v: 1,
-    type: "send_result",
-    request_id: exactRequest.request_id,
-    payload: { message_id: exactPayload.message_id, status: "received" },
-  }));
-  assert.equal((await exactResultPromise).status, "received");
 
   const invalidOutbound: string[] = [];
   pair.server.on("message", (data) => invalidOutbound.push(data.toString("utf8")));
@@ -678,25 +732,26 @@ test("send accepts canonical objects and rejects unsafe or over-transport-limit 
   await assert.rejects(
     client.send("destination", { hugeSparse }, undefined, new AbortController().signal),
     (error: unknown) => error instanceof RosterRequestError &&
-      error.reason === "invalid_arguments" &&
-      error.message === "Relay agent_send frame exceeds 512 KiB.",
+      error.reason === "body_too_large" &&
+      error.message === "Relay agent_send body exceeds 256 KiB.",
   );
   await assert.rejects(client.send("destination", "\ud800", undefined, new AbortController().signal), {
     message: "Relay agent_send arguments are invalid.",
   });
   await assert.rejects(client.send("destination", "x".repeat(512 * 1024), undefined, new AbortController().signal), {
-    message: "Relay agent_send frame exceeds 512 KiB.",
+    message: "Relay agent_send body exceeds 256 KiB.",
   });
+  const overLimitObjectValueBytes = MAX_BODY_BYTES - Buffer.byteLength('{"value":""}', "utf8") + 1;
   await assert.rejects(
     client.send(
       "destination",
-      { value: marker + "x".repeat(exactValueLength - marker.length + 1) },
+      { value: marker + "x".repeat(overLimitObjectValueBytes - marker.length) },
       undefined,
       new AbortController().signal,
     ),
     (error: unknown) => error instanceof RosterRequestError &&
-      error.reason === "invalid_arguments" &&
-      error.message === "Relay agent_send frame exceeds 512 KiB." &&
+      error.reason === "body_too_large" &&
+      error.message === "Relay agent_send body exceeds 256 KiB." &&
       !error.message.includes(marker),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));

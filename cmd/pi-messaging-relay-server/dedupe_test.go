@@ -250,6 +250,149 @@ func TestRepeatedSendFrameIsIdempotentConflictAwareAndSessionIsolated(t *testing
 	}
 }
 
+func TestOversizedBodyDenialPrecedesDedupeAndKeepsSessionsUsable(t *testing.T) {
+	h := newDedupeTestHarness(t)
+	sender := h.open("01993ca6-1111-7aaa-8aaa-111111111111", "/sender")
+	recipient := h.open("01993ca6-2222-7aaa-8aaa-222222222222", "/recipient")
+	recipient.SetReadLimit(maxFrameBytes)
+	const (
+		recipientAddress = "/recipient@host#01993ca6-2222-7aaa-8aaa-222222222222"
+		retainedID       = "01993ca6-3001-7aaa-8aaa-000000000001"
+		freshID          = "01993ca6-3002-7aaa-8aaa-000000000002"
+	)
+	serializedString := func(marker string, bytes int) string {
+		t.Helper()
+		body := `"` + marker + strings.Repeat("x", bytes-len(marker)-2) + `"`
+		if len(body) != bytes {
+			t.Fatalf("serialized body bytes = %d, want %d", len(body), bytes)
+		}
+		return body
+	}
+	ackOffer := func(offer messageEnvelope, messageID, requestID string) {
+		t.Helper()
+		ack := fmt.Sprintf(
+			`{"v":1,"type":"received","request_id":%q,"payload":{"delivery_id":%q,"message_id":%q}}`,
+			requestID, offer.Payload.DeliveryID, messageID,
+		)
+		if err := recipient.Write(h.ctx, websocket.MessageText, []byte(ack)); err != nil {
+			t.Fatalf("acknowledge body-boundary offer: %v", err)
+		}
+	}
+
+	const exactMarker = "exact-body-private-marker"
+	exactBody := " \n" + serializedString(exactMarker, maxBodyBytes) + "\t"
+	if err := sender.Write(h.ctx, websocket.MessageText, rawSendFrame(
+		"01993ca6-4001-7aaa-8aaa-000000000001", retainedID, recipientAddress, exactBody, "",
+	)); err != nil {
+		t.Fatalf("write exact-limit body: %v", err)
+	}
+	var exactOffer messageEnvelope
+	if err := wsjson.Read(h.ctx, recipient, &exactOffer); err != nil {
+		t.Fatalf("read exact-limit offer: %v", err)
+	}
+	if len(exactOffer.Payload.Body) != maxBodyBytes || exactOffer.Payload.MessageID != retainedID {
+		t.Fatalf("exact-limit offer body bytes = %d message=%s", len(exactOffer.Payload.Body), exactOffer.Payload.MessageID)
+	}
+	ackOffer(exactOffer, retainedID, "01993ca6-5001-7aaa-8aaa-000000000001")
+	if response := readResponse(t, h.ctx, sender); responsePayload(t, response) !=
+		`{"message_id":"`+retainedID+`","status":"received"}` {
+		t.Fatalf("exact-limit response = %+v payload=%s", response, responsePayload(t, response))
+	}
+
+	const oversizedMarker = "oversized-body-private-marker"
+	oversizedBody := "\t" + serializedString(oversizedMarker, maxBodyBytes+1) + " \n"
+	assertDenied := func(requestID, messageID string) {
+		t.Helper()
+		if err := sender.Write(h.ctx, websocket.MessageText,
+			rawSendFrame(requestID, messageID, recipientAddress, oversizedBody, "")); err != nil {
+			t.Fatalf("write oversized body: %v", err)
+		}
+		response := readResponse(t, h.ctx, sender)
+		if response.RequestID != requestID || response.Type != "send_result" || responsePayload(t, response) !=
+			`{"message_id":"`+messageID+`","reason":"body_too_large","status":"denied"}` {
+			t.Fatalf("oversized response = %+v payload=%s", response, responsePayload(t, response))
+		}
+	}
+
+	// Body denial wins over an existing retained identity and does not mutate it.
+	assertDenied("01993ca6-4002-7aaa-8aaa-000000000002", retainedID)
+	if err := sender.Write(h.ctx, websocket.MessageText, rawSendFrame(
+		"01993ca6-4003-7aaa-8aaa-000000000003", retainedID, recipientAddress, exactBody, "",
+	)); err != nil {
+		t.Fatalf("write retained legal duplicate: %v", err)
+	}
+	if response := readResponse(t, h.ctx, sender); responsePayload(t, response) !=
+		`{"message_id":"`+retainedID+`","status":"received"}` {
+		t.Fatalf("retained result after oversized body = %+v payload=%s", response, responsePayload(t, response))
+	}
+
+	// An unknown oversized identity creates no record; list and a later legal send remain usable.
+	assertDenied("01993ca6-4004-7aaa-8aaa-000000000004", freshID)
+	const listRequestID = "01993ca6-4005-7aaa-8aaa-000000000005"
+	if err := sender.Write(h.ctx, websocket.MessageText, []byte(fmt.Sprintf(
+		`{"v":1,"type":"list","request_id":%q,"payload":{}}`, listRequestID,
+	))); err != nil {
+		t.Fatalf("write list after oversized denial: %v", err)
+	}
+	if response := readResponse(t, h.ctx, sender); response.Type != "roster" || response.RequestID != listRequestID {
+		t.Fatalf("list after oversized denial = %+v", response)
+	}
+	if err := sender.Write(h.ctx, websocket.MessageText, rawSendFrame(
+		"01993ca6-4006-7aaa-8aaa-000000000006", freshID, recipientAddress, `"legal"`, "",
+	)); err != nil {
+		t.Fatalf("write legal body after oversized denial: %v", err)
+	}
+	var freshOffer messageEnvelope
+	if err := wsjson.Read(h.ctx, recipient, &freshOffer); err != nil {
+		t.Fatalf("read pollution-free legal offer: %v", err)
+	}
+	if freshOffer.Payload.MessageID != freshID || string(freshOffer.Payload.Body) != `"legal"` {
+		t.Fatalf("pollution-free offer = %+v body=%s", freshOffer, freshOffer.Payload.Body)
+	}
+	ackOffer(freshOffer, freshID, "01993ca6-5002-7aaa-8aaa-000000000002")
+	if response := readResponse(t, h.ctx, sender); responsePayload(t, response) !=
+		`{"message_id":"`+freshID+`","status":"received"}` {
+		t.Fatalf("legal response after oversized denial = %+v payload=%s", response, responsePayload(t, response))
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for strings.Count(h.logs.String(), `"reason":"body_too_large"`) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	logs := h.logs.String()
+	if strings.Contains(logs, exactMarker) || strings.Contains(logs, oversizedMarker) {
+		t.Fatalf("oversized body telemetry leaked body fixture: %s", logs)
+	}
+	denials := 0
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode telemetry line: %v", err)
+		}
+		if event["event"] != "operation_denied" || event["reason"] != "body_too_large" {
+			continue
+		}
+		denials++
+		if event["result"] != "denied" || event["code"] != "body_too_large" ||
+			event["type"] != "send" || event["status"] != "denied" ||
+			event["sender_route"] != "/sender@host#01993ca6-1111-7aaa-8aaa-111111111111" ||
+			event["body"] != redacted || event["request_id"] == nil || event["message_id"] == nil {
+			t.Fatalf("oversized body denial telemetry = %#v", event)
+		}
+		if _, exists := event["recipient_route"]; exists {
+			t.Fatalf("oversized denial derived recipient route: %#v", event)
+		}
+	}
+	if denials != 2 {
+		t.Fatalf("oversized body denial event count = %d, want 2: %s", denials, logs)
+	}
+	select {
+	case <-h.reporter.reported:
+		t.Fatalf("oversized body caused fatal runtime failure: %v", h.reporter.err())
+	default:
+	}
+}
+
 func TestRecipientDedupeWindowEvictsOldestSettledInsertionAt1025(t *testing.T) {
 	h := newDedupeTestHarness(t)
 	sender := h.open("01993ca2-1111-7aaa-8aaa-111111111111", "/sender")
