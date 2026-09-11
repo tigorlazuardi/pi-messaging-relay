@@ -30,7 +30,7 @@ func TestSessionAuthenticationDeadlineClosesSilentPeer(t *testing.T) {
 		}
 	})
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestSessionCapacityRejectsBeforeUpgradeAndShutdownOwnsReservedPeer(t *testi
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestConcurrentDuplicateActiveRouteFailsClosedForSameAndDifferentInstallatio
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -519,7 +519,7 @@ func TestAuthenticatedWebSocketJSONNestingBoundary(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -657,7 +657,7 @@ func TestInvalidDispatcherResponseReachesFatalOwnerWithoutWireOrAuditLeak(t *tes
 		fatalReports.Add(1)
 		reporter.report(err)
 	}
-	pairing, err := newPairingService(t.TempDir(), "", logger, reportFatal)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reportFatal)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}

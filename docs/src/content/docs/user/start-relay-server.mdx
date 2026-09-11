@@ -5,7 +5,11 @@ description: Build the loopback relay, choose temporary or durable allowlist sta
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The relay binds only to a loopback IP literal. Each startup creates one cryptographically random pairing code with a ten-minute lifetime. It works only before the `expires_at` time in `pairing_code_created`; at that exact time it is expired. The raw code is available only when you explicitly select a private file; normal JSON logs always show `<redacted>`.
+<Aside type="caution" title="Linux-only relay server">
+The Go relay server is supported only on Linux. Its authorization-state safety requires Linux descriptor-relative filesystem operations, no-follow opens, Unix ownership, and Unix mode bits. Non-Linux builds refuse startup instead of using a weaker storage path. The separately installed TypeScript extension is not restricted by this server build boundary.
+</Aside>
+
+The relay binds only to a loopback IP literal. Each accepted startup creates one cryptographically random pairing code with a ten-minute lifetime. It works only before the `expires_at` time in `pairing_code_created`; at that exact time it is expired. The raw code is available only when you explicitly select a private direct child of the retained state directory; normal JSON logs always show `<redacted>`.
 
 ## Build and start
 
@@ -23,7 +27,7 @@ The relay binds only to a loopback IP literal. Each startup creates one cryptogr
    $ install -d -m 700 "$HOME/.local/state/pi-messaging-relay"
    ```
 
-3. In the server terminal, choose a pairing-code path that does not already exist and start on an operating-system-selected port:
+3. In the server terminal, choose a pairing-code filename directly inside that state directory. The entry must not already exist. Start on an operating-system-selected port:
 
    ```console
    $ ./bin/pi-messaging-relay-server \
@@ -37,19 +41,21 @@ The relay binds only to a loopback IP literal. Each startup creates one cryptogr
 </Steps>
 
 <Aside type="caution" title="Treat the code file as authentication material">
-Do not paste the code into logs, shell history, chat, issue text, or screenshots. The server creates the selected path with mode `0600` and refuses to overwrite an existing file. It removes its own file after successful pairing or normal shutdown.
+Do not paste the code into logs, shell history, chat, issue text, or screenshots. The server accepts only a direct child of its retained state directory, creates that entry with mode `0600`, and refuses to overwrite an existing file. It removes its own file after successful pairing or normal shutdown.
 </Aside>
 
 ## State choices
 
 | Flag | Behavior |
 |---|---|
-| Omit `--state-dir` | Create unique temporary state and remove it on graceful shutdown, preserving the original default lifecycle. |
-| `--state-dir PATH` | Create or use a mode-`0700` durable directory and retain `allowlist.json` after shutdown. |
+| Omit `--state-dir` | Create unique temporary state and remove it on graceful shutdown. Because its random path is not known before startup, no configured pairing-code path can be its direct child. |
+| `--state-dir PATH` | Create or use a mode-`0700` durable directory and retain `allowlist.json` after shutdown. Required when disclosing a pairing code. |
 | Omit `--pairing-code-file` | Generate a code but do not disclose its raw value. Pairing cannot be completed from that startup. |
-| `--pairing-code-file PATH` | Exclusively create a mode-`0600` operator channel containing the current raw code. |
+| `--pairing-code-file PATH` | Exclusively create a mode-`0600` direct child of the retained state directory containing the current raw code. External, parent-traversing, root, and `allowlist.json` paths fail before code generation and readiness. |
 
-`allowlist.json` is mode `0600`. It stores client ID, Ed25519 public key, and pairing time only. It does not contain raw pairing codes, private keys, messages, pending sends, or replay data. New durable state is committed before readiness, and an allowlist update is committed before HTTP success.
+`allowlist.json` is a current-user-owned regular mode-`0600` file. It stores client ID, Ed25519 public key, and canonical UTC pairing time only. It does not contain raw pairing codes, private keys, routes, requests, message or delivery IDs, bodies, pending sends, dedupe records, offline inboxes, or replay data. New durable state is committed before readiness, and an allowlist update is committed before HTTP success. On restart, the relay opens the entry nonblocking, checks that it is regular before reading, reads at most 1 MiB, and fails before readiness if it is corrupt, partial, ambiguous, duplicate, non-canonical, permissive, wrong-owner, a symlink, FIFO, or another non-regular type.
+
+Linux path trust covers the complete absolute path, not only its last component. Every ancestor must be owned by root or the relay process user. Group- or other-writable ancestors must also be sticky; `/tmp` mode `1777` is the normal accepted shared-directory example. Any ancestor symlink or writable non-sticky ancestor fails before `server_ready`. After validation, the process keeps the opened directory handle and performs allowlist and direct-child pairing-code operations relative to it. Renaming or replacing the configured pathname cannot redirect authorization state, pairing-code creation, or pairing-code removal while that process runs.
 
 A well-formed incorrect, expired, or already used code receives the same `pairing_code_invalid` rejection and never adds an allowlist entry. The raw submitted code crosses only into the localhost request; the response omits it rather than echoing a redacted copy, while structured logs keep `pairing_code` and `private_key` as `<redacted>`. A wrong code does not consume the current code. Success consumes it and removes the code file. An expired file can remain until shutdown, but its contents no longer authorize pairing; stop and restart the relay with a new unused file path to obtain a fresh code.
 
@@ -74,7 +80,7 @@ Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes
 Pass a loopback IP literal and port with `--listen`:
 
 ```console
-$ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080 --pairing-code-file /private/path/new-code-file
+$ ./bin/pi-messaging-relay-server --listen 127.0.0.1:8080 --state-dir "$HOME/.local/state/pi-messaging-relay" --pairing-code-file "$HOME/.local/state/pi-messaging-relay/new-code-file"
 ```
 
 IPv6 loopback is also accepted, for example `--listen '[::1]:8080'`. Hostnames such as `localhost`, wildcard addresses such as `0.0.0.0`, and non-loopback IPs are rejected.
@@ -103,7 +109,7 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
   </TabItem>
   <TabItem label="Failure output">
     ```text
-    {"level":"error","event":"server_failed","reason":"create pairing code file without overwrite: open /home/operator/.local/state/pi-messaging-relay/pairing-code: file exists"}
+    {"level":"error","event":"server_failed","reason":"create pairing code file without overwrite: file exists"}
     exit code: 1
     ```
   </TabItem>
@@ -146,20 +152,27 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
 ## Security checks
 
 - Keep the server listener on `127.0.0.0/8` or `::1`; never place it directly on a LAN or public interface.
-- Keep both state and code-file parent directories owned by the relay operator.
-- Do not weaken `0700` state-directory or `0600` file modes.
+- Keep the final state directory owned by the relay process user; startup rejects a different owner. Keep every ancestor owned by root or that user, and remove group/other write permission unless the shared ancestor intentionally uses the sticky bit.
+- Do not put state below a symlinked ancestor. Resolve deployment paths structurally instead of relying on `readlink` output or a one-time canonicalized string.
+- Do not weaken `0700` state-directory or `0600` file modes, change `allowlist.json` ownership, or replace it with a symlink or other file type.
+- Place `--pairing-code-file` directly inside the exact state directory as shown above. This is mandatory: every external parent, `..` parent traversal, root form, or `allowlist.json` target is rejected before code generation and readiness. Creation and removal use the retained directory handle and cannot be redirected by later pathname replacement.
 - Structured logs may contain public client IDs, public keys, and display route metadata, but pairing-code, nonce, signature, and private-key fields must remain `<redacted>`.
-- Authentication uses the in-memory allowlist loaded by this process. Full child-process restart acceptance remains ticket #27 and is not claimed here.
+- Authentication uses the strictly validated in-memory allowlist loaded before readiness. Reusing the exact explicit `--state-dir` lets previously paired extensions authenticate after normal restart without another pairing code; unknown keys remain rejected.
 
 ## Troubleshooting
 
 - **`listen: bind: address already in use`** — choose another fixed port or use port `0`.
 - **`listen address must use a loopback IP literal`** — use `127.0.0.1` or `::1`, not a hostname, wildcard, LAN, or public address.
 - **`durable state directory must be ... 0700`** — make the dedicated directory private with `chmod 700 PATH`, after verifying it is the intended relay directory.
-- **Pairing-code file exists** — choose a different new path. The server intentionally never overwrites an existing file.
-- **`pairing_code_invalid`** — the submitted code was incorrect, expired, or already used. The relay intentionally does not distinguish these cases. If the current startup code may be older than ten minutes or was accepted once, stop the server and restart it with a new unused code-file path.
-- **`remove incomplete pairing code file`** — startup failed after creating the selected private file and could not remove it. Treat that exact path as authentication material, verify it is the intended path, then remove it manually before retrying.
-- **No raw code in stdout** — expected. Read only the exact file passed with `--pairing-code-file`.
+- **`durable state directory must be owned by the current user`** — run the relay as the directory owner or select a dedicated mode-`0700` directory owned by that process user. Do not change ownership without first verifying the exact path.
+- **State ancestor rejected** — remove symlinks from the entire selected path. Ensure each ancestor is root-owned or owned by the relay user; remove group/other write permission, or set the sticky bit only when that ancestor is intentionally shared and its sticky-directory semantics are understood.
+- **Linux-only startup refusal** — run the server binary on Linux. Do not bypass the refusal or copy the authorization file into an unvalidated non-Linux implementation.
+- **Allowlist startup failure** — preserve the rejected entry for diagnosis, but never paste its public identities into an untrusted report. A FIFO or other special file is rejected promptly without waiting for a writer. Restore a known-good current-user-owned mode-`0600` regular `allowlist.json`; do not weaken validation or silently replace corrupt state with an empty allowlist.
+- **`pairing code file must be a direct child of the state directory`** — provide an explicit `--state-dir`, then place the code-file path immediately inside that exact directory. Remove parent traversal and do not use an external directory, the state path itself, or the filesystem root.
+- **Pairing-code file exists** — choose a different unused basename directly inside the state directory. The server intentionally never overwrites an existing entry.
+- **`pairing_code_invalid`** — the submitted code was incorrect, expired, or already used. The relay intentionally does not distinguish these cases. If the current startup code may be older than ten minutes or was accepted once, stop the server and restart it with a new unused direct-child code-file path.
+- **`remove incomplete pairing code file`** — startup failed after creating the selected private direct child and could not remove it. Treat that exact state-directory entry as authentication material, verify it is the intended entry, then remove it manually before retrying.
+- **No raw code in stdout** — expected. Read only the exact direct-child file passed with `--pairing-code-file`.
 - **No `server_ready` event** — inspect the structured `server_failed` event on stderr. The process exits non-zero when startup cannot complete.
 - **`invalid_frame` followed by disconnect** — the client sent binary data, invalid UTF-8, malformed or trailing JSON, or more than 512 KiB in one reassembled message. Fix framing before reconnecting; fragmented messages share the same total ceiling.
 - **`invalid_envelope` followed by disconnect** — the JSON object had duplicate or unknown fields, a missing or mistyped operation field, an invalid UUIDv7 or list cursor, or a server-to-client/unknown type. Do not retry the same envelope unchanged.

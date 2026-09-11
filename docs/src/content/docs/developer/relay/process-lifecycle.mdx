@@ -10,6 +10,16 @@ import Decision from '../../../../components/Decision.astro';
 
 The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and implements installation pairing, session authentication, connected live `list`/`roster` discovery, up to 128 concurrent distinct sends per exact authenticated sender session, recoverable sender-capacity denial, successful authenticated idle and busy string/object delivery, current-registry-miss settlement, recipient-disconnected and five-second missing-ACK settlement, and immediate sender-owned cleanup when that exact sender disconnects.
 
+## Platform and filesystem boundary
+
+The relay server is supported on Linux only. Durable authorization and pairing-code publication depend on Linux directory-relative `openat`, `renameat`, and `unlinkat` behavior, no-follow opens, descriptor-relative fsync, Unix owners, and Unix mode bits. The server pins `golang.org/x/sys` v0.36.0 (BSD-3-Clause) for those Linux syscall wrappers. Non-Linux builds contain only the same package plus an intentional startup refusal; they do not select a weaker persistence path. The TypeScript extension has no matching Linux build restriction and remains a separate Node runtime component.
+
+For every server state path, each component from `/` downward is opened relative to the already validated parent without following symlinks. Every ancestor must be owned by root or the relay's effective user. A group- or other-writable ancestor is accepted only when it has the sticky bit, such as the normal root-owned `/tmp`; a writable non-sticky ancestor and every ancestor symlink fail before readiness. The final state directory must be owned by the effective user with exact mode `0700`.
+
+<Decision title="Bind Linux authorization state to one validated directory handle" status="accepted">
+The process retains the opened final directory and parent handles for its whole lifecycle. Allowlist opens, exclusive temporary creation, atomic replacement, cleanup, and fsync operate relative to those handles, so later pathname replacement cannot redirect authorization reads or writes. Linux is the smallest support contract that makes these semantics explicit instead of silently offering a weaker platform implementation.
+</Decision>
+
 ## Startup boundary
 
 The server accepts three flags:
@@ -18,7 +28,7 @@ The server accepts three flags:
 |---|---|---|
 | `--listen` | `127.0.0.1:0` | Loopback IP literal and TCP port. Port `0` asks the operating system for an ephemeral port. |
 | `--state-dir` | empty | Explicit durable allowlist directory. Empty retains process-owned temporary state. |
-| `--pairing-code-file` | empty | Operator-only path created exclusively with mode `0600` for the raw startup code. |
+| `--pairing-code-file` | empty | Operator-only mode-`0600` direct child of the retained state directory. Every external or escaping path is rejected. |
 
 Both IPv4 and IPv6 loopback literals are valid, for example `127.0.0.1:8080` and `[::1]:8080`. Hostnames, wildcard addresses, and non-loopback IPs fail before a listener is created.
 
@@ -26,7 +36,9 @@ Both IPv4 and IPv6 loopback literals are valid, for example `127.0.0.1:8080` and
 The default is `127.0.0.1:0`, and operator overrides remain loopback-only. Rejecting hostnames and wildcard addresses keeps DNS resolution and accidental network exposure outside this lifecycle seam.
 </Decision>
 
-Once `net.Listen` succeeds, the process writes one structured JSON readiness event to stdout. `address` is the operating system-selected listener address, so an operator or harness can discover an ephemeral port without internal access. The listening socket already exists when this event is emitted. A deterministic `pairing_code_created` event follows readiness with authentication fields set to `<redacted>`; the raw code appears only in the explicitly requested private file.
+Before code generation or listener creation, a configured pairing-code path is cleaned and resolved to absolute form. It must contain no `..` parent component, its parent must exactly equal the retained state path, and its basename must be one valid direct child other than `allowlist.json`. This requires an explicit `--state-dir` whenever the raw startup code must be disclosed; the random default state path cannot be named in advance. Accepted code-file creation and removal use the retained directory handle only.
+
+Once `net.Listen` succeeds, the process writes one structured JSON readiness event to stdout. `address` is the operating system-selected listener address, so an operator or harness can discover an ephemeral port without internal access. The listening socket already exists when this event is emitted. A deterministic `pairing_code_created` event follows readiness with authentication fields set to `<redacted>`; the raw code appears only in the explicitly requested direct-child private file.
 
 <Decision title="Publish readiness as one structured process event" status="accepted">
 The `server_ready` event is the narrow readiness contract for this slice. It includes the selected address and active state path without introducing a separate HTTP health endpoint.
@@ -34,10 +46,10 @@ The `server_ready` event is the narrow readiness contract for this slice. It inc
 
 ## Temporary state
 
-Without `--state-dir`, each process creates a unique directory beneath the operating system temporary directory. The path appears as `state_dir` in the readiness event and is removed during graceful shutdown. With `--state-dir`, the operator explicitly selects a mode-`0700` directory; its allowlist remains after shutdown. If the durable directory is new, the server fsyncs its parent before creating the listener or reporting readiness.
+Without `--state-dir`, each process creates a unique directory beneath the operating system temporary directory through the same trusted Linux path walk. The path appears as `state_dir` in the readiness event and is removed during graceful shutdown relative to retained handles. With `--state-dir`, the operator explicitly selects a current-user-owned mode-`0700` directory; its closed allowlist remains after shutdown. If the durable directory is new, the server fsyncs its opened parent before creating the listener or reporting readiness. Existing allowlist state is opened nonblocking through the retained directory and must pass bounded strict validation before the listener exists. File type is checked before any read, so a FIFO or other non-regular entry fails promptly rather than waiting for a peer. Corrupt, ambiguous, oversized, duplicate, non-canonical, permissive, symlink, non-regular, or wrong-owner state fails closed without readiness.
 
 <Decision title="Preserve temporary state as the default" status="accepted">
-A default process never shares its temporary state directory and removes it during graceful shutdown. Durable allowlist retention requires the explicit `--state-dir` flag, and a new durable directory entry must reach its parent filesystem boundary before startup continues.
+A default process never shares its temporary state directory and removes it during graceful shutdown. Durable allowlist retention requires the explicit `--state-dir` flag, and a new durable directory entry must reach its parent filesystem boundary before startup continues. Reusing that exact trusted directory is the only server-side input needed to restore paired authorization.
 </Decision>
 
 <Aside type="note" title="Crash boundary">
@@ -130,4 +142,8 @@ Ponytail: event writes and logger close are fixed to one second, response writes
 6. verifies the process exits successfully, state disappears, and the exact listener address can be rebound; and
 7. verifies a wildcard listener request fails without reporting readiness.
 
-All process-event waits are bounded. Real-child cleanup gives SIGTERM and SIGKILL independent three-second deadlines; if both expire, it destroys owned streams, detaches the child, and reports PID, signal state, and captured stdout/stderr tails instead of hanging the test worker.
+All process-event waits are bounded. Real-child cleanup gives SIGTERM and SIGKILL independent deadlines instead of hanging the test worker.
+
+`restart.acceptance.test.ts` owns the separate restart seam. It runs the same Linux binary twice against one explicit state directory and one operating-system-selected loopback address. The first child pairs and authenticates a real extension, then exits normally; the second child loads the unchanged allowlist, accepts the extension's fake-clock reconnect with the same client and route identity, exposes it through a second authorized extension's roster, and rejects an independently keyed extension. Exact disk inspection proves only version, client ID, public key, and pairing time survive.
+
+Focused Linux tests reject ancestor symlinks and writable non-sticky ancestors before readiness. A deterministic substitution test renames the final directory after preparation and places an injected-key symlink at the configured path; allowlist load, direct-child pairing-code publication, and later persistence continue through the retained original handle, never the injected directory. Additional tests reject a valid external parent, a symlinked substitutable external ancestor, every `..` parent traversal (including one that cleans back inside state), a lexical parent escape, and the filesystem root before readiness without creating or deleting the named entry. Linux and intentional non-Linux-refusal compile targets are checked separately.

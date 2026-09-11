@@ -194,7 +194,7 @@ Do not reduce the recipient's exact five-second ACK interval. The sender's fixed
 </Decision>
 
 <Aside type="caution" title="Remaining deferred failures">
-Bounded automatic reconnect (#26) now restores only authenticated live presence. Server-restart authentication (#27), broader restart/reconnect no-replay assertions (#28), and additional diagnostics (#29) remain deferred. Reconnect adds no message persistence, offline inbox, replay mechanism, or new reconnect event vocabulary.
+Bounded automatic reconnect (#26) restores authenticated live presence, including authorization from the allowlist after a normal server restart (#27). Broader restart/reconnect no-replay assertions (#28) and additional diagnostics (#29) remain deferred. Restart persistence adds no message persistence, offline inbox, replay mechanism, or new reconnect event vocabulary.
 </Aside>
 
 Busy follow-up routing is implemented by #15. Ticket #16 adds provenance and object rendering; #17 proves the existing ordinary send path carries a correlated reply with fresh IDs and independent settlement. A safe local object is encoded canonically before the send frame is created; the server forwards the accepted object body as the same JSON value without interpreting or rebuilding it; and the recipient canonicalizes it for Pi text injection. No string body, object content, or rendered provenance header enters an error or log.

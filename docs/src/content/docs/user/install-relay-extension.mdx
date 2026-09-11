@@ -17,9 +17,9 @@ An `auth_accepted` event means the session proved possession of an allowlisted i
 - Node.js 24 or newer
 - npm
 - A trusted checkout of this repository
-- A running relay and its current operator-only pairing code
+- A running Linux relay server and its current operator-only pairing code
 
-Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and `typebox` v1.3.7 (MIT) for tool schemas.
+The TypeScript extension remains a platform-neutral Node component; the Linux-only support boundary applies to the Go relay server because its durable authorization store depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and `typebox` v1.3.7 (MIT) for tool schemas.
 
 ## Install from a checkout
 
@@ -155,7 +155,7 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - **Relay could not be reached** — verify the server is still running at the configured address and the ten-second request deadline was not exceeded.
 - **Pairing code format rejected locally** — paste the exact 32-character URL-safe value with no surrounding whitespace. The extension has not created key state or contacted the relay.
 - **Pairing code rejected by the relay** — the code was incorrect, reached its ten-minute deadline, or was already accepted once; the relay deliberately returns the same message for all three. Obtain a fresh code by restarting the server with a new unused private code-file path.
-- **Authentication rejected after pairing** — confirm Pi still uses the state directory that owns the paired key and the same running relay process. Restart authorization acceptance belongs to ticket #27.
+- **Authentication rejected after pairing or relay restart** — confirm Pi still uses the extension state directory that owns the paired key and the server restarted with the exact durable `--state-dir` used for pairing. Restarting without that explicit directory uses empty temporary authorization state and requires deliberate re-pairing.
 - **Connection drops after authentication** — the route disappears from live presence immediately. Wait for bounded automatic reconnect; the same complete address returns only after authentication succeeds. Ten exhausted retries leave the session disconnected until another session lifecycle or permitted pairing-owned path starts a new sequence.
 - **Pairing and authentication succeeded but `list_peers` says disconnected** — the retained socket closed or no retry has authenticated yet. Wait through the bounded retry sequence. Failed attempts do not expose stale presence.
 - **`list_peers` or `agent_send` reports a concurrent request** — wait for the existing outgoing operation to settle. The extension deliberately sends no second operation and creates no operation queue.

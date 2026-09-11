@@ -97,7 +97,7 @@ func TestPairEndpointRejectsMalformedTrustBoundaryInput(t *testing.T) {
 					t.Errorf("close event logger: %v", err)
 				}
 			})
-			service, err := newPairingService(stateDir, "", logger, func(err error) {
+			service, err := newTestPairingService(t, stateDir, "", logger, func(err error) {
 				t.Fatalf("unexpected fatal pairing runtime failure: %v", err)
 			})
 			if err != nil {
@@ -141,7 +141,7 @@ func TestPairingAuditFailuresReachFatalReporter(t *testing.T) {
 
 	t.Run("rejection", func(t *testing.T) {
 		reporter := newFatalRuntimeReporter()
-		service, err := newPairingService(t.TempDir(), "", failingLogger, reporter.report)
+		service, err := newTestPairingService(t, t.TempDir(), "", failingLogger, reporter.report)
 		if err != nil {
 			t.Fatalf("create pairing service: %v", err)
 		}
@@ -165,7 +165,7 @@ func TestPairingAuditFailuresReachFatalReporter(t *testing.T) {
 	t.Run("cleanup and accepted event", func(t *testing.T) {
 		stateDir := t.TempDir()
 		reporter := newFatalRuntimeReporter()
-		service, err := newPairingService(stateDir, "", failingLogger, reporter.report)
+		service, err := newTestPairingService(t, stateDir, "", failingLogger, reporter.report)
 		if err != nil {
 			t.Fatalf("create pairing service: %v", err)
 		}
@@ -198,7 +198,7 @@ func TestPairingAuditFailuresReachFatalReporter(t *testing.T) {
 		default:
 			t.Fatal("cleanup audit failure did not reach runtime owner")
 		}
-		stored, err := loadAllowlist(stateDir)
+		stored, err := loadTestAllowlist(t, stateDir)
 		if err != nil {
 			t.Fatalf("load durable allowlist: %v", err)
 		}
@@ -236,7 +236,7 @@ func TestPairingHTTPRejectsInvalidExpiredAndReusedCodes(t *testing.T) {
 		if status != http.StatusCreated {
 			t.Fatalf("pre-deadline response = (%d, %q), want 201", status, body)
 		}
-		stored, err := loadAllowlist(harness.stateDir)
+		stored, err := loadTestAllowlist(t, harness.stateDir)
 		if err != nil {
 			t.Fatalf("load pre-deadline allowlist: %v", err)
 		}
@@ -270,7 +270,7 @@ func TestPairingHTTPRejectsInvalidExpiredAndReusedCodes(t *testing.T) {
 		if secondStatus != http.StatusUnauthorized || secondBody != stableRejection {
 			t.Fatalf("reuse response = (%d, %q), want (401, %q)", secondStatus, secondBody, stableRejection)
 		}
-		stored, err := loadAllowlist(harness.stateDir)
+		stored, err := loadTestAllowlist(t, harness.stateDir)
 		if err != nil {
 			t.Fatalf("load allowlist after reuse: %v", err)
 		}
@@ -336,7 +336,7 @@ func newPairingHTTPHarness(t *testing.T, createdAt time.Time) *pairingHTTPHarnes
 			t.Errorf("close event logger: %v", err)
 		}
 	})
-	harness.service, err = newPairingServiceWithClock(
+	harness.service, err = newTestPairingServiceWithClock(t,
 		stateDir,
 		filepath.Join(stateDir, "pairing-code"),
 		logger,
@@ -502,80 +502,267 @@ func (harness *pairingHTTPHarness) assertNoCodeLeak(t *testing.T, submittedCode,
 	}
 }
 
-func TestPairingCodeFileFailurePreservesIncompleteCleanupError(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "pairing-code")
-	primaryFailure := errors.New("injected pairing code write failure")
-	cleanupFailure := errors.New("injected incomplete file removal failure")
-	secret := "sensitive-raw-pairing-code"
-	t.Cleanup(func() {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("remove residual pairing code fixture: %v", err)
+func TestLoadAllowlistRejectsUnsafeOrAmbiguousRestartState(t *testing.T) {
+	publicOne, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate first public key fixture: %v", err)
+	}
+	publicTwo, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate second public key fixture: %v", err)
+	}
+	encodedOne := "ed25519:" + base64.StdEncoding.EncodeToString(publicOne)
+	encodedTwo := "ed25519:" + base64.StdEncoding.EncodeToString(publicTwo)
+	validClient := fmt.Sprintf(
+		`{"client_id":"cli_MDEyMzQ1Njc4OWFi","client_public_key":%q,"paired_at":"2026-09-11T12:34:56.123456789Z"}`,
+		encodedOne,
+	)
+
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "duplicate top-level field",
+			body: fmt.Sprintf(`{"version":1,"version":1,"clients":[%s]}`, validClient),
+		},
+		{
+			name: "duplicate client field",
+			body: fmt.Sprintf(
+				`{"version":1,"clients":[{"client_id":"cli_MDEyMzQ1Njc4OWFi","client_public_key":%q,"client_public_key":%q,"paired_at":"2026-09-11T12:34:56Z"}]}`,
+				encodedOne,
+				encodedTwo,
+			),
+		},
+		{
+			name: "duplicate client id",
+			body: fmt.Sprintf(
+				`{"version":1,"clients":[%s,{"client_id":"cli_MDEyMzQ1Njc4OWFi","client_public_key":%q,"paired_at":"2026-09-11T12:35:56Z"}]}`,
+				validClient,
+				encodedTwo,
+			),
+		},
+		{
+			name: "duplicate public key",
+			body: fmt.Sprintf(
+				`{"version":1,"clients":[%s,{"client_id":"cli_YWJjZGVmZ2hpamts","client_public_key":%q,"paired_at":"2026-09-11T12:35:56Z"}]}`,
+				validClient,
+				encodedOne,
+			),
+		},
+		{
+			name: "unknown client metadata",
+			body: fmt.Sprintf(
+				`{"version":1,"clients":[{"client_id":"cli_MDEyMzQ1Njc4OWFi","client_public_key":%q,"paired_at":"2026-09-11T12:34:56Z","role":"admin"}]}`,
+				encodedOne,
+			),
+		},
+		{
+			name: "non-canonical pairing timestamp offset",
+			body: fmt.Sprintf(
+				`{"version":1,"clients":[{"client_id":"cli_MDEyMzQ1Njc4OWFi","client_public_key":%q,"paired_at":"2026-09-11T12:34:56+00:00"}]}`,
+				encodedOne,
+			),
+		},
+		{
+			name: "non-canonical pairing timestamp precision",
+			body: fmt.Sprintf(
+				`{"version":1,"clients":[{"client_id":"cli_MDEyMzQ1Njc4OWFi","client_public_key":%q,"paired_at":"2026-09-11T12:34:56.1200Z"}]}`,
+				encodedOne,
+			),
+		},
+		{
+			name: "partial JSON",
+			body: `{"version":1,"clients":[`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			if err := os.Chmod(stateDir, 0o700); err != nil {
+				t.Fatalf("secure state fixture: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(stateDir, allowlistFilename), []byte(testCase.body), 0o600); err != nil {
+				t.Fatalf("write allowlist fixture: %v", err)
+			}
+
+			if _, err := loadTestAllowlist(t, stateDir); err == nil {
+				t.Fatal("unsafe or ambiguous allowlist loaded successfully")
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{
+			name: "group-readable file",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(`{"version":1,"clients":[]}`), 0o640); err != nil {
+					t.Fatalf("write permissive allowlist: %v", err)
+				}
+			},
+		},
+		{
+			name: "directory at file path",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("create directory allowlist: %v", err)
+				}
+			},
+		},
+		{
+			name: "symbolic link",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				target := filepath.Join(t.TempDir(), "target.json")
+				if err := os.WriteFile(target, []byte(`{"version":1,"clients":[]}`), 0o600); err != nil {
+					t.Fatalf("write symlink target: %v", err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatalf("create allowlist symlink: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			path := filepath.Join(stateDir, allowlistFilename)
+			testCase.setup(t, path)
+			if _, err := loadTestAllowlist(t, stateDir); err == nil {
+				t.Fatal("unsafe allowlist file loaded successfully")
+			}
+		})
+	}
+
+	t.Run("bounded read", func(t *testing.T) {
+		stateDir := t.TempDir()
+		if err := os.Chmod(stateDir, 0o700); err != nil {
+			t.Fatalf("secure state fixture: %v", err)
+		}
+		path := filepath.Join(stateDir, allowlistFilename)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+		if err != nil {
+			t.Fatalf("create oversized allowlist fixture: %v", err)
+		}
+		if err := file.Truncate(maxAllowlistBytes + 1); err != nil {
+			_ = file.Close()
+			t.Fatalf("size oversized allowlist fixture: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close oversized allowlist fixture: %v", err)
+		}
+
+		if _, err := loadTestAllowlist(t, stateDir); !errors.Is(err, errAllowlistTooLarge) {
+			t.Fatalf("oversized allowlist error = %v, want %v", err, errAllowlistTooLarge)
 		}
 	})
-
-	cleanup, err := writePairingCodeFileWithOperations(path, secret, pairingCodeFileOperations{
-		write: func(writer io.Writer, value string) (int, error) {
-			written, writeErr := io.WriteString(writer, value)
-			if writeErr != nil {
-				t.Fatalf("write primary-failure fixture: %v", writeErr)
-			}
-			return written, primaryFailure
-		},
-		sync: func(*os.File) error {
-			t.Fatal("sync ran after injected write failure")
-			return nil
-		},
-		close: func(file *os.File) error { return file.Close() },
-		remove: func(string) error {
-			return cleanupFailure
-		},
-	})
-
-	if cleanup != nil {
-		t.Fatal("failed pairing code publication returned a cleanup owner")
-	}
-	if !errors.Is(err, primaryFailure) || !errors.Is(err, cleanupFailure) {
-		t.Fatalf("combined error = %v, want primary and cleanup failures", err)
-	}
-	if !strings.Contains(err.Error(), "write pairing code file") ||
-		!strings.Contains(err.Error(), "remove incomplete pairing code file") {
-		t.Fatalf("combined error lacks actionable contexts: %v", err)
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("combined error exposed raw pairing code: %v", err)
-	}
-	contents, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatalf("read deliberately residual pairing code fixture: %v", readErr)
-	}
-	if string(contents) != secret+"\n" {
-		t.Fatalf("residual fixture contents changed unexpectedly")
-	}
 }
 
-func TestPairingCodeFileIsExclusiveAndPrivate(t *testing.T) {
-	parent := t.TempDir()
-	logger := newEventLogger(os.Stderr)
+func TestPairingRefusesToPersistAnAlreadyAllowlistedPublicKey(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatalf("secure state fixture: %v", err)
+	}
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate public key fixture: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	existing := allowlist{
+		Version: 1,
+		Clients: []allowlistClient{{
+			ClientID:  "cli_MDEyMzQ1Njc4OWFi",
+			PublicKey: encodedKey,
+			PairedAt:  "2026-09-11T12:34:56Z",
+		}},
+	}
+	if err := persistTestAllowlist(t, stateDir, existing); err != nil {
+		t.Fatalf("persist existing identity fixture: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(stateDir, allowlistFilename))
+	if err != nil {
+		t.Fatalf("read existing identity fixture: %v", err)
+	}
+	logger := newEventLogger(io.Discard)
 	t.Cleanup(func() {
 		if err := logger.close(); err != nil {
 			t.Errorf("close event logger: %v", err)
 		}
 	})
-	if _, err := newPairingService(
-		parent,
-		filepath.Join(parent, allowlistFilename),
+	service, err := newTestPairingService(t, stateDir, "", logger, func(error) {})
+	if err != nil {
+		t.Fatalf("load existing identity: %v", err)
+	}
+	code := service.code
+
+	if _, err := service.accept(pairRequest{PairingCode: code, ClientPublicKey: encodedKey}, time.Now()); err == nil {
+		t.Fatal("duplicate public key was accepted")
+	}
+	if service.code != code {
+		t.Fatal("failed duplicate pairing consumed current pairing code")
+	}
+	after, err := os.ReadFile(filepath.Join(stateDir, allowlistFilename))
+	if err != nil {
+		t.Fatalf("read identity after duplicate attempt: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("duplicate public key attempt changed durable allowlist")
+	}
+}
+
+func TestPairingCodePathIsRejectedBeforeTokenGeneration(t *testing.T) {
+	state := openTestStateDirectory(t, t.TempDir())
+	externalPath := filepath.Join(t.TempDir(), "pairing-code")
+	generated := false
+
+	service, err := newPairingServiceWithClockAndToken(
+		state,
+		externalPath,
+		nil,
+		func(error) {},
+		time.Now,
+		func(int) (string, error) {
+			generated = true
+			return "", errors.New("token generator must not run")
+		},
+	)
+	if service != nil || err == nil {
+		t.Fatalf("external pairing code path result = (%v, %v), want rejection", service, err)
+	}
+	if generated {
+		t.Fatal("pairing code was generated before path rejection")
+	}
+	if _, err := os.Stat(externalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("external pairing code path was created: %v", err)
+	}
+}
+
+func TestPairingCodeFileIsExclusiveAndPrivate(t *testing.T) {
+	stateDir := t.TempDir()
+	logger := newEventLogger(io.Discard)
+	t.Cleanup(func() {
+		if err := logger.close(); err != nil {
+			t.Errorf("close event logger: %v", err)
+		}
+	})
+	if _, err := newTestPairingService(t,
+		stateDir,
+		filepath.Join(stateDir, allowlistFilename),
 		logger,
 		func(error) {},
 	); err == nil {
-		t.Fatal("pairing service accepted the allowlist path as the raw-code channel")
+		t.Fatal("pairing service accepted the allowlist as the raw-code channel")
 	}
-	path := filepath.Join(parent, "pairing-code")
+
+	path := filepath.Join(stateDir, "pairing-code")
 	if err := os.WriteFile(path, []byte("operator-owned\n"), 0o600); err != nil {
 		t.Fatalf("create existing operator file: %v", err)
 	}
-
-	if _, err := writePairingCodeFile(path, "new-secret"); err == nil {
-		t.Fatal("pairing code writer overwrote an existing file")
+	if _, err := newTestPairingService(t, stateDir, path, logger, func(error) {}); err == nil {
+		t.Fatal("pairing service overwrote an existing direct-child file")
 	}
 	contents, err := os.ReadFile(path)
 	if err != nil {
@@ -584,20 +771,25 @@ func TestPairingCodeFileIsExclusiveAndPrivate(t *testing.T) {
 	if string(contents) != "operator-owned\n" {
 		t.Fatalf("existing operator file changed: %q", contents)
 	}
-
-	createdPath := filepath.Join(parent, "created-code")
-	cleanup, err := writePairingCodeFile(createdPath, "secret")
-	if err != nil {
-		t.Fatalf("write pairing code channel: %v", err)
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove operator file fixture: %v", err)
 	}
-	info, err := os.Stat(createdPath)
+
+	service, err := newTestPairingService(t, stateDir, path, logger, func(error) {})
 	if err != nil {
-		t.Fatalf("inspect pairing code channel: %v", err)
+		t.Fatalf("create direct-child pairing code channel: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("inspect direct-child pairing code channel: %v", err)
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("pairing code channel permissions = %o, want 600", info.Mode().Perm())
 	}
-	if err := cleanup(); err != nil {
-		t.Fatalf("remove pairing code channel: %v", err)
+	if err := service.closeCodeChannel(); err != nil {
+		t.Fatalf("remove direct-child pairing code channel: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("closed pairing code channel remains: %v", err)
 	}
 }

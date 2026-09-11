@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/subtle"
@@ -21,17 +22,22 @@ import (
 const (
 	pairingCodeLifetime = 10 * time.Minute
 	maxPairRequestBytes = 4096
-	allowlistFilename   = "allowlist.json"
+	// ponytail: fixed to 1 MiB; make configurable when a second deployment profile needs more paired installations.
+	maxAllowlistBytes = 1 << 20
+	allowlistFilename = "allowlist.json"
 )
 
-var errPairingCodeInvalid = errors.New("pairing code is invalid or expired")
+var (
+	errPairingCodeInvalid = errors.New("pairing code is invalid or expired")
+	errAllowlistTooLarge  = errors.New("allowlist exceeds 1 MiB")
+)
 
 type pairingService struct {
 	mu             sync.Mutex
 	code           string
 	expiresAt      time.Time
 	now            func() time.Time
-	stateDir       string
+	state          *stateDirectory
 	allowlist      allowlist
 	logger         *eventLogger
 	reportFatal    func(error)
@@ -64,43 +70,53 @@ type allowlistClient struct {
 }
 
 func newPairingService(
-	stateDir, codeFilePath string,
+	state *stateDirectory,
+	codeFilePath string,
 	logger *eventLogger,
 	reportFatal func(error),
 ) (*pairingService, error) {
-	return newPairingServiceWithClock(stateDir, codeFilePath, logger, reportFatal, time.Now)
+	return newPairingServiceWithClock(state, codeFilePath, logger, reportFatal, time.Now)
 }
 
 func newPairingServiceWithClock(
-	stateDir, codeFilePath string,
+	state *stateDirectory,
+	codeFilePath string,
 	logger *eventLogger,
 	reportFatal func(error),
 	now func() time.Time,
 ) (*pairingService, error) {
+	return newPairingServiceWithClockAndToken(state, codeFilePath, logger, reportFatal, now, randomToken)
+}
+
+func newPairingServiceWithClockAndToken(
+	state *stateDirectory,
+	codeFilePath string,
+	logger *eventLogger,
+	reportFatal func(error),
+	now func() time.Time,
+	generateToken func(int) (string, error),
+) (*pairingService, error) {
+	if state == nil || state.directory == nil {
+		return nil, errors.New("pairing service requires an opened state directory")
+	}
 	if reportFatal == nil {
 		return nil, errors.New("pairing service requires a fatal runtime reporter")
 	}
 	if now == nil {
 		return nil, errors.New("pairing service requires a clock")
 	}
-	if codeFilePath != "" {
-		absoluteCodePath, err := filepath.Abs(codeFilePath)
-		if err != nil {
-			return nil, fmt.Errorf("resolve pairing code file: %w", err)
-		}
-		absoluteAllowlistPath, err := filepath.Abs(filepath.Join(stateDir, allowlistFilename))
-		if err != nil {
-			return nil, fmt.Errorf("resolve allowlist file: %w", err)
-		}
-		if filepath.Clean(absoluteCodePath) == filepath.Clean(absoluteAllowlistPath) {
-			return nil, errors.New("pairing code file must not be the allowlist file")
-		}
+	if generateToken == nil {
+		return nil, errors.New("pairing service requires a token generator")
 	}
-	stored, err := loadAllowlist(stateDir)
+	codeFilename, err := directPairingCodeFilename(state, codeFilePath)
 	if err != nil {
 		return nil, err
 	}
-	code, err := randomToken(24)
+	stored, err := loadAllowlist(state)
+	if err != nil {
+		return nil, err
+	}
+	code, err := generateToken(24)
 	if err != nil {
 		return nil, fmt.Errorf("generate pairing code: %w", err)
 	}
@@ -109,19 +125,44 @@ func newPairingServiceWithClock(
 		code:        code,
 		expiresAt:   now().Add(pairingCodeLifetime),
 		now:         now,
-		stateDir:    stateDir,
+		state:       state,
 		allowlist:   stored,
 		logger:      logger,
 		reportFatal: reportFatal,
 	}
-	if codeFilePath != "" {
-		cleanup, err := writePairingCodeFile(codeFilePath, code)
+	if codeFilename != "" {
+		cleanup, err := state.writePairingCodeFile(codeFilename, code)
 		if err != nil {
 			return nil, err
 		}
 		service.removeCodeFile = cleanup
 	}
 	return service, nil
+}
+
+func directPairingCodeFilename(state *stateDirectory, configured string) (string, error) {
+	if configured == "" {
+		return "", nil
+	}
+	for _, component := range strings.Split(filepath.ToSlash(configured), "/") {
+		if component == ".." {
+			return "", errors.New("pairing code file must be a direct child of the state directory")
+		}
+	}
+	absolute, err := filepath.Abs(configured)
+	if err != nil {
+		return "", fmt.Errorf("resolve pairing code file: %w", err)
+	}
+	cleaned := filepath.Clean(absolute)
+	name := filepath.Base(cleaned)
+	if filepath.Clean(filepath.Dir(cleaned)) != state.path ||
+		filepath.Base(name) != name || name == "." || name == ".." || name == "" || strings.IndexByte(name, 0) >= 0 {
+		return "", errors.New("pairing code file must be a direct child of the state directory")
+	}
+	if name == allowlistFilename {
+		return "", errors.New("pairing code file must not be the allowlist file")
+	}
+	return name, nil
 }
 
 func (service *pairingService) closeCodeChannel() error {
@@ -214,6 +255,14 @@ func (service *pairingService) accept(input pairRequest, now time.Time) (string,
 		return "", fmt.Errorf("generate client id: %w", err)
 	}
 	clientID := "cli_" + clientIDToken
+	for _, client := range service.allowlist.Clients {
+		if client.PublicKey == input.ClientPublicKey {
+			return "", errors.New("client public key is already allowlisted")
+		}
+		if client.ClientID == clientID {
+			return "", errors.New("generated client id collides with existing identity")
+		}
+	}
 	next := allowlist{
 		Version: service.allowlist.Version,
 		Clients: append(append([]allowlistClient(nil), service.allowlist.Clients...), allowlistClient{
@@ -222,7 +271,7 @@ func (service *pairingService) accept(input pairRequest, now time.Time) (string,
 			PairedAt:  now.UTC().Format(time.RFC3339Nano),
 		}),
 	}
-	if err := persistAllowlist(service.stateDir, next); err != nil {
+	if err := persistAllowlist(service.state, next); err != nil {
 		return "", err
 	}
 	service.allowlist = next
@@ -365,24 +414,38 @@ func randomToken(size int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
-func loadAllowlist(stateDir string) (allowlist, error) {
-	path := filepath.Join(stateDir, allowlistFilename)
-	info, err := os.Lstat(path)
+func loadAllowlist(state *stateDirectory) (allowlist, error) {
+	file, size, err := state.openAllowlist()
 	if errors.Is(err, os.ErrNotExist) {
 		return allowlist{Version: 1, Clients: []allowlistClient{}}, nil
 	}
 	if err != nil {
-		return allowlist{}, fmt.Errorf("inspect allowlist: %w", err)
+		return allowlist{}, fmt.Errorf("open allowlist: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return allowlist{}, errors.New("allowlist must be a regular file with permissions 0600")
+	if size > maxAllowlistBytes {
+		return allowlist{}, errors.Join(errAllowlistTooLarge, file.Close())
 	}
-	data, err := os.ReadFile(path)
+	data, readErr := io.ReadAll(io.LimitReader(file, maxAllowlistBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return allowlist{}, errors.Join(
+			wrapError("read allowlist", readErr),
+			wrapError("close allowlist after read", closeErr),
+		)
+	}
+	if len(data) > maxAllowlistBytes {
+		return allowlist{}, errAllowlistTooLarge
+	}
+	inspection, err := inspectJSON(data)
 	if err != nil {
-		return allowlist{}, fmt.Errorf("read allowlist: %w", err)
+		return allowlist{}, fmt.Errorf("inspect allowlist JSON: %w", err)
 	}
+	if !inspection.object || inspection.duplicate {
+		return allowlist{}, errors.New("allowlist must be an unambiguous JSON object")
+	}
+
 	var stored allowlist
-	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&stored); err != nil {
 		return allowlist{}, fmt.Errorf("decode allowlist: %w", err)
@@ -394,6 +457,7 @@ func loadAllowlist(stateDir string) (allowlist, error) {
 		return allowlist{}, errors.New("allowlist has unsupported or missing version")
 	}
 	seenClientIDs := make(map[string]struct{}, len(stored.Clients))
+	seenPublicKeys := make(map[string]struct{}, len(stored.Clients))
 	for _, client := range stored.Clients {
 		clientToken := strings.TrimPrefix(client.ClientID, "cli_")
 		decodedID, err := base64.RawURLEncoding.DecodeString(clientToken)
@@ -407,125 +471,35 @@ func loadAllowlist(stateDir string) (allowlist, error) {
 		if err := validateEd25519PublicKey(client.PublicKey); err != nil {
 			return allowlist{}, errors.New("allowlist contains an invalid client_public_key")
 		}
-		if _, err := time.Parse(time.RFC3339Nano, client.PairedAt); err != nil {
-			return allowlist{}, errors.New("allowlist contains an invalid paired_at")
+		if _, duplicate := seenPublicKeys[client.PublicKey]; duplicate {
+			return allowlist{}, errors.New("allowlist contains a duplicate client_public_key")
+		}
+		seenPublicKeys[client.PublicKey] = struct{}{}
+		pairedAt, err := time.Parse(time.RFC3339Nano, client.PairedAt)
+		if err != nil || pairedAt.UTC().Format(time.RFC3339Nano) != client.PairedAt {
+			return allowlist{}, errors.New("allowlist contains an invalid or non-canonical paired_at")
 		}
 	}
 	return stored, nil
 }
 
-func persistAllowlist(stateDir string, value allowlist) error {
+func persistAllowlist(state *stateDirectory, value allowlist) error {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode allowlist: %w", err)
 	}
 	data = append(data, '\n')
-	path := filepath.Join(stateDir, allowlistFilename)
-	if info, err := os.Lstat(path); err == nil {
-		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-			return errors.New("existing allowlist must be a regular file with permissions 0600")
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect existing allowlist: %w", err)
+	if len(data) > maxAllowlistBytes {
+		return errAllowlistTooLarge
 	}
-
-	temporary, err := os.CreateTemp(stateDir, ".allowlist-*")
-	if err != nil {
-		return fmt.Errorf("create temporary allowlist: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	closed := false
-	defer func() {
-		if !closed {
-			_ = temporary.Close()
-		}
-		_ = os.Remove(temporaryPath)
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return fmt.Errorf("set temporary allowlist permissions: %w", err)
-	}
-	if _, err := temporary.Write(data); err != nil {
-		return fmt.Errorf("write temporary allowlist: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync temporary allowlist: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		closed = true
-		return fmt.Errorf("close temporary allowlist: %w", err)
-	}
-	closed = true
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace allowlist atomically: %w", err)
-	}
-	if err := syncDirectory(stateDir); err != nil {
-		return fmt.Errorf("sync state directory: %w", err)
-	}
-	return nil
+	return state.persistAllowlistData(data)
 }
 
-type pairingCodeFileOperations struct {
-	write  func(io.Writer, string) (int, error)
-	sync   func(*os.File) error
-	close  func(*os.File) error
-	remove func(string) error
-}
-
-func writePairingCodeFile(path, code string) (func() error, error) {
-	return writePairingCodeFileWithOperations(path, code, pairingCodeFileOperations{
-		write:  io.WriteString,
-		sync:   func(file *os.File) error { return file.Sync() },
-		close:  func(file *os.File) error { return file.Close() },
-		remove: os.Remove,
-	})
-}
-
-func writePairingCodeFileWithOperations(
-	path, code string,
-	operations pairingCodeFileOperations,
-) (func() error, error) {
-	parent := filepath.Dir(path)
-	info, err := os.Stat(parent)
-	if err != nil {
-		return nil, fmt.Errorf("inspect pairing code file directory: %w", err)
+func wrapError(context string, err error) error {
+	if err == nil {
+		return nil
 	}
-	if !info.IsDir() {
-		return nil, errors.New("pairing code file parent must be a directory")
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("create pairing code file without overwrite: %w", err)
-	}
-	closed := false
-	cleanupIncomplete := func(primary error) error {
-		if !closed {
-			if closeErr := operations.close(file); closeErr != nil {
-				primary = errors.Join(primary, fmt.Errorf("close incomplete pairing code file: %w", closeErr))
-			}
-			closed = true
-		}
-		if removeErr := operations.remove(path); removeErr != nil {
-			primary = errors.Join(primary, fmt.Errorf("remove incomplete pairing code file: %w", removeErr))
-		}
-		return primary
-	}
-	defer func() {
-		if !closed {
-			_ = operations.close(file)
-		}
-	}()
-	if _, err := operations.write(file, code+"\n"); err != nil {
-		return nil, cleanupIncomplete(fmt.Errorf("write pairing code file: %w", err))
-	}
-	if err := operations.sync(file); err != nil {
-		return nil, cleanupIncomplete(fmt.Errorf("sync pairing code file: %w", err))
-	}
-	if err := operations.close(file); err != nil {
-		closed = true
-		return nil, cleanupIncomplete(fmt.Errorf("close pairing code file: %w", err))
-	}
-	closed = true
-	return func() error { return operations.remove(path) }, nil
+	return fmt.Errorf("%s: %w", context, err)
 }
 
 func writeJSON(response http.ResponseWriter, status int, value any) {

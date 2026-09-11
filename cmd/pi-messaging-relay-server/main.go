@@ -12,10 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -185,22 +183,25 @@ func (reporter *fatalRuntimeReporter) err() error {
 }
 
 func run(args []string, output io.Writer) error {
-	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), terminationSignals()...)
 	defer stopSignals()
-	return runWithContext(args, output, syncDirectory, signalContext)
+	return runWithContext(args, output, syncOpenedDirectory, signalContext)
 }
 
 func runWithContext(
 	args []string,
 	output io.Writer,
-	syncStateDirectoryParent func(string) error,
+	syncStateDirectoryParent directorySync,
 	terminationContext context.Context,
 ) (runErr error) {
+	if err := requireSupportedPlatform(); err != nil {
+		return err
+	}
 	flags := flag.NewFlagSet("pi-messaging-relay-server", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	listenAddress := flags.String("listen", defaultListenAddress, "loopback IP and port to listen on")
 	configuredStateDir := flags.String("state-dir", "", "durable state directory; empty uses temporary process state")
-	pairingCodeFile := flags.String("pairing-code-file", "", "operator-only file to create with the startup pairing code")
+	pairingCodeFile := flags.String("pairing-code-file", "", "operator-only direct child of state-dir to create with the startup pairing code")
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
@@ -211,17 +212,19 @@ func runWithContext(
 		return err
 	}
 
-	stateDir, temporaryState, err := prepareStateDirectoryWithSync(*configuredStateDir, syncStateDirectoryParent)
+	state, err := prepareStateDirectoryWithSync(*configuredStateDir, syncStateDirectoryParent)
 	if err != nil {
 		return err
 	}
 	stateCleanupAttempted := false
 	defer func() {
-		if !temporaryState || stateCleanupAttempted {
-			return
+		if state.temporary && !stateCleanupAttempted {
+			if err := state.removeTemporaryState(); err != nil {
+				runErr = errors.Join(runErr, err)
+			}
 		}
-		if err := os.RemoveAll(stateDir); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("remove temporary state directory: %w", err))
+		if err := state.close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close state directory handles: %w", err))
 		}
 	}()
 
@@ -232,7 +235,7 @@ func runWithContext(
 		}
 	}()
 	runtimeFailures := newFatalRuntimeReporter()
-	pairing, err := newPairingService(stateDir, *pairingCodeFile, logger, runtimeFailures.report)
+	pairing, err := newPairingService(state, *pairingCodeFile, logger, runtimeFailures.report)
 	if err != nil {
 		return err
 	}
@@ -279,7 +282,7 @@ func runWithContext(
 		Level:    "info",
 		Event:    "server_ready",
 		Address:  selectedAddress,
-		StateDir: stateDir,
+		StateDir: state.path,
 	}); err != nil {
 		_ = server.Close()
 		<-serveResult
@@ -324,10 +327,10 @@ func runWithContext(
 		return errors.Join(terminalErr, err)
 	}
 	connectionsClosed = true
-	if temporaryState {
+	if state.temporary {
 		stateCleanupAttempted = true
-		if err := os.RemoveAll(stateDir); err != nil {
-			return errors.Join(terminalErr, fmt.Errorf("remove temporary state directory: %w", err))
+		if err := state.removeTemporaryState(); err != nil {
+			return errors.Join(terminalErr, err)
 		}
 	}
 	if fatalErr := runtimeFailures.err(); fatalErr != nil {
@@ -356,52 +359,6 @@ func newRelayHTTPServer(handler http.Handler) *http.Server {
 		WriteTimeout:      pairingWriteTimeout,
 		IdleTimeout:       30 * time.Second,
 	}
-}
-
-func prepareStateDirectoryWithSync(
-	configured string,
-	syncStateDirectoryParent func(string) error,
-) (path string, temporary bool, err error) {
-	if configured == "" {
-		path, err := os.MkdirTemp("", "pi-messaging-relay-")
-		if err != nil {
-			return "", false, fmt.Errorf("create temporary state directory: %w", err)
-		}
-		return path, true, nil
-	}
-	created := false
-	if err := os.Mkdir(configured, 0o700); err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return "", false, fmt.Errorf("create durable state directory: %w", err)
-		}
-	} else {
-		created = true
-	}
-	info, err := os.Lstat(configured)
-	if err != nil {
-		return "", false, fmt.Errorf("inspect durable state directory: %w", err)
-	}
-	if !info.IsDir() || info.Mode().Perm() != 0o700 {
-		return "", false, errors.New("durable state directory must be a directory with permissions 0700")
-	}
-	if created {
-		if err := syncStateDirectoryParent(filepath.Dir(configured)); err != nil {
-			return "", false, fmt.Errorf("sync durable state directory parent: %w", err)
-		}
-	}
-	return configured, false, nil
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return err
-	}
-	return nil
 }
 
 func validateListenAddress(address string) error {

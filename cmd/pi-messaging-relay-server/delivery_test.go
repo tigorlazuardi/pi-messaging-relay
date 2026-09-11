@@ -51,7 +51,7 @@ func TestDeliverySettlesOnlyAfterExactRecipientAcknowledgement(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestDeliveryShutdownPreservesFirstPendingOwner(t *testing.T) {
 			logger := newEventLogger(&logs)
 			t.Cleanup(func() { _ = logger.close() })
 			reporter := newFatalRuntimeReporter()
-			pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+			pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 			if err != nil {
 				t.Fatalf("create pairing service: %v", err)
 			}
@@ -401,7 +401,7 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 			logger := newEventLogger(&logs)
 			t.Cleanup(func() { _ = logger.close() })
 			reporter := newFatalRuntimeReporter()
-			pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+			pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 			if err != nil {
 				t.Fatalf("create pairing service: %v", err)
 			}
@@ -607,7 +607,7 @@ func TestOfflineDestinationSettlesWithoutDeliveryWorkAndKeepsSenderUsable(t *tes
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -739,7 +739,7 @@ func TestDeliveryACKDeadlineSettlesTimeoutOnceAndKeepsConnectionsUsable(t *testi
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -956,7 +956,7 @@ func TestReadyDeadlineCannotRelabelAcknowledgementOrRecipientCancellation(t *tes
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -1173,7 +1173,7 @@ func TestOfferWriteFailureAfterRecipientUnpublishesReturnsRecipientDisconnected(
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -1294,7 +1294,7 @@ func TestRecipientDisconnectSettlesEverySenderWithoutReplayAndKeepsSocketsUsable
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -1531,7 +1531,7 @@ func TestSenderDisconnectAbandonsOnlyItsPendingOfferAndPreservesRecipientAndOthe
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -1791,7 +1791,7 @@ func TestSelfSendDisconnectAbandonsSenderOwnedOfferWithoutRecipientResult(t *tes
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -1884,7 +1884,7 @@ func TestSelfSendAcknowledgementOverlapsSenderOperationWithoutClosing(t *testing
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -1975,7 +1975,7 @@ func TestTerminalDispatchFailureJoinsPumpBlockedInReader(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}

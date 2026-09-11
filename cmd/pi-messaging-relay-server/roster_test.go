@@ -134,7 +134,7 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 			t.Cleanup(func() { _ = logger.close() })
 
 			reporter := newFatalRuntimeReporter()
-			pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+			pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 			if err != nil {
 				t.Fatalf("create pairing service: %v", err)
 			}

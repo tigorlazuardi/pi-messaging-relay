@@ -36,7 +36,7 @@ func newDedupeTestHarness(t *testing.T) *dedupeTestHarness {
 	logs := &lockedBuffer{changed: make(chan struct{}, 1)}
 	logger := newEventLogger(logs)
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}

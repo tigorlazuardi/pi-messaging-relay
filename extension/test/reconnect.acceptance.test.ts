@@ -394,7 +394,7 @@ test("fake-clock extension lifecycle restores exact live route with capped jitte
   const binary = join(root, "relay-server");
   const serverState = join(root, "server-state");
   const extensionState = join(root, "extension-state");
-  const codeFile = join(root, "pairing-code");
+  const codeFile = join(serverState, "pairing-code");
   execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
     cwd: repositoryRoot,
     stdio: "pipe",

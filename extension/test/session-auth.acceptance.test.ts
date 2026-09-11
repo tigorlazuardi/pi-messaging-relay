@@ -179,7 +179,7 @@ test("real WebSocket boundary authenticates paired extension and rejects unautho
   const binary = join(testRoot, "relay-server");
   const serverState = join(testRoot, "server-state");
   const extensionState = join(testRoot, "extension-state");
-  const codeFile = join(testRoot, "pairing-code");
+  const codeFile = join(serverState, "pairing-code");
   execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
     cwd: repositoryRoot,
     stdio: "pipe",
@@ -386,7 +386,7 @@ test("pre-paired installation authenticates exactly once when session lifecycle 
   const binary = join(testRoot, "relay-server");
   const serverState = join(testRoot, "server-state");
   const extensionState = join(testRoot, "extension-state");
-  const codeFile = join(testRoot, "pairing-code");
+  const codeFile = join(serverState, "pairing-code");
   execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
     cwd: repositoryRoot,
     stdio: "pipe",

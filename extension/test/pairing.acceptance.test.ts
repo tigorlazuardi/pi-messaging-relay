@@ -91,7 +91,7 @@ test("real relay-pair command establishes one persisted installation identity", 
   const binary = join(testRoot, "pi-messaging-relay-server");
   const serverState = join(testRoot, "server-state");
   const extensionState = join(testRoot, "extension-state");
-  const codeFile = join(testRoot, "operator-pairing-code");
+  const codeFile = join(serverState, "operator-pairing-code");
 
   execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
     cwd: repositoryRoot,

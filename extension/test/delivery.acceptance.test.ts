@@ -85,7 +85,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     const binary = join(root, "relay-server");
     const state = join(root, "server-state");
     const extensionState = join(root, "extension-state");
-    const codeFile = join(root, "pairing-code");
+    const codeFile = join(state, "pairing-code");
     execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
       cwd: repositoryRoot,
       stdio: "pipe",

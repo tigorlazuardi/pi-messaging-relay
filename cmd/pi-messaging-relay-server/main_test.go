@@ -160,7 +160,7 @@ func TestSessionAuthAuditFailureReportsFatalRelayRuntimeClassification(t *testin
 	var fallback bytes.Buffer
 	runDone := make(chan error, 1)
 	go func() {
-		runErr := runWithContext(nil, output, syncDirectory, terminationContext)
+		runErr := runWithContext(nil, output, syncOpenedDirectory, terminationContext)
 		runDone <- reportServerFailure(runErr, &fallback)
 	}()
 
@@ -228,8 +228,8 @@ func TestNewDurableStateDirectoryMustSyncBeforeServerReadiness(t *testing.T) {
 	runErr := runWithContext(
 		[]string{"--state-dir", stateDir},
 		&output,
-		func(path string) error {
-			syncedPath = path
+		func(directory *os.File) error {
+			syncedPath = directory.Name()
 			return syncFailure
 		},
 		context.Background(),
@@ -244,10 +244,60 @@ func TestNewDurableStateDirectoryMustSyncBeforeServerReadiness(t *testing.T) {
 	if output.Len() != 0 {
 		t.Fatalf("server emitted readiness before durable state parent sync: %s", output.String())
 	}
-	if info, err := os.Stat(stateDir); err != nil {
-		t.Fatalf("inspect newly created state directory: %v", err)
-	} else if info.Mode().Perm() != 0o700 {
-		t.Fatalf("new state directory permissions = %o, want 700", info.Mode().Perm())
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state directory remains after parent-sync startup failure: %v", err)
+	}
+}
+
+func TestDurableStateDirectoryRejectsUnsafeExistingPaths(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		setup func(t *testing.T, parent string) string
+	}{
+		{
+			name: "permissive directory",
+			setup: func(t *testing.T, parent string) string {
+				t.Helper()
+				path := filepath.Join(parent, "permissive")
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatalf("create permissive directory: %v", err)
+				}
+				return path
+			},
+		},
+		{
+			name: "regular file",
+			setup: func(t *testing.T, parent string) string {
+				t.Helper()
+				path := filepath.Join(parent, "regular-file")
+				if err := os.WriteFile(path, nil, 0o700); err != nil {
+					t.Fatalf("create regular file: %v", err)
+				}
+				return path
+			},
+		},
+		{
+			name: "symbolic link",
+			setup: func(t *testing.T, parent string) string {
+				t.Helper()
+				target := filepath.Join(parent, "target")
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatalf("create symlink target: %v", err)
+				}
+				path := filepath.Join(parent, "state-link")
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatalf("create state symlink: %v", err)
+				}
+				return path
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := testCase.setup(t, t.TempDir())
+			if _, err := prepareStateDirectoryWithSync(path, syncOpenedDirectory); err == nil {
+				t.Fatal("unsafe durable state path was accepted")
+			}
+		})
 	}
 }
 
@@ -257,7 +307,7 @@ func TestBlockedStartupEventAndFailureFallbackRemainBounded(t *testing.T) {
 		t.Cleanup(output.unblock)
 		runDone := make(chan error, 1)
 		go func() {
-			runDone <- runWithContext(nil, output, syncDirectory, context.Background())
+			runDone <- runWithContext(nil, output, syncOpenedDirectory, context.Background())
 		}()
 		select {
 		case <-output.blocked:
@@ -358,7 +408,7 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 	t.Cleanup(output.unblock)
 	logger := newEventLogger(output)
 	reporter := newFatalRuntimeReporter()
-	service, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	service, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
 	if err != nil {
 		t.Fatalf("create pairing service: %v", err)
 	}
@@ -425,7 +475,7 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 func TestAcceptedPairBlockedAuditWinsCancellationAndPreservesIdentity(t *testing.T) {
 	stateParent := t.TempDir()
 	stateDir := filepath.Join(stateParent, "durable-state")
-	codeFile := filepath.Join(stateParent, "pairing-code")
+	codeFile := filepath.Join(stateDir, "pairing-code")
 	terminationContext, cancelTermination := context.WithCancel(context.Background())
 	defer cancelTermination()
 	output := newBlockingAfterWriter(2, cancelTermination)
@@ -440,7 +490,7 @@ func TestAcceptedPairBlockedAuditWinsCancellationAndPreservesIdentity(t *testing
 				"--pairing-code-file", codeFile,
 			},
 			output,
-			syncDirectory,
+			syncOpenedDirectory,
 			terminationContext,
 		)
 		runDone <- reportServerFailure(runErr, &fallback)
@@ -573,7 +623,7 @@ func TestAcceptedPairBlockedAuditWinsCancellationAndPreservesIdentity(t *testing
 func TestOneShotAcceptedAuditFailureCannotBeMaskedByCancellation(t *testing.T) {
 	stateParent := t.TempDir()
 	stateDir := filepath.Join(stateParent, "durable-state")
-	codeFile := filepath.Join(stateParent, "pairing-code")
+	codeFile := filepath.Join(stateDir, "pairing-code")
 	auditFailure := errors.New("one-shot pair_accepted audit failure")
 	terminationContext, cancelTermination := context.WithCancel(context.Background())
 	defer cancelTermination()
@@ -593,7 +643,7 @@ func TestOneShotAcceptedAuditFailureCannotBeMaskedByCancellation(t *testing.T) {
 				"--pairing-code-file", codeFile,
 			},
 			output,
-			syncDirectory,
+			syncOpenedDirectory,
 			terminationContext,
 		)
 		runDone <- reportServerFailure(runErr, &fallback)
@@ -692,7 +742,7 @@ func TestOneShotAcceptedAuditFailureCannotBeMaskedByCancellation(t *testing.T) {
 	}
 }
 
-func TestRunPreservesPrimaryAndFallbackCleanupFailures(t *testing.T) {
+func TestRunRetainedTemporaryParentDefeatsPathReplacementDuringCleanup(t *testing.T) {
 	stateParent := t.TempDir()
 	movedStateParent := filepath.Join(t.TempDir(), "state-parent")
 	t.Setenv("TMPDIR", stateParent)
@@ -735,6 +785,13 @@ func TestRunPreservesPrimaryAndFallbackCleanupFailures(t *testing.T) {
 	})
 
 	runErr := run(nil, output)
+	remaining, readErr := os.ReadDir(movedStateParent)
+	if readErr != nil {
+		t.Fatalf("inspect retained temporary parent: %v", readErr)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("retained parent still contains temporary state: %v", remaining)
+	}
 	if err := restoreStateParent(); err != nil {
 		t.Fatalf("restore test state parent: %v", err)
 	}
@@ -744,10 +801,7 @@ func TestRunPreservesPrimaryAndFallbackCleanupFailures(t *testing.T) {
 	if !errors.Is(runErr, primaryErr) {
 		t.Fatalf("run error does not preserve primary failure: %v", runErr)
 	}
-	if !strings.Contains(runErr.Error(), "report readiness: readiness output failed") {
-		t.Fatalf("run error lacks actionable primary context: %v", runErr)
-	}
-	if !strings.Contains(runErr.Error(), "remove temporary state directory:") {
-		t.Fatalf("run error lacks fallback cleanup failure: %v", runErr)
+	if runErr.Error() != "report readiness: readiness output failed" {
+		t.Fatalf("run error includes unexpected cleanup failure: %v", runErr)
 	}
 }
