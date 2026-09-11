@@ -3,7 +3,7 @@ import test from "node:test";
 
 import WebSocket, { WebSocketServer } from "ws";
 
-import { RosterClient } from "../internal/roster-client.ts";
+import { RosterClient, RosterRequestError } from "../internal/roster-client.ts";
 
 const REQUEST_ID = "01993c84-5d38-7d75-8bc1-f945bfa42cdf";
 const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
@@ -223,6 +223,146 @@ test("abort, timeout, and socket close reject in-flight list and settle resource
           : "Relay disconnected during list_peers.",
     });
     await closes(pair.client);
+    await pair.close();
+  }
+});
+
+test("send generates internal IDs and accepts only exact correlated send_result", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  const request = await requestPromise;
+  const payload = request.payload as Record<string, unknown>;
+  assert.match(String(request.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.match(String(payload.message_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.notEqual(request.request_id, payload.message_id);
+  assert.deepEqual(Object.keys(payload), ["message_id", "to", "body"]);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: request.request_id,
+    payload: { message_id: payload.message_id, status: "received" },
+  }));
+  assert.deepEqual(await resultPromise, { message_id: payload.message_id, status: "received" });
+});
+
+test("send rejects unsupported, unsafe, or over-transport-limit input without consuming the connection", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+  const frames: string[] = [];
+  pair.server.on("message", (data) => frames.push(data.toString("utf8")));
+  const objectMarker = "unsupported-object-body-must-not-cross-wire";
+  await assert.rejects(
+    client.send("destination", { private: objectMarker }, undefined, new AbortController().signal),
+    (error: unknown) => error instanceof RosterRequestError &&
+      error.reason === "object_body_unsupported" &&
+      error.message === "Relay agent_send object bodies are not supported by this release." &&
+      !error.message.includes(objectMarker),
+  );
+  await assert.rejects(client.send("destination", "\ud800", undefined, new AbortController().signal), {
+    message: "Relay agent_send arguments are invalid.",
+  });
+  await assert.rejects(client.send("destination", "x".repeat(512 * 1024), undefined, new AbortController().signal), {
+    message: "Relay agent_send frame exceeds 512 KiB.",
+  });
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.list(undefined, new AbortController().signal);
+  const request = await requestPromise;
+  assert.equal(request.type, "list");
+  pair.server.send(roster(String(request.request_id), { peers: [] }));
+  assert.deepEqual(await resultPromise, { peers: [] });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].includes(objectMarker), false);
+});
+
+test("message is injected without steering before a fresh exact received ACK", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const attempts: unknown[][] = [];
+  const client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    selfAddress: "recipient",
+    deliverUserMessage: (...args: unknown[]) => { attempts.push(args); },
+  });
+  void client;
+  const ackPromise = nextClientRequest(pair.server);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "message",
+    payload: {
+      delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
+      message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+      from: "sender",
+      to: "recipient",
+      body: "exact body",
+    },
+  }));
+  const ack = await ackPromise;
+  assert.deepEqual(attempts, [["exact body"]]);
+  assert.equal(ack.type, "received");
+  assert.match(String(ack.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.deepEqual(ack.payload, {
+    delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
+    message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+  });
+});
+
+test("object message push closes without Pi injection or received ACK", { timeout: 2_000 }, async () => {
+  const pair = await socketPair();
+  const attempts: unknown[][] = [];
+  const outbound: string[] = [];
+  pair.server.on("message", (data) => outbound.push(data.toString("utf8")));
+  const _client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    selfAddress: "recipient",
+    deliverUserMessage: (...args: unknown[]) => { attempts.push(args); },
+  });
+  const peerClosed = closes(pair.server);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "message",
+    payload: {
+      delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
+      message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+      from: "hostile-sender",
+      to: "recipient",
+      body: { private: "hostile-object-body-must-not-be-injected" },
+    },
+  }));
+  await peerClosed;
+  assert.deepEqual(attempts, []);
+  assert.deepEqual(outbound, []);
+  await pair.close();
+});
+
+test("wrong destination, duplicate message fields, and send-result desync fail closed", async () => {
+  const cases: Array<(requestID: string, messageID: string) => string> = [
+    () => `{"v":1,"type":"message","payload":{"delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","from":"sender","to":"other","body":"x"}}`,
+    () => `{"v":1,"type":"message","payload":{"delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","from":"sender","to":"recipient","body":"x","body":"y"}}`,
+    () => `{"v":1,"type":"message","payload":{"delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","from":"sender","to":"recipient","body":"\\ud800"}}`,
+    () => JSON.stringify({ v: 1, type: "message", payload: { delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47", message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df", from: "sender", to: "recipient", body: "x".repeat(512 * 1024) } }),
+    (requestID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: REQUEST_ID, status: "received" } }),
+  ];
+  for (const makeFrame of cases) {
+    const pair = await socketPair();
+    const attempts: unknown[][] = [];
+    const client = new RosterClient(pair.client, {
+      responseTimeoutMS: 1_000,
+      selfAddress: "recipient",
+      deliverUserMessage: (...args: unknown[]) => { attempts.push(args); },
+    });
+    const requestPromise = nextClientRequest(pair.server);
+    const result = client.send("destination", "body", undefined, new AbortController().signal);
+    const request = await requestPromise;
+    const messageID = String((request.payload as Record<string, unknown>).message_id);
+    const peerClosed = closes(pair.server);
+    pair.server.send(makeFrame(String(request.request_id), messageID));
+    await assert.rejects(result, { message: "Relay returned an invalid agent_send response." });
+    await peerClosed;
+    assert.deepEqual(attempts, []);
     await pair.close();
   }
 });

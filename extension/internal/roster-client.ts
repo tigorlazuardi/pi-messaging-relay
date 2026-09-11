@@ -3,11 +3,12 @@ import WebSocket from "ws";
 import { generateUUIDv7 } from "./uuid.ts";
 
 const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
+const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_ADDRESS_BYTES = 4_389;
 const MAX_CURSOR_CHARACTERS = 5_856;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
 
-/** Stable local list failure with a telemetry-safe reason. */
+/** Stable local retained-socket failure with a telemetry-safe reason. */
 export class RosterRequestError extends Error {
   readonly reason: string;
 
@@ -24,9 +25,18 @@ export type RosterPage = {
   next_cursor?: string;
 };
 
-type PendingList = {
+/** Closed model-visible result returned by one correlated send response. */
+export type SendResult = {
+  message_id: string;
+  status: "received" | "denied" | "timeout";
+  reason?: string;
+};
+
+type PendingOperation = {
+  kind: "list" | "send";
   requestID: string;
-  resolve(page: RosterPage): void;
+  messageID?: string;
+  resolve(value: RosterPage | SendResult): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
   signal: AbortSignal;
@@ -36,97 +46,193 @@ type PendingList = {
 type RosterClientOptions = {
   responseTimeoutMS?: number;
   settle?: () => Promise<void>;
+  selfAddress?: string;
+  deliverUserMessage?: (body: string) => void;
 };
 
-/** Single-flight roster request owner for one authenticated retained socket. */
+/** Single-flight operation and inbound-delivery owner for one authenticated socket. */
 export class RosterClient {
   private readonly socket: WebSocket;
   private readonly responseTimeoutMS: number;
   private readonly settle: () => Promise<void>;
-  private pending: PendingList | undefined;
+  private readonly selfAddress: string | undefined;
+  private readonly deliverUserMessage: ((body: string) => void) | undefined;
+  private pending: PendingOperation | undefined;
   private terminal = false;
+  private inboundProcessing = false;
+  private writeInFlight: Promise<void> | undefined;
 
   constructor(socket: WebSocket, options: RosterClientOptions = {}) {
     this.socket = socket;
     this.responseTimeoutMS = options.responseTimeoutMS ?? DEFAULT_RESPONSE_TIMEOUT_MS;
     this.settle = options.settle ?? (() => terminateAndWait(socket));
+    this.selfAddress = options.selfAddress;
+    this.deliverUserMessage = options.deliverUserMessage;
     socket.on("message", this.onMessage);
     socket.on("error", this.onError);
     socket.once("close", this.onClose);
   }
 
   list(cursor: string | undefined, signal: AbortSignal): Promise<RosterPage> {
-    if (this.terminal || this.socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new RosterRequestError("disconnected", "Relay disconnected during list_peers."));
+    const requestID = generateUUIDv7();
+    const frame = JSON.stringify({
+      v: 1,
+      type: "list",
+      request_id: requestID,
+      payload: cursor === undefined ? {} : { cursor },
+    });
+    return this.beginOperation("list", requestID, undefined, frame, signal) as Promise<RosterPage>;
+  }
+
+  send(
+    to: string,
+    body: string | Record<string, unknown>,
+    re: string | undefined,
+    signal: AbortSignal,
+  ): Promise<SendResult> {
+    if (typeof body !== "string") {
+      return Promise.reject(new RosterRequestError(
+        "object_body_unsupported",
+        "Relay agent_send object bodies are not supported by this release.",
+      ));
     }
-    if (this.pending) {
+    if (!validOpaqueString(to, MAX_ADDRESS_BYTES) || !validText(body) ||
+        (re !== undefined && !isUUIDv7(re))) {
+      return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send arguments are invalid."));
+    }
+    const requestID = generateUUIDv7();
+    const messageID = generateUUIDv7();
+    const payload = re === undefined
+      ? { message_id: messageID, to, body }
+      : { message_id: messageID, to, body, re };
+    const frame = JSON.stringify({ v: 1, type: "send", request_id: requestID, payload });
+    if (Buffer.byteLength(frame, "utf8") > MAX_FRAME_BYTES) {
+      return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send frame exceeds 512 KiB."));
+    }
+    return this.beginOperation("send", requestID, messageID, frame, signal) as Promise<SendResult>;
+  }
+
+  private beginOperation(
+    kind: "list" | "send",
+    requestID: string,
+    messageID: string | undefined,
+    frame: string,
+    signal: AbortSignal,
+  ): Promise<RosterPage | SendResult> {
+    if (this.terminal || this.socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(this.operationError(kind, "disconnected"));
+    }
+    if (this.pending || this.writeInFlight) {
+      const operation = kind === "list" ? "list_peers" : "agent_send";
       return Promise.reject(new RosterRequestError(
         "concurrent_request",
-        "Relay list_peers already has one request in flight.",
+        `Relay ${operation} already has one request in flight.`,
       ));
     }
     if (signal.aborted) {
-      return Promise.reject(new RosterRequestError("aborted", "Relay list_peers request was aborted."));
+      return Promise.reject(this.operationError(kind, "aborted"));
     }
 
-    const requestID = generateUUIDv7();
-    return new Promise<RosterPage>((resolve, reject) => {
-      const onAbort = () => {
-        void this.failTerminal(new RosterRequestError("aborted", "Relay list_peers request was aborted."));
-      };
+    return new Promise<RosterPage | SendResult>((resolve, reject) => {
+      const onAbort = () => void this.failTerminal(this.operationError(kind, "aborted"));
       const timer = setTimeout(() => {
-        void this.failTerminal(new RosterRequestError("timeout", "Relay list_peers response timed out."));
+        void this.failTerminal(this.operationError(kind, "timeout"));
       }, this.responseTimeoutMS);
-      this.pending = { requestID, resolve, reject, timer, signal, onAbort };
+      this.pending = { kind, requestID, messageID, resolve, reject, timer, signal, onAbort };
       signal.addEventListener("abort", onAbort, { once: true });
-
-      const frame = JSON.stringify({
-        v: 1,
-        type: "list",
-        request_id: requestID,
-        payload: cursor === undefined ? {} : { cursor },
+      void this.write(frame).catch(() => {
+        void this.failTerminal(this.operationError(kind, "disconnected"));
       });
-      try {
-        this.socket.send(frame, (error) => {
-          if (error) void this.failTerminal(new RosterRequestError(
-            "disconnected",
-            "Relay disconnected during list_peers.",
-          ));
-        });
-      } catch {
-        void this.failTerminal(new RosterRequestError("disconnected", "Relay disconnected during list_peers."));
-      }
     });
   }
 
   private readonly onMessage = (data: WebSocket.RawData, isBinary: boolean): void => {
-    const pending = this.pending;
-    if (!pending) {
-      void this.failTerminal();
-      return;
-    }
     try {
-      if (isBinary || !Buffer.isBuffer(data) || data.byteLength > MAX_ROSTER_FRAME_BYTES) {
-        throw new Error("invalid roster frame");
+      if (isBinary || !Buffer.isBuffer(data) || data.byteLength > MAX_FRAME_BYTES) {
+        throw new Error("invalid relay frame");
       }
       const text = new TextDecoder("utf-8", { fatal: true }).decode(data);
-      const page = parseRoster(text, pending.requestID);
+      assertUnambiguousJSON(text);
+      const parsed: unknown = JSON.parse(text);
+      if (!isObject(parsed) || parsed.v !== 1 || typeof parsed.type !== "string") {
+        throw new Error("invalid relay envelope");
+      }
+      if (parsed.type === "message") {
+        if (this.inboundProcessing) throw new Error("concurrent inbound delivery");
+        const delivery = parseMessage(parsed, this.selfAddress, this.deliverUserMessage);
+        this.inboundProcessing = true;
+        void this.acceptDelivery(delivery);
+        return;
+      }
+
+      const pending = this.pending;
+      if (!pending) throw new Error("unsolicited relay response");
+      let result: RosterPage | SendResult;
+      if (pending.kind === "list") {
+        if (data.byteLength > MAX_ROSTER_FRAME_BYTES) throw new Error("oversized roster frame");
+        result = parseRoster(parsed, pending.requestID);
+      } else {
+        result = parseSendResult(parsed, pending.requestID, pending.messageID as string);
+      }
       this.clearPending();
-      pending.resolve(page);
+      pending.resolve(result);
     } catch {
-      void this.failTerminal(new RosterRequestError(
-        "invalid_response",
-        "Relay returned an invalid list_peers response.",
-      ));
+      const pending = this.pending;
+      void this.failTerminal(pending
+        ? this.operationError(pending.kind, "invalid_response")
+        : undefined);
     }
   };
+
+  private async acceptDelivery(delivery: InboundDelivery): Promise<void> {
+    try {
+      try {
+        this.deliverUserMessage?.(delivery.body);
+      } catch {
+        // received is attempt-at-extension-boundary only; Pi exposes no stronger receipt.
+      }
+      await this.write(JSON.stringify({
+        v: 1,
+        type: "received",
+        request_id: generateUUIDv7(),
+        payload: {
+          delivery_id: delivery.deliveryID,
+          message_id: delivery.messageID,
+        },
+      }));
+      this.inboundProcessing = false;
+    } catch {
+      await this.failTerminal();
+    }
+  }
+
+  private write(frame: string): Promise<void> {
+    const waitFor = this.writeInFlight ?? Promise.resolve();
+    const write = waitFor.then(() => new Promise<void>((resolve, reject) => {
+      if (this.terminal || this.socket.readyState !== WebSocket.OPEN) {
+        reject(new Error("socket closed"));
+        return;
+      }
+      try {
+        this.socket.send(frame, (error) => error ? reject(error) : resolve());
+      } catch (error) {
+        reject(error);
+      }
+    }));
+    const tracked = write.finally(() => {
+      if (this.writeInFlight === tracked) this.writeInFlight = undefined;
+    });
+    this.writeInFlight = tracked;
+    return tracked;
+  }
 
   private readonly onError = (error: Error & { code?: string }): void => {
     const invalidFrame = error.code === "WS_ERR_INVALID_UTF8" ||
       error.code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
-    void this.failTerminal(invalidFrame
-      ? new RosterRequestError("invalid_response", "Relay returned an invalid list_peers response.")
-      : new RosterRequestError("disconnected", "Relay disconnected during list_peers."));
+    const pending = this.pending;
+    void this.failTerminal(pending
+      ? this.operationError(pending.kind, invalidFrame ? "invalid_response" : "disconnected")
+      : undefined);
   };
 
   private readonly onClose = (): void => {
@@ -136,7 +242,7 @@ export class RosterClient {
     const pending = this.pending;
     if (!pending) return;
     this.clearPending();
-    pending.reject(new RosterRequestError("disconnected", "Relay disconnected during list_peers."));
+    pending.reject(this.operationError(pending.kind, "disconnected"));
   };
 
   private clearPending(): void {
@@ -145,6 +251,17 @@ export class RosterClient {
     clearTimeout(pending.timer);
     pending.signal.removeEventListener("abort", pending.onAbort);
     this.pending = undefined;
+  }
+
+  private operationError(kind: "list" | "send", reason: string): RosterRequestError {
+    const operation = kind === "list" ? "list_peers" : "agent_send";
+    const messages: Record<string, string> = {
+      aborted: `Relay ${operation} request was aborted.`,
+      timeout: `Relay ${operation} response timed out.`,
+      invalid_response: `Relay returned an invalid ${operation} response.`,
+      disconnected: `Relay disconnected during ${operation}.`,
+    };
+    return new RosterRequestError(reason, messages[reason] ?? `Relay ${operation} failed.`);
   }
 
   private async failTerminal(error?: Error): Promise<void> {
@@ -160,14 +277,43 @@ export class RosterClient {
   }
 }
 
-function parseRoster(text: string, requestID: string): RosterPage {
-  assertUnambiguousJSON(text);
-  const parsed: unknown = JSON.parse(text);
-  if (!isObject(parsed) || !hasExactKeys(parsed, ["v", "type", "request_id", "payload"]) ||
-      parsed.v !== 1 || parsed.type !== "roster" || parsed.request_id !== requestID) {
+type InboundDelivery = { deliveryID: string; messageID: string; body: string };
+
+function parseMessage(
+  frame: Record<string, unknown>,
+  selfAddress: string | undefined,
+  deliver: ((body: string) => void) | undefined,
+): InboundDelivery {
+  if (!hasExactKeys(frame, ["v", "type", "payload"]) || !selfAddress || !deliver) {
+    throw new Error("unsolicited message envelope");
+  }
+  const payload = frame.payload;
+  if (!isObject(payload) ||
+      (!hasExactKeys(payload, ["delivery_id", "message_id", "from", "to", "body"]) &&
+       !hasExactKeys(payload, ["delivery_id", "message_id", "from", "to", "body", "re"]))) {
+    throw new Error("invalid message payload");
+  }
+  if (typeof payload.delivery_id !== "string" || !isUUIDv7(payload.delivery_id) ||
+      typeof payload.message_id !== "string" || !isUUIDv7(payload.message_id) ||
+      typeof payload.from !== "string" || !validOpaqueString(payload.from, MAX_ADDRESS_BYTES) ||
+      typeof payload.to !== "string" || !validOpaqueString(payload.to, MAX_ADDRESS_BYTES) ||
+      payload.to !== selfAddress ||
+      ("re" in payload && (typeof payload.re !== "string" || !isUUIDv7(payload.re)))) {
+    throw new Error("invalid message correlation");
+  }
+  if (typeof payload.body !== "string" || !validText(payload.body) ||
+      Buffer.byteLength(payload.body, "utf8") > MAX_FRAME_BYTES) {
+    throw new Error("invalid message body text");
+  }
+  return { deliveryID: payload.delivery_id, messageID: payload.message_id, body: payload.body };
+}
+
+function parseRoster(frame: Record<string, unknown>, requestID: string): RosterPage {
+  if (!hasExactKeys(frame, ["v", "type", "request_id", "payload"]) ||
+      frame.type !== "roster" || frame.request_id !== requestID) {
     throw new Error("invalid roster envelope");
   }
-  const payload = parsed.payload;
+  const payload = frame.payload;
   if (!isObject(payload) ||
       (!hasExactKeys(payload, ["peers"]) && !hasExactKeys(payload, ["peers", "next_cursor"])) ||
       !Array.isArray(payload.peers)) {
@@ -189,6 +335,26 @@ function parseRoster(text: string, requestID: string): RosterPage {
   return { peers };
 }
 
+function parseSendResult(frame: Record<string, unknown>, requestID: string, messageID: string): SendResult {
+  if (!hasExactKeys(frame, ["v", "type", "request_id", "payload"]) ||
+      frame.type !== "send_result" || frame.request_id !== requestID) {
+    throw new Error("invalid send result envelope");
+  }
+  const payload = frame.payload;
+  if (!isObject(payload) ||
+      (!hasExactKeys(payload, ["message_id", "status"]) &&
+       !hasExactKeys(payload, ["message_id", "status", "reason"])) ||
+      payload.message_id !== messageID ||
+      (payload.status !== "received" && payload.status !== "denied" && payload.status !== "timeout") ||
+      ("reason" in payload && (typeof payload.reason !== "string" || payload.reason.length === 0)) ||
+      (payload.status === "received" && "reason" in payload)) {
+    throw new Error("invalid send result payload");
+  }
+  return "reason" in payload
+    ? { message_id: messageID, status: payload.status, reason: payload.reason as string }
+    : { message_id: messageID, status: payload.status };
+}
+
 function validCursor(cursor: string): boolean {
   if (cursor.length <= 4 || cursor.length > MAX_CURSOR_CHARACTERS || !/^cur_[A-Za-z0-9_-]+$/.test(cursor)) {
     return false;
@@ -196,23 +362,23 @@ function validCursor(cursor: string): boolean {
   const encoded = cursor.slice(4);
   const decoded = Buffer.from(encoded, "base64url");
   return decoded.byteLength > 0 && decoded.byteLength <= MAX_ADDRESS_BYTES &&
-    decoded.toString("base64url") === encoded &&
-    validUTF8(decoded);
+    decoded.toString("base64url") === encoded && validUTF8(decoded);
 }
 
 function validOpaqueString(value: string, maximumBytes: number): boolean {
-  if (value.length === 0) return false;
+  return value.length > 0 && validText(value) && Buffer.byteLength(value, "utf8") <= maximumBytes;
+}
+
+function validText(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const unit = value.charCodeAt(index);
     if (unit >= 0xd800 && unit <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
       if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) return false;
       index += 1;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      return false;
-    }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
   }
-  return Buffer.byteLength(value, "utf8") <= maximumBytes;
+  return true;
 }
 
 function validUTF8(value: Buffer): boolean {
@@ -222,6 +388,10 @@ function validUTF8(value: Buffer): boolean {
   } catch {
     return false;
   }
+}
+
+function isUUIDv7(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -258,7 +428,9 @@ function assertUnambiguousJSON(text: string): void {
   };
   const value = (depth: number): void => {
     whitespace();
-    if (depth > 64) throw new Error("JSON nesting exceeds limit");
+    if ((text[cursor] === "{" || text[cursor] === "[") && depth > 64) {
+      throw new Error("JSON nesting exceeds limit");
+    }
     if (text[cursor] === "{") {
       cursor += 1;
       whitespace();

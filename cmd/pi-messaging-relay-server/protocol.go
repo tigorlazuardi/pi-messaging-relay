@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
 )
 
 const (
@@ -49,11 +48,16 @@ type clientOperation struct {
 }
 
 type operationResponse struct {
-	Type      string
-	Payload   any
-	Outcome   string
-	Code      string
-	PeerCount *int
+	Type           string
+	Payload        any
+	Outcome        string
+	Code           string
+	PeerCount      *int
+	MessageID      string
+	DeliveryID     string
+	SenderRoute    string
+	RecipientRoute string
+	Status         string
 }
 
 type operationResponseEnvelope struct {
@@ -112,11 +116,16 @@ func (service *sessionAuthService) serveAuthenticated(
 				_ = connection.CloseNow()
 				return
 			}
-			_ = writeProtocolError(connection, *failure)
+			if encoded, encodeErr := encodeProtocolError(*failure); encodeErr == nil {
+				writeContext, cancelWrite := context.WithTimeout(context.Background(), protocolResponseWriteTimeout)
+				_ = service.connections.writeToConnection(writeContext, connection, encoded)
+				cancelWrite()
+			}
 			_ = connection.CloseNow()
 			return
 		}
 
+		operationStarted := time.Now()
 		response, respond, err := service.dispatchOperation(context.Background(), session, operation)
 		if err != nil {
 			service.reportFatal(fmt.Errorf("dispatch %s operation: %w", operation.Type, err))
@@ -137,25 +146,41 @@ func (service *sessionAuthService) serveAuthenticated(
 			_ = connection.CloseNow()
 			return
 		}
-		if err := writeOperationResponse(connection, encodedResponse); err != nil {
+		writeContext, cancelWrite := context.WithTimeout(context.Background(), protocolResponseWriteTimeout)
+		err = service.connections.writeToSession(writeContext, session, encodedResponse)
+		cancelWrite()
+		if err != nil {
 			return
 		}
 		event := "operation_settled"
 		level := "info"
+		if operation.Type == "send" && response.Outcome == "settled" {
+			event = "send_settled"
+		}
 		if response.Outcome == "denied" {
 			event = "operation_denied"
 			level = "warn"
 		}
-		if !service.writeAudit(logEvent{
-			Level:     level,
-			Event:     event,
-			Result:    response.Outcome,
-			Reason:    response.Code,
-			Code:      response.Code,
-			Type:      operation.Type,
-			RequestID: operation.RequestID,
-			Count:     response.PeerCount,
-		}) {
+		log := logEvent{
+			Level:          level,
+			Event:          event,
+			Result:         response.Outcome,
+			Reason:         response.Code,
+			Code:           response.Code,
+			Type:           operation.Type,
+			RequestID:      operation.RequestID,
+			Count:          response.PeerCount,
+			MessageID:      response.MessageID,
+			DeliveryID:     response.DeliveryID,
+			SenderRoute:    response.SenderRoute,
+			RecipientRoute: response.RecipientRoute,
+			Status:         response.Status,
+			LatencyMS:      latencySince(operationStarted),
+		}
+		if operation.Type == "send" {
+			log.Body = redacted
+		}
+		if !service.writeAudit(log) {
 			_ = connection.CloseNow()
 			return
 		}
@@ -515,10 +540,8 @@ func recoverRequestID(data []byte, duplicateRequestID bool) string {
 	return requestID
 }
 
-func writeProtocolError(connection *websocket.Conn, failure protocolFailure) error {
-	ctx, cancel := context.WithTimeout(context.Background(), protocolResponseWriteTimeout)
-	defer cancel()
-	return wsjson.Write(ctx, connection, websocketErrorEnvelope{
+func encodeProtocolError(failure protocolFailure) ([]byte, error) {
+	return json.Marshal(websocketErrorEnvelope{
 		Version:   1,
 		Type:      "error",
 		RequestID: failure.RequestID,

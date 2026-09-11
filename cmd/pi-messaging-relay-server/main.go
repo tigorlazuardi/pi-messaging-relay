@@ -37,6 +37,12 @@ type logEvent struct {
 	Code            string `json:"code,omitempty"`
 	Type            string `json:"type,omitempty"`
 	RequestID       string `json:"request_id,omitempty"`
+	MessageID       string `json:"message_id,omitempty"`
+	DeliveryID      string `json:"delivery_id,omitempty"`
+	SenderRoute     string `json:"sender_route,omitempty"`
+	RecipientRoute  string `json:"recipient_route,omitempty"`
+	Status          string `json:"status,omitempty"`
+	Body            string `json:"body,omitempty"`
 	PairingCode     string `json:"pairing_code,omitempty"`
 	PrivateKey      string `json:"private_key,omitempty"`
 	ClientPublicKey string `json:"client_public_key,omitempty"`
@@ -304,6 +310,7 @@ func runWithContext(
 
 	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
+	connections.beginShutdown()
 	if err := server.Shutdown(shutdownContext); err != nil {
 		_ = server.Close()
 		<-serveResult

@@ -31,7 +31,7 @@ Copy only a `next_cursor` returned by the relay. A cursor is not a peer identity
 
 A disconnected peer is absent from later pages after its disconnect settles. If your own retained relay connection closes, `list_peers` fails instead of returning a stale roster. Automatic reconnect is not available yet; start a new Pi session or use the currently supported pairing connection flow.
 
-Only one `list_peers` operation can be in flight on one retained connection. A concurrent call fails locally without being sent or queued. A request also fails and settles the connection when it is aborted, exceeds its five-second response deadline, receives malformed or wrongly correlated data, or loses the socket. Retry from a newly authenticated connection; do not reuse a cursor when you need a fresh view.
+Only one outgoing `list_peers` or `agent_send` operation can be in flight on one retained connection. A concurrent call fails locally without being sent or queued. Incoming validated delivery can still arrive while that operation waits. A request also fails and settles the connection when it is aborted, exceeds its five-second response deadline, receives malformed or wrongly correlated data, or loses the socket. Retry from a newly authenticated connection; do not reuse a cursor when you need a fresh view.
 
 | Condition | Error |
 |---|---|

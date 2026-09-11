@@ -3,7 +3,7 @@ import { sign, type KeyObject } from "node:crypto";
 
 import WebSocket from "ws";
 
-import { RosterClient, type RosterPage } from "./roster-client.ts";
+import { RosterClient, type RosterPage, type SendResult } from "./roster-client.ts";
 import { generateUUIDv7 } from "./uuid.ts";
 
 export { generateUUIDv7 } from "./uuid.ts";
@@ -22,6 +22,12 @@ type AuthenticatedConnection = {
   socket: WebSocket;
   address: string;
   list(cursor: string | undefined, signal: AbortSignal): Promise<RosterPage>;
+  send(
+    to: string,
+    body: string | Record<string, unknown>,
+    re: string | undefined,
+    signal: AbortSignal,
+  ): Promise<SendResult>;
   closeAndWait(): Promise<void>;
 };
 
@@ -32,6 +38,7 @@ type SessionSocketAttemptOptions = {
   routeID: string;
   cwd: string;
   hostname?: string;
+  deliverUserMessage(body: string): void;
   onDisconnected(): void;
 };
 
@@ -151,11 +158,16 @@ export class SessionSocketAttempt {
             socket.off("error", onRetainedError);
             options.onDisconnected();
           });
-          const roster = new RosterClient(socket, { settle: () => closeAndWait(socket) });
+          const roster = new RosterClient(socket, {
+            settle: () => closeAndWait(socket),
+            selfAddress: address,
+            deliverUserMessage: options.deliverUserMessage,
+          });
           resolve({
             socket,
             address,
             list: (cursor, signal) => roster.list(cursor, signal),
+            send: (to, body, re, signal) => roster.send(to, body, re, signal),
             closeAndWait: () => closeAndWait(socket),
           });
         } catch (error) {

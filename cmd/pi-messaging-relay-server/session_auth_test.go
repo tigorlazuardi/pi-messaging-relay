@@ -502,7 +502,7 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `"event":"protocol_rejected"`) ||
 		!strings.Contains(logs.String(), `"event":"operation_denied"`) ||
-		!strings.Contains(logs.String(), `"event":"operation_settled"`) ||
+		!strings.Contains(logs.String(), `"event":"send_settled"`) ||
 		!strings.Contains(logs.String(), `"request_id":"`+requestID+`"`) {
 		t.Fatalf("protocol telemetry incomplete: %s", logs.String())
 	}

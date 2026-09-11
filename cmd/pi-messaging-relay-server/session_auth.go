@@ -95,6 +95,7 @@ type trackedSessionConnection struct {
 	connection *websocket.Conn
 	session    *authenticatedSession
 	visible    bool
+	writeMu    sync.Mutex
 }
 
 type sessionAuthenticationResult int
@@ -106,11 +107,14 @@ const (
 )
 
 type sessionConnectionRegistry struct {
-	mu      sync.Mutex
-	closing bool
-	limit   int
-	entries map[*trackedSessionConnection]struct{}
-	changed chan struct{}
+	mu                   sync.Mutex
+	closing              bool
+	limit                int
+	entries              map[*trackedSessionConnection]struct{}
+	changed              chan struct{}
+	closed               chan struct{}
+	closeOnce            sync.Once
+	onSessionUnavailable func(*authenticatedSession)
 }
 
 func newSessionConnectionRegistry() *sessionConnectionRegistry {
@@ -122,6 +126,7 @@ func newSessionConnectionRegistryWithLimit(limit int) *sessionConnectionRegistry
 		limit:   limit,
 		entries: make(map[*trackedSessionConnection]struct{}),
 		changed: make(chan struct{}, 1),
+		closed:  make(chan struct{}),
 	}
 }
 
@@ -192,18 +197,29 @@ func (registry *sessionConnectionRegistry) publishAuthentication(
 
 func (registry *sessionConnectionRegistry) clearAuthentication(entry *trackedSessionConnection) {
 	registry.mu.Lock()
+	var unavailable *authenticatedSession
 	if _, exists := registry.entries[entry]; exists {
+		unavailable = entry.session
 		entry.visible = false
 		entry.session = nil
 	}
+	onUnavailable := registry.onSessionUnavailable
 	registry.mu.Unlock()
+	if unavailable != nil && onUnavailable != nil {
+		onUnavailable(unavailable)
+	}
 }
 
 func (registry *sessionConnectionRegistry) remove(entry *trackedSessionConnection) {
 	registry.mu.Lock()
+	unavailable := entry.session
 	delete(registry.entries, entry)
 	empty := len(registry.entries) == 0
+	onUnavailable := registry.onSessionUnavailable
 	registry.mu.Unlock()
+	if unavailable != nil && onUnavailable != nil {
+		onUnavailable(unavailable)
+	}
 	if empty {
 		select {
 		case registry.changed <- struct{}{}:
@@ -212,9 +228,16 @@ func (registry *sessionConnectionRegistry) remove(entry *trackedSessionConnectio
 	}
 }
 
-func (registry *sessionConnectionRegistry) closeAndWait(ctx context.Context) error {
+func (registry *sessionConnectionRegistry) beginShutdown() {
 	registry.mu.Lock()
 	registry.closing = true
+	registry.closeOnce.Do(func() { close(registry.closed) })
+	registry.mu.Unlock()
+}
+
+func (registry *sessionConnectionRegistry) closeAndWait(ctx context.Context) error {
+	registry.beginShutdown()
+	registry.mu.Lock()
 	connections := make([]*websocket.Conn, 0, len(registry.entries))
 	for entry := range registry.entries {
 		if entry.connection != nil {
@@ -241,6 +264,64 @@ func (registry *sessionConnectionRegistry) closeAndWait(ctx context.Context) err
 	}
 }
 
+func (registry *sessionConnectionRegistry) closingSignal() <-chan struct{} {
+	return registry.closed
+}
+
+func (registry *sessionConnectionRegistry) publishedSession(address string) (*authenticatedSession, bool) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for entry := range registry.entries {
+		if entry.visible && entry.session != nil && entry.session.Address == address {
+			return entry.session, true
+		}
+	}
+	return nil, false
+}
+
+func (registry *sessionConnectionRegistry) writeToSession(
+	ctx context.Context,
+	session *authenticatedSession,
+	frame []byte,
+) error {
+	registry.mu.Lock()
+	var destination *trackedSessionConnection
+	for entry := range registry.entries {
+		if entry.visible && entry.session == session && entry.connection != nil {
+			destination = entry
+			break
+		}
+	}
+	registry.mu.Unlock()
+	return writeTrackedConnection(ctx, destination, frame)
+}
+
+func (registry *sessionConnectionRegistry) writeToConnection(
+	ctx context.Context,
+	connection *websocket.Conn,
+	frame []byte,
+) error {
+	registry.mu.Lock()
+	var destination *trackedSessionConnection
+	for entry := range registry.entries {
+		if entry.connection == connection {
+			destination = entry
+			break
+		}
+	}
+	registry.mu.Unlock()
+	return writeTrackedConnection(ctx, destination, frame)
+}
+
+func writeTrackedConnection(ctx context.Context, destination *trackedSessionConnection, frame []byte) error {
+	if destination == nil || destination.connection == nil {
+		return errors.New("tracked destination is unavailable")
+	}
+	destination.writeMu.Lock()
+	defer destination.writeMu.Unlock()
+	return destination.connection.Write(ctx, websocket.MessageText, frame)
+}
+
 type sessionAuthService struct {
 	pairing           *pairingService
 	connections       *sessionConnectionRegistry
@@ -257,12 +338,13 @@ func newSessionAuthService(
 	logger *eventLogger,
 	reportFatal func(error),
 ) *sessionAuthService {
+	delivery := newDeliveryDispatcher(connections)
 	return &sessionAuthService{
 		pairing:           pairing,
 		connections:       connections,
 		logger:            logger,
 		reportFatal:       reportFatal,
-		dispatchOperation: rosterOperationDispatcher(connections),
+		dispatchOperation: delivery.dispatch,
 		writeWelcome: func(ctx context.Context, connection *websocket.Conn, welcome welcomeEnvelope) error {
 			return wsjson.Write(ctx, connection, welcome)
 		},

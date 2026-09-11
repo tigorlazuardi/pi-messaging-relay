@@ -596,6 +596,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
       clientPublicKey,
       routeID,
       cwd,
+      deliverUserMessage: (body) => pi.sendUserMessage(body),
       onDisconnected: () => {
         if (activeConnection?.socket === connection?.socket) activeConnection = undefined;
         logAuthentication("info", "disconnected", {
@@ -713,10 +714,29 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "agent_send",
     label: "Send to Relay Peer",
-    description: "Send a string or JSON object body to one online Pi relay session",
+    description: "Send text to one online Pi relay session; object bodies are reserved for a later release",
     parameters: agentSendParameters,
-    async execute() {
-      return disconnected("agent_send");
+    async execute(_toolCallID, params, signal) {
+      const connection = activeConnection;
+      if (!connection) return disconnected("agent_send");
+      try {
+        const input = params as {
+          to: string;
+          body: string | Record<string, unknown>;
+          re?: string;
+        };
+        const result = await connection.send(input.to, input.body, input.re, signal as AbortSignal);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }],
+          details: result,
+        };
+      } catch (error) {
+        logFailure(
+          "agent_send",
+          error instanceof RosterRequestError ? error.reason : "unexpected_failure",
+        );
+        throw error;
+      }
     },
   });
 }

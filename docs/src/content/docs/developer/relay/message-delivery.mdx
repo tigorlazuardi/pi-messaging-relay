@@ -1,0 +1,82 @@
+---
+title: Authenticated idle text delivery
+description: How one online text send is correlated, injected into an idle Pi session, acknowledged, bounded, and logged without overstating receipt.
+status: accepted
+date: 2026-09-11
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Decision from '../../../../components/Decision.astro';
+
+This seam connects `agent_send` to one exact currently published authenticated destination. It implements successful idle text delivery only. Addresses remain whole opaque registry keys; cwd, hostname, route formatting, model input, and message identifiers never grant routing authority.
+
+## Successful flow
+
+```mermaid
+sequenceDiagram
+    participant S as Sender Pi
+    participant SE as Sender extension
+    participant R as Relay
+    participant RE as Recipient extension
+    participant P as Recipient Pi
+    S->>SE: agent_send(to, text)
+    SE->>SE: generate request_id and message_id
+    SE->>R: send
+    R->>R: find exact published address; generate delivery_id
+    R->>RE: message
+    RE->>P: sendUserMessage(text)
+    RE->>R: received with fresh request_id
+    R->>SE: correlated send_result(received)
+    SE->>S: compact JSON result
+```
+
+The model supplies only `to`, `body`, and optional `re`; it cannot supply a request, message, or delivery ID. The extension generates fresh canonical lowercase UUIDv7 request and message IDs. The relay generates a fresh UUIDv7 delivery ID and retains only the minimum in-memory pending correlation: exact sender session, exact recipient session, sender request and message IDs, and delivery ID.
+
+The recipient validates the closed `message` envelope, duplicate keys, nesting, types, UUIDs, opaque string bounds, body text, and exact equality between `to` and its authenticated address. For this idle seam it calls `pi.sendUserMessage(body)` with no options. It never calls `sendMessage` and never accepts sender-selected steering. After the call is attempted—even if Pi throws—the extension sends a closed `received` operation with a fresh request ID and the matching delivery and message IDs.
+
+<Decision title="Define received as an attempted Pi boundary call" status="accepted">
+`received` means only that the intended recipient extension validated the offer and attempted `pi.sendUserMessage`. It does not claim that Pi queued or persisted anything, that a model read the message, that work completed, or that a reply will arrive.
+</Decision>
+
+Only an ACK from the exact recipient session with both exact IDs removes and settles pending work. Unknown, late, wrong-session, wrong-delivery, and wrong-message ACKs produce no response, do not settle a sender, and leave a healthy connection usable.
+
+## Bounds and socket ownership
+
+One retained extension socket owns both `list_peers` and `agent_send` operations. At most one outgoing operation may be in flight; a second fails locally and is not queued. Server pushes remain acceptable while an operation is pending. One inbound offer is processed at a time, and all client and server WebSocket writes are serialized per connection.
+
+Complete frames are bounded to 512 KiB, JSON nesting to 64 containers, addresses to 4,389 UTF-8 bytes, and the pending ACK wait to five seconds. Abort, timeout, malformed or wrongly correlated response, unsolicited response, and close settle extension listeners and timers; ambiguity force-settles the socket. The server has at most one actively dispatched send per connection under this seam and no more than 1,024 tracked connections, so pending memory and waiters remain bounded. Pending bodies are memory-only and are never persisted, replayed, or logged.
+
+<Aside type="caution" title="Interim incomplete failures">
+Ticket #18 owns the offline sender result, #19 owns `ack_timeout`, #20 owns recipient-disconnected settlement, and #21 owns immediate sender-disconnect cleanup assertions. Until those tickets land, these paths may end without `send_result`; the extension's five-second response deadline then closes its socket. The relay still removes pending work at its five-second ceiling, on recipient removal, or on shutdown. There is no retry (#22), 256 KiB body rejection (#24), or 128-send pipelining (#25).
+</Aside>
+
+Busy follow-up routing is #15. Provenance headers and stable object rendering are #16. Reply behavior is #17. The final v1 schema still accepts object bodies and optional `re`, but #14 runtime delivery is text-only. A local object-body call fails with reason `object_body_unsupported` before IDs or a frame are created, leaving the retained socket available for later text or list operations. A raw-client object send remains syntactically valid at the protocol parser, then ends without an offer, pending state, or interim sender result. A recipient that receives an object push closes without calling Pi or acknowledging it. No object content enters an error or log. Ticket #16 removes these staged guards when it adds the provenance header and canonical compact object renderer.
+
+## Telemetry
+
+One successful send produces one server-owned `send_settled` JSON event after the correlated sender response is written. It includes request, message, delivery, sender and recipient routes, status, result/reason, and latency. The `body` field is always `<redacted>`; raw body text and stringified bodies never enter logs. The extension does not duplicate the successful settlement log. The accepted v1 decision adds no traces or metrics for this small operator-run relay.
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Tool input">
+    ```json
+    {"to":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222","body":"Review the API contract"}
+    ```
+  </TabItem>
+  <TabItem label="Recipient Pi call">
+    ```text
+    pi.sendUserMessage("Review the API contract")
+    ```
+  </TabItem>
+  <TabItem label="Tool result">
+    ```json
+    {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"received"}
+    ```
+  </TabItem>
+  <TabItem label="Settlement log">
+    ```json
+    {"level":"info","event":"send_settled","result":"settled","reason":"received","code":"received","type":"send","request_id":"01993c7a-7d2c-7699-b159-851da079f09f","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","recipient_route":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222","status":"received","body":"<redacted>","latency_ms":12}
+    ```
+  </TabItem>
+</Tabs>

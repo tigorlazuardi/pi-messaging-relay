@@ -177,6 +177,7 @@ async function expectRejectedAttempt(
     routeID: ROUTE_ID,
     cwd: "/oversized",
     hostname: "malicious-endpoint",
+    deliverUserMessage: () => {},
     onDisconnected: () => {},
   });
   await assert.rejects(within(attempt.result), (error: unknown) =>
