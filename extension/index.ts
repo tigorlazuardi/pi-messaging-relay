@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { link, lstat, mkdir, open, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname as operatingSystemHostname } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import {
   createPrivateKey,
@@ -15,6 +15,12 @@ import { Type } from "typebox";
 
 import { createRecipientDelivery } from "./internal/delivery-policy.ts";
 import { syncDirectory } from "./internal/directory-durability.ts";
+import {
+  reconnectDelayMS,
+  reconnectDependencies,
+  RECONNECT_MAX_RETRIES,
+  type ReconnectDeadline,
+} from "./internal/reconnect.ts";
 import { RosterRequestError } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
 
@@ -34,6 +40,8 @@ const MAX_PAIRING_CODE_BYTES = Math.min(
   PAIRING_CODE_BYTES,
   MAX_PAIR_REQUEST_BYTES - PAIR_REQUEST_FIXED_BYTES,
 );
+const ROUTE_ENTRY_TYPE = "pi-messaging-relay-route-v1";
+const ROUTE_ENTRY_VERSION = 1;
 
 const listPeersParameters = Type.Object(
   {
@@ -514,14 +522,53 @@ function validatePairingCodeArgument(argument: string): string {
   return argument;
 }
 
+function retainedSessionRouteID(context: {
+  sessionManager: { getEntries(): unknown[] };
+}): string | undefined {
+  const entries = context.sessionManager.getEntries();
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const candidate = entries[index];
+    if (candidate === null || typeof candidate !== "object" ||
+        (candidate as { type?: unknown }).type !== "custom" ||
+        (candidate as { customType?: unknown }).customType !== ROUTE_ENTRY_TYPE) {
+      continue;
+    }
+    const data = (candidate as { data?: unknown }).data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const record = data as Record<string, unknown>;
+    if (Object.keys(record).sort().join(",") !== "route_id,version" ||
+        record.version !== ROUTE_ENTRY_VERSION || typeof record.route_id !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.route_id)) {
+      return undefined;
+    }
+    return record.route_id;
+  }
+  return undefined;
+}
+
 export default function relayExtension(pi: ExtensionAPI): void {
+  type ConnectionIdentity = {
+    endpoint: URL;
+    privateKey: KeyObject;
+    clientPublicKey: string;
+    routeID: string;
+    cwd: string;
+    hostname: string;
+    sessionIdle(): boolean;
+  };
+
+  const reconnect = reconnectDependencies();
   let sessionStarted = false;
   let sessionRouteID: string | undefined;
   let sessionCWD: string | undefined;
   let startupAttempted = false;
   let pairingAttempted = false;
+  let lifecycleGeneration = 0;
+  let retryIndex = 0;
+  let retryDeadline: { deadline: ReconnectDeadline } | undefined;
   let activeSessionIdle: (() => boolean) | undefined;
   let activeAttempt: SessionSocketAttempt | undefined;
+  let activeTask: Promise<void> | undefined;
   let activeConnection: Awaited<SessionSocketAttempt["result"]> | undefined;
 
   const logAuthentication = (
@@ -548,6 +595,163 @@ export default function relayExtension(pi: ExtensionAPI): void {
     }));
   };
 
+  const now = (): number => {
+    const value = reconnect.now();
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Reconnect clock returned an invalid timestamp.");
+    }
+    return value;
+  };
+
+  const isCurrent = (generation: number, routeID?: string): boolean =>
+    sessionStarted && lifecycleGeneration === generation &&
+    (routeID === undefined || sessionRouteID === routeID);
+
+  const cancelRetry = (): void => {
+    const scheduled = retryDeadline;
+    retryDeadline = undefined;
+    if (!scheduled) return;
+    try {
+      scheduled.deadline.cancel();
+    } catch {
+      // Cancellation must not block session teardown or replace socket settlement.
+    }
+  };
+
+  const launchConnection = async (
+    identity: ConnectionIdentity,
+    generation: number,
+  ): Promise<void> => {
+    if (!isCurrent(generation, identity.routeID) || activeConnection) return;
+    if (activeTask) {
+      const previousTask = activeTask;
+      await previousTask;
+      if (!isCurrent(generation, identity.routeID) || activeConnection || activeTask) return;
+    }
+
+    const operation = (async () => {
+      let started: number;
+      try {
+        started = now();
+      } catch {
+        return;
+      }
+      let connection: Awaited<SessionSocketAttempt["result"]> | undefined;
+      let retained = false;
+      const attempt = new SessionSocketAttempt({
+        endpoint: identity.endpoint,
+        privateKey: identity.privateKey,
+        clientPublicKey: identity.clientPublicKey,
+        routeID: identity.routeID,
+        cwd: identity.cwd,
+        hostname: identity.hostname,
+        deliverUserMessage: createRecipientDelivery(
+          pi.sendUserMessage,
+          identity.sessionIdle,
+          () => activeSessionIdle === identity.sessionIdle,
+        ),
+        onDisconnected: () => {
+          if (!retained || !connection) return;
+          const wasCurrent = activeConnection?.socket === connection.socket;
+          if (wasCurrent) activeConnection = undefined;
+          logAuthentication("info", "disconnected", {
+            address: connection.address,
+            routeID: identity.routeID,
+            clientPublicKey: identity.clientPublicKey,
+          });
+          if (wasCurrent && isCurrent(generation, identity.routeID)) {
+            scheduleRetry(identity, generation);
+          }
+        },
+      });
+      activeAttempt = attempt;
+      try {
+        connection = await attempt.result;
+        if (!isCurrent(generation, identity.routeID)) {
+          await connection.closeAndWait();
+          return;
+        }
+        if (connection.socket.readyState !== connection.socket.OPEN) {
+          // A close that beats retention is a failed attempt; retained closes run after tracked ownership clears.
+          await connection.closeAndWait();
+          throw new Error("authenticated socket closed before retention");
+        }
+        const latencyMS = now() - started;
+        activeConnection = connection;
+        retained = true;
+        retryIndex = 0;
+        logAuthentication("info", "accepted", {
+          address: connection.address,
+          routeID: identity.routeID,
+          clientPublicKey: identity.clientPublicKey,
+          latencyMS,
+        });
+      } catch (error) {
+        if (!isCurrent(generation, identity.routeID)) return;
+        const reason = error !== null && typeof error === "object" && "reason" in error &&
+            typeof (error as { reason?: unknown }).reason === "string"
+          ? (error as { reason: string }).reason
+          : "connection_failed";
+        let latencyMS: number | undefined;
+        try {
+          latencyMS = now() - started;
+        } catch {
+          latencyMS = undefined;
+        }
+        logAuthentication("warn", "rejected", {
+          reason,
+          routeID: identity.routeID,
+          clientPublicKey: identity.clientPublicKey,
+          latencyMS,
+        });
+        scheduleRetry(identity, generation);
+      } finally {
+        if (activeAttempt === attempt) activeAttempt = undefined;
+      }
+    })();
+    let trackedTask: Promise<void>;
+    trackedTask = operation.finally(() => {
+      if (activeTask === trackedTask) activeTask = undefined;
+    });
+    activeTask = trackedTask;
+    await trackedTask;
+  };
+
+  function scheduleRetry(identity: ConnectionIdentity, generation: number): void {
+    if (!isCurrent(generation, identity.routeID) || activeConnection || retryDeadline ||
+        retryIndex >= RECONNECT_MAX_RETRIES) return;
+    let delayMS: number;
+    try {
+      delayMS = reconnectDelayMS(retryIndex, reconnect.randomUnit);
+    } catch {
+      return;
+    }
+    retryIndex += 1;
+
+    let deadline: ReconnectDeadline | undefined;
+    let firedSynchronously = false;
+    const fire = () => {
+      if (!deadline) {
+        firedSynchronously = true;
+        return;
+      }
+      if (retryDeadline?.deadline !== deadline) return;
+      retryDeadline = undefined;
+      void launchConnection(identity, generation).catch(() => undefined);
+    };
+    try {
+      deadline = reconnect.schedule(fire, delayMS);
+      if (!deadline || typeof deadline.cancel !== "function") return;
+    } catch {
+      return;
+    }
+    if (firedSynchronously) {
+      void launchConnection(identity, generation).catch(() => undefined);
+      return;
+    }
+    retryDeadline = { deadline };
+  }
+
   const connectOnce = async (cause: "startup" | "pairing", pairedKey?: KeyObject): Promise<void> => {
     if (!sessionStarted || activeConnection) return;
     if (cause === "startup") {
@@ -555,8 +759,8 @@ export default function relayExtension(pi: ExtensionAPI): void {
     } else if (pairingAttempted) {
       return;
     }
-    if (activeAttempt) {
-      await activeAttempt.result.catch(() => undefined);
+    if (activeTask) {
+      await activeTask;
       if (!sessionStarted || activeConnection) return;
     }
 
@@ -574,18 +778,19 @@ export default function relayExtension(pi: ExtensionAPI): void {
     if (cause === "startup") startupAttempted = true;
     else pairingAttempted = true;
 
-    const started = Date.now();
     let clientPublicKey: string;
     let endpoint: URL;
+    let hostname: string;
     try {
+      now();
       clientPublicKey = encodedPublicKey(privateKey);
       endpoint = connectEndpoint();
+      hostname = operatingSystemHostname();
     } catch (error) {
       const reason = error instanceof PairingError ? error.reason : "configuration_invalid";
       logAuthentication("warn", "rejected", {
         reason,
         routeID: sessionRouteID,
-        latencyMS: Date.now() - started,
       });
       return;
     }
@@ -594,63 +799,51 @@ export default function relayExtension(pi: ExtensionAPI): void {
     const sessionIdle = activeSessionIdle;
     if (!routeID || !cwd || !sessionIdle) return;
 
-    const attempt = new SessionSocketAttempt({
+    cancelRetry();
+    if (cause === "pairing") retryIndex = 0;
+    const identity = {
       endpoint,
       privateKey,
       clientPublicKey,
       routeID,
       cwd,
-      deliverUserMessage: createRecipientDelivery(
-        pi.sendUserMessage,
-        sessionIdle,
-        () => activeSessionIdle === sessionIdle,
-      ),
-      onDisconnected: () => {
-        if (activeConnection?.socket === connection?.socket) activeConnection = undefined;
-        logAuthentication("info", "disconnected", {
-          address: connection?.address,
-          routeID,
-          clientPublicKey,
-        });
-      },
-    });
-    activeAttempt = attempt;
-    let connection: Awaited<typeof attempt.result> | undefined;
-    try {
-      connection = await attempt.result;
-      if (!sessionStarted || sessionRouteID !== routeID) {
-        await connection.closeAndWait();
-        return;
-      }
-      activeConnection = connection;
-      logAuthentication("info", "accepted", {
-        address: connection.address,
-        routeID,
-        clientPublicKey,
-        latencyMS: Date.now() - started,
-      });
-    } catch (error) {
-      const reason = error !== null && typeof error === "object" && "reason" in error &&
-          typeof (error as { reason?: unknown }).reason === "string"
-        ? (error as { reason: string }).reason
-        : "connection_failed";
-      logAuthentication("warn", "rejected", {
-        reason,
-        routeID,
-        clientPublicKey,
-        latencyMS: Date.now() - started,
-      });
-    } finally {
-      if (activeAttempt === attempt) activeAttempt = undefined;
-    }
+      hostname,
+      sessionIdle,
+    };
+    await launchConnection(identity, lifecycleGeneration);
   };
 
-  pi.on("session_start", async (_event, ctx) => {
+  const stopSession = async (): Promise<void> => {
+    sessionStarted = false;
+    lifecycleGeneration += 1;
     activeSessionIdle = undefined;
-    if (activeConnection) await activeConnection.closeAndWait();
+    cancelRetry();
+    const task = activeTask;
     activeAttempt?.close();
+    if (task) await task;
+    const connection = activeConnection;
+    activeConnection = undefined;
+    if (connection) await connection.closeAndWait();
+    retryIndex = 0;
+    sessionRouteID = undefined;
+    sessionCWD = undefined;
+  };
+
+  pi.on("session_start", async (event, ctx) => {
+    await stopSession();
     sessionStarted = true;
-    sessionRouteID = generateUUIDv7();
+    const reason = (event as { reason?: unknown }).reason;
+    const mayRetainRoute = reason === "startup" || reason === "reload" || reason === "resume";
+    const retainedRouteID = mayRetainRoute
+      ? retainedSessionRouteID(ctx as unknown as { sessionManager: { getEntries(): unknown[] } })
+      : undefined;
+    sessionRouteID = retainedRouteID ?? generateUUIDv7(now());
+    if (!retainedRouteID) {
+      pi.appendEntry(ROUTE_ENTRY_TYPE, {
+        version: ROUTE_ENTRY_VERSION,
+        route_id: sessionRouteID,
+      });
+    }
     sessionCWD = ctx.cwd;
     activeSessionIdle = () => ctx.isIdle();
     startupAttempted = false;
@@ -658,18 +851,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
     await connectOnce("startup");
   });
 
-  pi.on("session_shutdown", async () => {
-    sessionStarted = false;
-    sessionRouteID = undefined;
-    sessionCWD = undefined;
-    activeSessionIdle = undefined;
-    const pendingAttempt = activeAttempt?.result;
-    activeAttempt?.close();
-    if (pendingAttempt) await pendingAttempt.catch(() => undefined);
-    const connection = activeConnection;
-    activeConnection = undefined;
-    if (connection) await connection.closeAndWait();
-  });
+  pi.on("session_shutdown", stopSession);
 
   pi.registerCommand("relay-pair", {
     description: "Pair this Pi installation with the configured relay server",

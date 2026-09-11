@@ -42,6 +42,8 @@ The authenticated connection owns one deep `list` request API. It generates a UU
 
 One outgoing list or send request may be in flight per retained connection. A second attempt fails locally without a send or queue. Validated server-pushed delivery offers remain acceptable while that operation waits. The `list_peers` response deadline remains five seconds; `agent_send` uses its separate eight-second deadline so the relay's complete five-second recipient ACK path can answer. Abort or local response timeout closes and settles the socket because a later response could otherwise desynchronize correlation. Socket close rejects an in-flight request. A malformed, unsolicited, or wrong-correlation roster also fails closed and force-settles the transport.
 
+After that exact connection closes, [automatic session reconnect](/developer/relay/automatic-reconnect/) may restore the same address only through a fresh successful authentication. The session remains absent from every roster read while disconnected or while retry attempts have not authenticated. Reconnect does not resume the failed list, retain its cursor as operation state, or return a stale page.
+
 <Decision title="Allow exactly one outgoing operation per retained connection" status="accepted">
 A shared extension single-flight owner correlates list and send responses while still accepting bounded recipient pushes. This local ceiling intentionally does not expose the server's 128-send raw-client capacity and adds no extension queue.
 </Decision>

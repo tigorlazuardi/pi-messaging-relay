@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 The extension package in `extension/` establishes the Pi-facing surface. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
 
 <Aside type="note" title="Authenticated roster and message delivery">
-The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers authenticate and retain one WebSocket shared by bounded `list_peers`, `agent_send`, and recipient delivery. Deterministic provenance formatting plus successful string/object idle injection and busy follow-up injection are connected; replies, failure results, and reconnect remain deferred. Loading the factory still requires no relay server and no model call.
+The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers authenticate and retain one WebSocket shared by bounded `list_peers`, `agent_send`, and recipient delivery. Deterministic provenance formatting, successful string/object idle injection and busy follow-up injection, replies, finalized failure results, and bounded automatic reconnect are connected. Loading the factory still requires no relay server and no model call.
 </Aside>
 
 ## Registration and lifecycle boundary
@@ -24,13 +24,15 @@ flowchart TD
     L --> S[Register agent_send]
     S --> D[Return with no network resource]
     D --> A[session_start: attempt authentication when configured and paired]
-    A --> X[session_shutdown: settle in-flight or retained socket]
+    A --> R[interruption: bounded jittered reconnect with same session route]
+    R --> A
+    A --> X[session_shutdown: cancel timer, join attempt, settle retained socket]
 ```
 
-The synchronous factory registers the command, both tools, and the two lifecycle handlers. Factory execution does not start timers, open sockets, call `fetch`, inspect a model, or inject session content. `session_start` makes one bounded authentication attempt when both endpoint and installation key exist. A successful `/relay-pair CODE` invocation performs bounded file and HTTP work and, when the session is already active, makes one pairing-owned authentication attempt. `session_shutdown` idempotently closes an in-flight or retained socket and rejects an in-flight list or send operation.
+The synchronous factory registers the command, both tools, and the two lifecycle handlers. Factory execution does not start timers, open sockets, call `fetch`, inspect a model, or inject session content. `session_start` makes one immediate bounded authentication attempt when both endpoint and installation key exist. A successful `/relay-pair CODE` invocation performs bounded file and HTTP work and, when the session is already active, makes one pairing-owned immediate authentication attempt. Failed attempts and retained-socket loss schedule at most ten single-flight retries with the fixed policy in [automatic session reconnect](/developer/relay/automatic-reconnect/). `session_shutdown` idempotently cancels its timer, closes and joins an in-flight attempt, closes a retained socket, and rejects an in-flight list or send operation.
 
 <Decision title="Keep factory loading inert and give session lifecycle socket ownership" status="accepted">
-Loading only registers surfaces and lifecycle handlers, so it creates no resource that outlives a factory invocation. `session_start`, successful pairing during an active session, and `session_shutdown` explicitly own authentication attempts and transport settlement.
+Loading only registers surfaces and lifecycle handlers, so it creates no resource that outlives a factory invocation. `session_start` and successful pairing during an active session start connection ownership; one active session lifecycle owns all later reconnect deadlines and attempts; `session_shutdown` cancels and joins that ownership.
 </Decision>
 
 The schemas preserve the accepted model intents:
@@ -128,7 +130,7 @@ Authentication establishes a live session identity. One retained-socket owner co
 
 ## Fake Pi host seam
 
-The focused Node test loads the real extension factory behind a strict fake Pi host. The fake records command and tool registrations, notifications, `sendMessage` attempts, and `sendUserMessage` attempts. It exposes only a controlled idle/busy predicate for delivery tests; unknown Pi or context access fails the test, so model registry, session, and other live capabilities cannot be consulted silently.
+The focused Node test loads the real extension factory behind a strict fake Pi host. The fake records command and tool registrations, notifications, hidden custom session entries, `sendMessage` attempts, and `sendUserMessage` attempts. It exposes only controlled session-entry reads plus an idle/busy predicate; unknown Pi or context access fails the test, so model registry and other live capabilities cannot be consulted silently.
 
 Handlers execute directly through the recorded registrations. The acceptance assertions cover:
 
@@ -136,9 +138,10 @@ Handlers execute directly through the recorded registrations. The acceptance ass
 - closed input schemas, including invalid edge shapes;
 - one command-to-real-HTTP success notification with no raw pairing code or private key in telemetry;
 - disconnected errors from both model tools;
-- no Pi message injection or live context access while disconnected;
+- no Pi message injection or unapproved live context access while disconnected;
 - no timer, fetch, or WebSocket creation during factory execution or a keyless lifecycle startup; and
-- one retained authenticated socket from either lifecycle ordering, followed by idempotent shutdown settlement; and
+- one retained authenticated socket from either lifecycle ordering, followed by idempotent shutdown settlement;
+- fake-clock reconnect progression with deterministic jitter, exact same-session route/address retention, authenticated presence disappearance and restoration, fresh new/fork routes, and no post-shutdown timer or attempt; and
 - real-server address-only roster membership, strict continuation, disconnect removal, hostile-response closure, shared local single-flight rejection, and abort/timeout/close cleanup; and
 - real-server string/object delivery through two extension instances, exact deterministic provenance and canonical object text, no-option idle injection and busy `{ deliverAs: "followUp" }` injection, stale-session and idle-predicate failure safety, thrown-Pi-call best-effort ACK, sender schema rejection of IDs/modes, no steering, unique IDs, exact ACK correlation, accepted `sender_capacity` compatibility results, redacted logs, and deterministic `received` output.
 

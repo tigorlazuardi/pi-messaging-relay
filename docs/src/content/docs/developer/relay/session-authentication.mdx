@@ -8,10 +8,10 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop, and the [active peer roster](/developer/relay/active-peer-roster/) consumes authenticated presence. The [authenticated message delivery](/developer/relay/message-delivery/) seam consumes the same retained socket, renders string/object provenance, and selects recipient-local idle or busy injection; reconnect and restart acceptance remain separate.
+This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop, and the [active peer roster](/developer/relay/active-peer-roster/) consumes authenticated presence. The [authenticated message delivery](/developer/relay/message-delivery/) seam consumes the same retained socket, renders string/object provenance, and selects recipient-local idle or busy injection. [Automatic session reconnect](/developer/relay/automatic-reconnect/) reuses this authentication boundary; server-restart acceptance remains separate.
 
 <Aside type="note" title="Ticket boundaries">
-Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Tickets #36 and #13 own bounded live roster pagination, while #14–#16 own successful idle and busy string/object delivery with deterministic provenance. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
+Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Tickets #36 and #13 own bounded live roster pagination, while #14–#16 own successful idle and busy string/object delivery with deterministic provenance. Ticket #26 adds bounded reconnect and same-session route restoration through this unchanged authentication seam. Ticket #27 owns server-restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
 </Aside>
 
 ## Authentication flow
@@ -21,8 +21,12 @@ sequenceDiagram
     participant P as Pi session
     participant E as Extension
     participant R as Relay
-    P->>E: session_start with cwd
-    E->>E: generate session route UUIDv7
+    P->>E: session_start(reason, cwd)
+    alt startup, reload, or resume with strictly valid hidden route entry
+      E->>E: restore session route UUIDv7
+    else missing or malformed entry, new, or fork
+      E->>E: generate and append fresh session route UUIDv7
+    end
     E->>R: GET /v1/connect WebSocket upgrade
     R->>E: fresh 32-byte nonce challenge
     E->>R: signed hello with key and display metadata
@@ -37,7 +41,7 @@ sequenceDiagram
 
 The server generates a fresh 32-byte cryptographic nonce for every upgraded connection and encodes it as 43-character unpadded URL-safe Base64. One five-second authentication deadline owns challenge write, hello read, verification, and welcome write. The server's general WebSocket read ceiling is 512 KiB; the initial client hello has a narrower 16 KiB ceiling. The extension independently applies a 512 KiB socket transport ceiling before message materialization and rejects complete challenge or welcome messages above 16 KiB after bounded materialization. Cwd is non-empty and at most 4,096 UTF-8 bytes. Hostname is non-empty and at most 255 UTF-8 bytes.
 
-The extension creates no network resource in its factory. Two lifecycle paths each own exactly one attempt: `session_start` loads a previously paired mode-`0600` Ed25519 key without creating a missing state directory, generates one UUIDv7 route ID, and connects when the endpoint and key exist; a successful `/relay-pair` during an already-started session makes one pairing-owned attempt with the newly persisted key. Failure remains disconnected; ticket #26 adds retries later. `session_shutdown` closes an in-flight or retained socket and is idempotent.
+The extension creates no network resource in its factory. Two lifecycle paths can start an immediate attempt: `session_start` loads a previously paired mode-`0600` Ed25519 key without creating a missing state directory, selects the current Pi session's UUIDv7 route ID, and connects when the endpoint and key exist; a successful `/relay-pair` during an already-started session makes one pairing-owned attempt with the newly persisted key. Failure or retained-socket interruption starts the bounded jittered policy documented in [automatic session reconnect](/developer/relay/automatic-reconnect/). `session_shutdown` cancels a pending reconnect deadline, closes and joins an in-flight attempt, closes a retained socket, and is idempotent.
 
 <Decision title="Bind every hello field with one length-prefixed transcript" status="accepted">
 The signature covers the fresh nonce, hello request ID, submitted public key, route UUID, hostname, and cwd in a fixed order. UTF-8 byte lengths prevent delimiter ambiguity. The signature field itself is excluded. Go and TypeScript construct the same bytes.
@@ -69,7 +73,7 @@ The allowlisted key identifies the installation. One UUIDv7 identifies this Pi s
 
 The connection registry atomically reserves one of 1,024 slots before `websocket.Accept`. Capacity exhaustion returns bounded HTTP `503` without upgrading and emits one `session_capacity_rejected` event. Accept failure releases the reservation; every successful upgrade attaches to its reservation immediately. Shutdown force-closes and settles reserved authentication or authenticated sockets within the existing five-second process deadline before reporting `server_stopped`.
 
-Under the same registry lock, authentication rejects an active duplicate route UUID or complete opaque address. Each accepted entry stores the authenticated installation key and route UUID separately; no composite-address parsing participates in identity or authorization. The roster consumes only a copy of active opaque address strings and omits reserved or unauthenticated entries. Process-lifetime ownership and whether a route becomes reusable after disconnect remain explicitly blocked on reconnect semantics in ticket #26; this slice does not invent reuse or reconnect behavior.
+Under the same registry lock, authentication rejects an active duplicate route UUID or complete opaque address. Each accepted entry stores the authenticated installation key and route UUID separately; no composite-address parsing participates in identity or authorization. The roster consumes only a copy of active opaque address strings and omits reserved or unauthenticated entries. After exact disconnect cleanup, a bounded automatic attempt may authenticate the same route and complete opaque address as a new live registry entry. It cannot replace an entry that is still active.
 
 ## Dependency boundary
 
@@ -114,6 +118,6 @@ Server `session_disconnected` carries address, route, public-key and client iden
   </TabItem>
 </Tabs>
 
-Real-boundary acceptance exercises both lifecycle paths separately. One scenario emits `session_start` before pairing and proves successful pairing owns exactly one accepted retained connection. Another invokes pairing before session lifecycle, then emits `session_start` and proves the pre-paired key owns exactly one accepted connection. Both correlate extension acceptance and disconnect events to the server route and address.
+Real-boundary acceptance exercises both immediate lifecycle paths separately. One scenario emits `session_start` before pairing and proves successful pairing owns exactly one accepted retained connection. Another invokes pairing before session lifecycle, then emits `session_start` and proves the pre-paired key owns exactly one accepted connection. Both correlate extension acceptance and disconnect events to the server route and address. The reconnect acceptance then drives the same real boundary with a fake scheduler and deterministic randomness, proving exact retry timing, unchanged route/address identity, authenticated presence restoration, fresh new/fork routes, and shutdown cancellation.
 
 Independent WebSocket clients prove changed display metadata remains authorized when correctly signed, unknown keys and invalid signatures receive the same error and peer close, and fresh connections receive distinct nonces. Malicious actual endpoints send complete and fragmented valid-JSON challenge messages above 16 KiB, a valid-JSON welcome-phase message above 16 KiB, and a hard transport message above 512 KiB. Every attempt rejects and settles while the peer ignores close. Another endpoint authenticates and then ignores shutdown close. These tests prove separate semantic and pre-materialization ceilings plus bounded process-resource settlement. Server tests prove pre-upgrade capacity rejection, tracked nonresponsive-peer shutdown, and concurrent same-key and different-key active route collisions.

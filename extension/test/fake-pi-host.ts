@@ -25,6 +25,8 @@ export class FakePiHost {
   readonly notifications: Notification[] = [];
   readonly sendMessageAttempts: unknown[] = [];
   readonly sendUserMessageAttempts: unknown[] = [];
+  readonly appendEntryAttempts: Array<{ customType: string; data: unknown }> = [];
+  readonly sessionEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
   readonly liveAccessAttempts: string[] = [];
   readonly events = new Map<string, EventHandler[]>();
   cwd = "/tmp/fake-pi-session";
@@ -55,6 +57,11 @@ export class FakePiHost {
         const error = this.nextSendUserMessageError;
         this.nextSendUserMessageError = undefined;
         if (error) throw error;
+      },
+      appendEntry: (customType: string, data: unknown) => {
+        const entry = { type: "custom" as const, customType, data };
+        this.appendEntryAttempts.push({ customType, data });
+        this.sessionEntries.push(entry);
       },
     },
     {
@@ -128,6 +135,9 @@ export class FakePiHost {
       {
         ui,
         cwd: this.cwd,
+        sessionManager: {
+          getEntries: () => [...this.sessionEntries],
+        },
         isIdle: () => {
           const error = this.nextIdleCheckError;
           this.nextIdleCheckError = undefined;

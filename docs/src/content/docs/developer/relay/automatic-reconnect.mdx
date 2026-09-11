@@ -1,0 +1,94 @@
+---
+title: Automatic session reconnect
+description: How one active Pi session restores authenticated presence with bounded jittered backoff while retaining its exact route identity.
+status: accepted
+date: 2026-09-11
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Decision from '../../../../components/Decision.astro';
+
+The extension reconnects an interrupted authenticated session automatically. Reconnect restores only a live WebSocket and roster presence. It never transfers pending operation state, retains message bodies, creates an offline inbox, or replays a previous offer.
+
+## Lifecycle and identity
+
+```mermaid
+sequenceDiagram
+    participant P as Pi session
+    participant E as Extension
+    participant R as Relay
+    participant O as Other session
+    R--xE: authenticated socket closes
+    R->>O: subject absent from live roster
+    E->>E: wait bounded jittered delay
+    E->>R: authenticate with same key, cwd, hostname, and route UUID
+    alt attempt fails
+      E->>E: increase bounded retry delay
+    else authentication succeeds
+      R->>O: same complete address returns to live roster
+      E->>E: reset retry progression
+    end
+```
+
+One active lifecycle captures its route UUID, cwd, hostname, installation key, endpoint, and recipient idle predicate. Every automatic attempt uses that same identity snapshot, so successful reauthentication returns the exact original `<cwd>@<hostname>#<route_id>` address. The relay removes the old socket from live presence before any replacement is authenticated; failed and challenge-only attempts remain absent. Presence returns only after the relay accepts the signed hello.
+
+A hidden Pi custom session entry stores only `{version: 1, route_id: <uuidv7>}` under `pi-messaging-relay-route-v1`. It is not model context. `startup`, `reload`, and `resume` restore a strictly shaped canonical UUIDv7 entry when present. Missing or malformed state generates and appends a fresh route. `new` and `fork` always ignore inherited route entries and append a fresh UUIDv7, preventing two live Pi sessions from sharing one route.
+
+<Decision title="Keep route identity in Pi session state, separate from installation trust" status="accepted">
+The installation Ed25519 key identifies the paired installation. One hidden custom entry identifies only the current Pi session route. Strict restoration keeps reloads stable, while explicit new and fork lifecycle reasons always create a fresh route without treating cwd, hostname, or entry content as authorization.
+</Decision>
+
+## Fixed retry policy
+
+The first startup or post-pair connection attempt remains immediate. After an attempt fails, or after a retained authenticated socket closes, the reconnect scheduler waits before another attempt.
+
+| Policy value | Fixed v1 value |
+|---|---:|
+| Nominal initial delay | 500 ms |
+| Multiplier | 2 |
+| Jitter | uniform factor from 0.75 inclusive to 1.25 exclusive |
+| Final delay cap | 30,000 ms |
+| Automatic retries per uninterrupted failure sequence | 10 |
+
+For zero-based retry index `n`, nominal delay is `min(30000, 500 × 2ⁿ)`. One platform cryptographic 32-bit sample is converted to `[0, 1)`, then to the jitter factor. The scheduler rounds to the nearest millisecond and applies the 30-second cap again. For deterministic samples `0`, `0.5`, and `0.75`, the first three waits are exactly 375 ms, 1,000 ms, and 2,250 ms. Nominal delays reach the cap at index 6; positive jitter never exceeds 30 seconds. After ten unsuccessful automatic retries, the lifecycle stays safely disconnected until a new session lifecycle or a permitted pairing-owned connection path starts another sequence.
+
+Successful authentication resets the retry index. A later interruption starts again from the initial delay. One lifecycle owns at most one scheduled deadline, one authentication attempt, and one retained socket. A timer cannot queue behind an active attempt, and a stale callback cannot install a socket for a replaced session.
+
+<Decision title="Bound retry count, delay, and ownership" status="accepted">
+Ponytail: v1 uses 500 ms initial delay, multiplier 2, ±25% jitter, a 30-second final cap, and ten automatic retries. Make these configurable only when a second measured deployment profile requires different values. The finite retry budget follows the repository rule against unbounded reconnect loops.
+</Decision>
+
+## Shutdown and operation boundary
+
+`session_shutdown` invalidates the lifecycle first, cancels its pending reconnect deadline, closes any connecting socket, joins that attempt, and then closes and awaits the retained socket. No cancelled timer or stale disconnect callback can start another attempt after shutdown returns. Starting a replacement Pi session applies the same cancellation-and-join sequence before selecting its route identity.
+
+An interrupted `list_peers` or `agent_send` still settles through the retained socket's existing disconnected path. Reconnect never resumes that operation and never reuses its request or message state. A caller starts a fresh tool operation only after authentication restores the connection. Ticket #28 owns broader reconnect/restart no-replay acceptance; ticket #27 owns authorization restoration across server process restart.
+
+<Aside type="note" title="Diagnostics remain a separate seam">
+Ticket #26 preserves existing `relay_auth_accepted`, `relay_auth_rejected`, and `relay_session_disconnected` events. It defines no new reconnect event vocabulary. Ticket #29 owns reconnect-state diagnostics and their complete redaction acceptance.
+</Aside>
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Disconnect">
+    ```text
+    t=0 ms: /srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111 leaves list_peers
+    ```
+  </TabItem>
+  <TabItem label="Deterministic retry input">
+    ```json
+    {"retry_index":0,"random_unit":0}
+    ```
+  </TabItem>
+  <TabItem label="Scheduled output">
+    ```json
+    {"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111"}
+    ```
+  </TabItem>
+  <TabItem label="Authenticated restoration">
+    ```json
+    {"peers":[{"address":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111"}]}
+    ```
+  </TabItem>
+</Tabs>
