@@ -7,6 +7,7 @@ const AUTH_TIMEOUT_MS = 5_000;
 const CLOSE_TIMEOUT_MS = 1_000;
 const AUTH_TRANSCRIPT_DOMAIN = "pi-messaging-relay-auth-v1\n";
 const MAX_AUTH_FRAME_BYTES = 16 * 1024;
+const MAX_SOCKET_PAYLOAD_BYTES = 512 * 1024;
 const MAX_CWD_BYTES = 4096;
 const MAX_HOSTNAME_BYTES = 255;
 const HEARTBEAT_MS = 30_000;
@@ -62,7 +63,7 @@ export class SessionSocketAttempt {
     const requestID = generateUUIDv7();
     const socket = new WebSocket(options.endpoint, {
       handshakeTimeout: AUTH_TIMEOUT_MS,
-      maxPayload: MAX_AUTH_FRAME_BYTES,
+      maxPayload: MAX_SOCKET_PAYLOAD_BYTES,
       perMessageDeflate: false,
     });
     this.socket = socket;
@@ -90,7 +91,7 @@ export class SessionSocketAttempt {
         fail(new SessionAuthenticationError(
           oversized ? "invalid_frame" : "connection_failed",
           oversized
-            ? "Relay authentication frame exceeds 16 KiB."
+            ? "Relay authentication transport payload exceeds 512 KiB."
             : "Relay WebSocket connection failed.",
         ));
       };

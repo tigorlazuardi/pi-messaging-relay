@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 The extension package in `extension/` establishes the Pi-facing surface. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
 
 <Aside type="note" title="Authenticated transport, disconnected tools">
-The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers can authenticate and retain one WebSocket, but roster, routing, delivery, and reconnect are not implemented. Loading the factory still requires no relay server and no model call, and `list_peers` and `agent_send` remain disconnected.
+The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers can authenticate and retain one WebSocket, and `list_peers` now publishes the bounded cursor schema, but roster reads, results, routing, delivery, and reconnect are not implemented. Loading the factory still requires no relay server and no model call, and both tools remain disconnected until their behavior tickets land.
 </Aside>
 
 ## Registration and lifecycle boundary
@@ -38,8 +38,10 @@ The schemas preserve the accepted model intents:
 | Surface | Input |
 |---|---|
 | `relay-pair` | Human-supplied current startup pairing code |
-| `list_peers` | Closed empty object |
+| `list_peers` | Closed object with only optional opaque `cursor` |
 | `agent_send` | Closed object with required opaque `to`, required string-or-JSON-object `body`, and optional `re` |
+
+The `list_peers` cursor schema permits only `cur_` followed by one or more URL-safe Base64 characters and caps the string at 5,856 characters. It is an opaque `next_cursor` copied from a preceding page. The eventual result is `{ peers: [{ address: string }], next_cursor?: string }`; callers omit the cursor for a fresh first page and continue only while `next_cursor` is present. The server remains the final canonical decoder and authorization boundary.
 
 The model cannot provide `message_id`, delivery policy, steering intent, or any other relay field. Addresses remain opaque strings. Schema validation rejects extra properties, an empty destination, array or null bodies, and missing required fields before a connected implementation can own those values.
 
@@ -77,7 +79,30 @@ Authentication establishes a live session identity and retains its socket. The s
 </Tabs>
 
 <Tabs>
-  <TabItem label="Tool input">
+  <TabItem label="First-page list input">
+    ```json
+    {}
+    ```
+  </TabItem>
+  <TabItem label="Next-page list input">
+    ```json
+    {"cursor":"cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"}
+    ```
+  </TabItem>
+  <TabItem label="Eventual page result (ticket #13)">
+    ```json
+    {"peers":[{"address":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"}],"next_cursor":"cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"}
+    ```
+  </TabItem>
+  <TabItem label="Current Pi tool error">
+    ```text
+    Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Send tool input">
     ```json
     {
       "to": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
@@ -111,7 +136,7 @@ The primary pairing acceptance additionally starts the real Go child, invokes th
 ## Runtime dependency and telemetry
 
 <Decision title="Keep runtime dependencies beside the Nix-loaded extension" status="accepted">
-The package declares TypeBox 1.3.7 and `ws` 8.21.3 as pinned extension-local runtime dependencies through `extension/package-lock.json`; `npm ci` installs both beside the extension. TypeBox owns tool schemas. The `ws` client enforces the authentication payload ceiling and supports bounded hard transport termination. This avoids assuming that a Nix-installed Pi exposes its internal package tree to a user extension at runtime. Pi core remains a type-only import and is erased before runtime, so the extension does not resolve Pi internals at runtime.
+The package declares TypeBox 1.3.7 and `ws` 8.21.3 as pinned extension-local runtime dependencies through `extension/package-lock.json`; `npm ci` installs both beside the extension. TypeBox owns tool schemas. The `ws` client enforces the 512 KiB socket-wide pre-materialization ceiling; the authentication handler separately enforces 16 KiB challenge and welcome semantics and supports bounded hard transport termination. This avoids assuming that a Nix-installed Pi exposes its internal package tree to a user extension at runtime. Pi core remains a type-only import and is erased before runtime, so the extension does not resolve Pi internals at runtime.
 </Decision>
 
 Disconnected model-tool attempts write one structured warning with `event: "relay_operation_failed"`. Pairing writes one settled `relay_pair_accepted` or `relay_pair_rejected` event with latency and stable result or reason. Session lifecycle emits `relay_auth_accepted`, `relay_auth_rejected`, and `relay_session_disconnected`; accepted and disconnected events carry available public client, route, and address correlation fields. Pairing-code, nonce, signature, and private-key field names contain `<redacted>`; message bodies remain absent. The accepted v1 observability decision excludes traces and metrics for this small operator-run relay, so this shell adds neither spans nor counters.

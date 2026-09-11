@@ -111,6 +111,10 @@ test("loads and runs disconnected handlers without starting resources", { concur
       name: "Error",
       message: EXPECTED_DISCONNECTED_ERROR,
     });
+    await assert.rejects(host.executeTool("list_peers", { cursor: "cur_cGVlcg" }), {
+      name: "Error",
+      message: EXPECTED_DISCONNECTED_ERROR,
+    });
     await assert.rejects(
       host.executeTool("agent_send", {
         to: "/srv/backend@host#route-id",
@@ -234,7 +238,16 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   assert.ok(listSchema);
   assert.ok(sendSchema);
 
+  const maximumCursor = `cur_${Buffer.from("a".repeat(4_389), "utf8").toString("base64url")}`;
+  assert.equal(maximumCursor.length, 5_856);
   assert.equal(Value.Check(listSchema as never, {}), true);
+  assert.equal(Value.Check(listSchema as never, { cursor: "cur_cGVlcg" }), true);
+  assert.equal(Value.Check(listSchema as never, { cursor: maximumCursor }), true);
+  assert.equal(Value.Check(listSchema as never, { cursor: "" }), false);
+  assert.equal(Value.Check(listSchema as never, { cursor: "cur_" }), false);
+  assert.equal(Value.Check(listSchema as never, { cursor: "cur_cGVlcg==" }), false);
+  assert.equal(Value.Check(listSchema as never, { cursor: `${maximumCursor}a` }), false);
+  assert.equal(Value.Check(listSchema as never, { cursor: 12 }), false);
   assert.equal(Value.Check(listSchema as never, { unexpected: true }), false);
 
   const stringSend = {

@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -16,11 +18,15 @@ import (
 
 const (
 	maxAddressBytes              = maxCWDBytes + 1 + maxHostnameBytes + 1 + 36
+	maxCursorBytes               = 5856
 	maxJSONNestingDepth          = 64
 	protocolResponseWriteTimeout = time.Second
+	cursorPrefix                 = "cur_"
 )
 
-type listOperationPayload struct{}
+type listOperationPayload struct {
+	AfterAddress string
+}
 
 type sendOperationPayload struct {
 	MessageID string
@@ -254,11 +260,11 @@ func decodeClientOperation(data []byte) (clientOperation, *protocolFailure, erro
 	operation := clientOperation{Type: operationType, RequestID: requestID}
 	switch operationType {
 	case "list":
-		payloadFields, err := decodeObject(fields["payload"])
-		if err != nil || len(payloadFields) != 0 {
+		payload, valid := decodeListPayload(fields["payload"])
+		if !valid {
 			return failure("invalid_envelope", "invalid_list_payload", operationType)
 		}
-		operation.List = &listOperationPayload{}
+		operation.List = &payload
 	case "send":
 		payload, valid := decodeSendPayload(fields["payload"])
 		if !valid {
@@ -284,6 +290,31 @@ func safeClientOperationType(operationType string) string {
 	default:
 		return ""
 	}
+}
+
+func decodeListPayload(data []byte) (listOperationPayload, bool) {
+	fields, err := decodeObject(data)
+	if err != nil || len(fields) > 1 || !hasOnlyFields(fields, "cursor") {
+		return listOperationPayload{}, false
+	}
+	encoded, exists := fields["cursor"]
+	if !exists {
+		return listOperationPayload{}, true
+	}
+	var cursor string
+	if err := json.Unmarshal(encoded, &cursor); err != nil ||
+		len(cursor) <= len(cursorPrefix) || len(cursor) > maxCursorBytes ||
+		!strings.HasPrefix(cursor, cursorPrefix) {
+		return listOperationPayload{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(cursor, cursorPrefix))
+	if err != nil || len(raw) == 0 || len(raw) > maxAddressBytes || !utf8.Valid(raw) {
+		return listOperationPayload{}, false
+	}
+	if cursorPrefix+base64.RawURLEncoding.EncodeToString(raw) != cursor {
+		return listOperationPayload{}, false
+	}
+	return listOperationPayload{AfterAddress: string(raw)}, true
 }
 
 func decodeSendPayload(data []byte) (sendOperationPayload, bool) {

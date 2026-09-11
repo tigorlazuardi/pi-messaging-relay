@@ -80,13 +80,20 @@ class RawPeer {
 }
 
 function serverFrame(payload: Buffer, fin: boolean, opcode: number): Buffer {
-  const header = payload.length < 126 ? Buffer.alloc(2) : Buffer.alloc(4);
+  const header = payload.length < 126
+    ? Buffer.alloc(2)
+    : payload.length <= 0xffff
+      ? Buffer.alloc(4)
+      : Buffer.alloc(10);
   header[0] = (fin ? 0x80 : 0) | opcode;
   if (payload.length < 126) {
     header[1] = payload.length;
-  } else {
+  } else if (payload.length <= 0xffff) {
     header[1] = 126;
     header.writeUInt16BE(payload.length, 2);
+  } else {
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
   }
   return Buffer.concat([header, payload]);
 }
@@ -158,22 +165,13 @@ async function closeServer(server: Server): Promise<void> {
   });
 }
 
-test("fragmented authentication payload over 16 KiB is rejected and force-settled when peer ignores close", async (context) => {
-  let peerClosed: Promise<void> | undefined;
-  const endpoint = await startRawEndpoint((peer) => {
-    peerClosed = peer.closed;
-    const fragment = "x".repeat(4_096);
-    peer.sendText(fragment, { fin: false, opcode: 0x1 });
-    peer.sendText(fragment, { fin: false, opcode: 0x0 });
-    peer.sendText(fragment, { fin: false, opcode: 0x0 });
-    peer.sendText(fragment, { fin: false, opcode: 0x0 });
-    peer.sendText("x", { fin: true, opcode: 0x0 });
-    // Deliberately ignore the client's close frame.
-  });
-  context.after(async () => closeServer(endpoint.server));
+async function expectRejectedAttempt(
+  endpoint: URL,
+  expectedMessage: string,
+): Promise<void> {
   const installation = installationFixture();
   const attempt = new SessionSocketAttempt({
-    endpoint: endpoint.endpoint,
+    endpoint,
     privateKey: installation.privateKey,
     clientPublicKey: installation.publicKey,
     routeID: ROUTE_ID,
@@ -181,9 +179,104 @@ test("fragmented authentication payload over 16 KiB is rejected and force-settle
     hostname: "malicious-endpoint",
     onDisconnected: () => {},
   });
-
   await assert.rejects(within(attempt.result), (error: unknown) =>
-    error !== null && typeof error === "object" && "reason" in error && error.reason === "invalid_frame");
+    error !== null && typeof error === "object" &&
+    "reason" in error && error.reason === "invalid_frame" &&
+    "message" in error && error.message === expectedMessage);
+}
+
+const SEMANTIC_LIMIT_MESSAGE = "Relay authentication frame exceeds 16 KiB.";
+
+test("complete valid JSON authentication payload over 16 KiB is semantically rejected and force-settled", async (context) => {
+  let peerClosed: Promise<void> | undefined;
+  const endpoint = await startRawEndpoint((peer) => {
+    peerClosed = peer.closed;
+    peer.sendText(JSON.stringify({
+      v: 1,
+      type: "challenge",
+      payload: { nonce: "A".repeat(43) },
+      padding: "x".repeat(16 * 1_024),
+    }));
+    // Deliberately ignore the client's close frame.
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  await expectRejectedAttempt(endpoint.endpoint, SEMANTIC_LIMIT_MESSAGE);
+  assert.ok(peerClosed);
+  await within(peerClosed);
+});
+
+test("fragmented valid JSON authentication payload over 16 KiB is semantically rejected and force-settled", async (context) => {
+  let peerClosed: Promise<void> | undefined;
+  const endpoint = await startRawEndpoint((peer) => {
+    peerClosed = peer.closed;
+    const payload = JSON.stringify({
+      v: 1,
+      type: "challenge",
+      payload: { nonce: "A".repeat(43) },
+      padding: "x".repeat(16 * 1_024),
+    });
+    const boundaries = [0, 4_096, 8_192, 12_288, 16_384, payload.length];
+    for (let index = 0; index < boundaries.length - 1; index += 1) {
+      peer.sendText(payload.slice(boundaries[index], boundaries[index + 1]), {
+        fin: index === boundaries.length - 2,
+        opcode: index === 0 ? 0x1 : 0x0,
+      });
+    }
+    // Deliberately ignore the client's close frame.
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  await expectRejectedAttempt(endpoint.endpoint, SEMANTIC_LIMIT_MESSAGE);
+  assert.ok(peerClosed);
+  await within(peerClosed);
+});
+
+test("welcome-phase valid JSON payload over 16 KiB is semantically rejected and force-settled", async (context) => {
+  let peerClosed: Promise<void> | undefined;
+  const endpoint = await startRawEndpoint((peer) => {
+    peerClosed = peer.closed;
+    peer.sendText(JSON.stringify({
+      v: 1,
+      type: "challenge",
+      payload: { nonce: "A".repeat(43) },
+    }));
+    void peer.readFrame().then((frame) => {
+      const hello = JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
+      peer.sendText(JSON.stringify({
+        v: 1,
+        type: "welcome",
+        request_id: hello.request_id,
+        payload: {
+          self_address: "unused",
+          heartbeat_ms: 30_000,
+          max_body_bytes: 262_144,
+        },
+        padding: "x".repeat(16 * 1_024),
+      }));
+      // Deliberately ignore the client's close frame.
+    });
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  await expectRejectedAttempt(endpoint.endpoint, SEMANTIC_LIMIT_MESSAGE);
+  assert.ok(peerClosed);
+  await within(peerClosed);
+});
+
+test("authentication payload over 512 KiB is transport-rejected and force-settled before use", async (context) => {
+  let peerClosed: Promise<void> | undefined;
+  const endpoint = await startRawEndpoint((peer) => {
+    peerClosed = peer.closed;
+    peer.sendText("x".repeat(512 * 1_024 + 1));
+    // Deliberately ignore the client's close frame.
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  await expectRejectedAttempt(
+    endpoint.endpoint,
+    "Relay authentication transport payload exceeds 512 KiB.",
+  );
   assert.ok(peerClosed);
   await within(peerClosed);
 });

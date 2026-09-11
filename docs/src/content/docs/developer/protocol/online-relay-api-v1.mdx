@@ -16,7 +16,7 @@ This document defines the accepted v1 external contract. It does not select Go p
 
 The Pi extension exposes two model tools:
 
-- `list_peers()`
+- `list_peers({ cursor? })`
 - `agent_send({ to, body, re? })`
 
 Connection and pairing are human/configuration concerns. They are not model tools. The extension maintains one persistent WebSocket to a localhost server; cross-machine deployments provide localhost reachability through VPN or SSH forwarding.
@@ -52,7 +52,9 @@ Every WebSocket text frame is one JSON object:
 
 Unknown fields are rejected at the envelope and typed-payload levels. Duplicate JSON keys are rejected at every accepted depth, including inside application-owned object bodies, before any map or typed value can erase the ambiguity. JSON is limited to 64 nested object or array containers, counting the outer envelope as depth 1; a container at depth 65 or greater is rejected as `invalid_frame`. Canonical addresses have the form `<full-cwd>@<hostname>#<uuidv7>`, but clients treat the whole value as opaque and copy it verbatim. Cwd and hostname are display metadata, never authorization inputs.
 
-After authentication, the only accepted client-to-server `type` values are `list`, `send`, and `received`. Their payloads are closed objects: `list` is exactly empty; `send` requires `message_id`, `to`, and `body` and permits only optional `re`; and `received` requires exactly `delivery_id` and `message_id`. Every ID is a canonical lowercase UUIDv7. `to` is a non-empty opaque UTF-8 string bounded to the largest server-issued v1 address. `body` is only a JSON string or object. The 512 KiB ceiling applies to the complete reassembled WebSocket message's UTF-8 bytes, whether it arrived in one fragment or many, before JSON decoding. Compression is disabled. Ticket #24 separately owns the 256 KiB serialized-body limit.
+After authentication, the only accepted client-to-server `type` values are `list`, `send`, and `received`. Their payloads are closed objects: `list` is either `{}` or contains exactly one `cursor` string; `send` requires `message_id`, `to`, and `body` and permits only optional `re`; and `received` requires exactly `delivery_id` and `message_id`. Every ID is a canonical lowercase UUIDv7. `to` is a non-empty opaque UTF-8 string bounded to the largest server-issued v1 address. `body` is only a JSON string or object. The 512 KiB ceiling applies to the complete reassembled WebSocket message's UTF-8 bytes, whether it arrived in one fragment or many, before JSON decoding. Compression is disabled. Ticket #24 separately owns the 256 KiB serialized-body limit.
+
+A cursor is `cur_` followed by canonical unpadded Base64url of the raw UTF-8 bytes of the last returned opaque address. A present cursor must decode to valid UTF-8 of 1 through 4,389 bytes and re-encode byte-for-byte to the submitted spelling. Its maximum is therefore exactly 5,856 ASCII characters. Empty values, padding, another alphabet or prefix, noncanonical trailing bits, invalid UTF-8, and over-limit decoded values are terminal `invalid_envelope` input. The decoded value remains whole and opaque: the relay compares it only for pagination and never parses address components or uses it as authorization identity.
 
 A post-authentication parser starts at a message boundary and either dispatches one complete valid operation or enters a terminal protocol-error state. Binary messages, invalid UTF-8, malformed or trailing JSON, and over-limit messages use `invalid_frame`. A syntax-valid value that is not the closed operation envelope, including duplicate or unknown fields and wrong-direction types, uses `invalid_envelope`. An otherwise shaped envelope whose integer major is not `1` uses `unsupported_protocol`. These stable errors have `close: true`; the server makes one bounded best-effort error write and then hard-closes promptly. `request_id` is included only when the complete JSON has exactly one valid top-level request ID that can be recovered without ambiguity. Error messages and logs never include raw frame or body data; logs omit unrecognized submitted types.
 
@@ -81,7 +83,7 @@ flowchart TD
 
 The pairing code and nonce are authentication material and are always redacted from logs. The server writes the current raw pairing code only when `--pairing-code-file PATH` explicitly requests an exclusively created mode-`0600` operator file. If the flag is omitted, the raw code remains undisclosed; ordinary structured logs contain only `<redacted>`. A startup pairing code is exactly 32 URL-safe Base64 characters encoding 24 random bytes. It is valid only before its ten-minute `expires_at` timestamp: the exact deadline and every later instant are expired. The server persists allowlisted public keys and minimal pairing metadata, but never messages or pending sends. Pair requests are bounded to 4,096 bytes and use a closed two-string JSON object; the extension's fixed accepted code and public-key forms produce a 126-byte request. `client_public_key` is `ed25519:` followed by canonical standard Base64 for exactly 32 raw Ed25519 public-key bytes. `client_id` is `cli_` followed by exactly 16 URL-safe Base64 characters encoding 12 random bytes.
 
-The server reserves one of 1,024 tracked slots before WebSocket upgrade. At capacity it returns bounded HTTP `503` without upgrading. Each upgraded connection receives a fresh 32-byte cryptographic nonce encoded as 43-character unpadded URL-safe Base64. Challenge write, hello read, verification, and welcome write share a five-second authentication deadline. The general frame ceiling remains 512 KiB, while hello uses a narrower 16 KiB read ceiling. Cwd is bounded to 4,096 UTF-8 bytes and hostname to 255 UTF-8 bytes; both must be non-empty. These values are signed display metadata, not authorization identity.
+The server reserves one of 1,024 tracked slots before WebSocket upgrade. At capacity it returns bounded HTTP `503` without upgrading. Each upgraded connection receives a fresh 32-byte cryptographic nonce encoded as 43-character unpadded URL-safe Base64. Challenge write, hello read, verification, and welcome write share a five-second authentication deadline. The server's general frame ceiling remains 512 KiB, while client hello uses a narrower 16 KiB read ceiling. The extension configures its socket-wide pre-materialization transport ceiling to 512 KiB, then applies a separate 16 KiB semantic ceiling to complete challenge and welcome messages after bounded materialization. Cwd is bounded to 4,096 UTF-8 bytes and hostname to 255 UTF-8 bytes; both must be non-empty. These values are signed display metadata, not authorization identity.
 
 The Ed25519 signature covers this exact UTF-8 transcript, in order, where each length is the decimal UTF-8 byte length and each shown `\n` is one LF byte:
 
@@ -249,29 +251,49 @@ A well-formed incorrect, expired, or already consumed code returns HTTP `401` wi
 
 Every authenticated active session on the server except the caller is visible. Roster entries contain only the opaque address and express online presence only; Pi `idle/busy` state is not published. No `connection_name` configuration exists.
 
+Discovery uses stateless live keyset pagination. A request without `cursor` starts a fresh traversal. For each request, the server reads current active addresses, omits the caller, sorts complete opaque addresses lexicographically, and considers only values strictly greater than the decoded cursor. It retains no pagination snapshot. A session that appears or disappears before the cursor can therefore be missed during one traversal; callers restart without a cursor when they need a fresh view.
+
+A `roster` payload is the closed shape `{ peers: [{ address: string }], next_cursor?: string }`. The complete compact serialized v1 `roster` WebSocket frame—including `v`, `type`, `request_id`, and payload—must be at most 49,152 UTF-8 bytes. Page filling takes the longest consecutive prefix of eligible ordered addresses whose complete encoded frame fits: when candidates remain, that size includes `next_cursor` for the last returned address; when all candidates fit, `next_cursor` is omitted. No eligible addresses returns an empty `peers` array without `next_cursor`. This rule always permits at least one current-maximum address, including its cursor and worst-case JSON escaping.
+
+<Decision title="Use bounded stateless cursor pages for live presence" status="accepted">
+A 48 KiB roster-frame ceiling leaves tool-result wrapper headroom and avoids snapshot state. The cursor is navigation and correlation only, never proof of identity or authority.
+</Decision>
+
+<Aside type="note" title="Implementation boundary">
+Ticket #36 implements cursor validation, model-tool schema, and bounded transport only. Production registry reads, page construction, `roster` responses, and model-tool WebSocket operations remain explicitly deferred to ticket #13.
+</Aside>
+
 ### I/O examples
 
 <Tabs>
-  <TabItem label="Pi tool input">
+  <TabItem label="Pi tool first page input">
     ```json
     {}
     ```
   </TabItem>
-  <TabItem label="Pi tool output">
+  <TabItem label="Pi tool next page input">
+    ```json
+    {
+      "cursor": "cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"
+    }
+    ```
+  </TabItem>
+  <TabItem label="Pi tool page output">
     ```json
     {
       "peers": [
         {
           "address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"
         }
-      ]
+      ],
+      "next_cursor": "cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"
     }
     ```
   </TabItem>
 </Tabs>
 
 <Tabs>
-  <TabItem label="Wire request">
+  <TabItem label="Wire first-page request">
     ```json
     {
       "v": 1,
@@ -281,7 +303,19 @@ Every authenticated active session on the server except the caller is visible. R
     }
     ```
   </TabItem>
-  <TabItem label="Wire response">
+  <TabItem label="Wire next-page request">
+    ```json
+    {
+      "v": 1,
+      "type": "list",
+      "request_id": "01993c7a-7d2c-7699-b159-851da079f09f",
+      "payload": {
+        "cursor": "cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Wire page response">
     ```json
     {
       "v": 1,
@@ -292,20 +326,21 @@ Every authenticated active session on the server except the caller is visible. R
           {
             "address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"
           }
-        ]
+        ],
+        "next_cursor": "cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"
       }
     }
     ```
   </TabItem>
-  <TabItem label="Unauthenticated">
+  <TabItem label="Malformed cursor">
     ```json
     {
       "v": 1,
       "type": "error",
       "request_id": "01993c7a-7d2c-7699-b159-851da079f09f",
       "payload": {
-        "code": "not_authorized",
-        "message": "Authenticate before listing peers",
+        "code": "invalid_envelope",
+        "message": "Invalid protocol envelope",
         "close": true
       }
     }

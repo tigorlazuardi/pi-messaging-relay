@@ -262,11 +262,11 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	registry := newSessionConnectionRegistry()
 	service := newSessionAuthService(pairing, registry, logger, reporter.report)
 	var dispatched atomic.Int32
-	var listDispatched atomic.Bool
+	listCursors := make(chan string, 2)
 	var receivedDispatched atomic.Bool
 	service.dispatchOperation = func(_ context.Context, _ *authenticatedSession, operation clientOperation) (operationResponse, bool, error) {
 		if operation.List != nil {
-			listDispatched.Store(true)
+			listCursors <- operation.List.AfterAddress
 			return operationResponse{}, false, nil
 		}
 		if operation.Received != nil {
@@ -302,6 +302,7 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 
 	validSend := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":"/srv/peer@host#01993ca2-2222-7bbb-9bbb-222222222222","body":"safe-body"}}`, requestID, messageID)
+	overLimitCursor := "cur_" + base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("a", maxAddressBytes+1)))
 	cases := []struct {
 		name          string
 		messageType   websocket.MessageType
@@ -318,6 +319,16 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 		{name: "duplicate nested body key", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":"peer","body":{"nested":{"same":1,"same":2}}}}`, requestID, messageID), code: "invalid_envelope", wantRequestID: true},
 		{name: "unknown envelope field", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{},"extra":true}`, requestID), code: "invalid_envelope", wantRequestID: true},
 		{name: "unknown payload field", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"extra":true}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "empty list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":""}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "empty decoded list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cur_"}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "bad list cursor prefix", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cGVlcg"}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "bad list cursor alphabet", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cur_cGVl+g"}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "padded list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cur_cGVlcg=="}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "noncanonical list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cur_cGVlcj"}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "invalid UTF-8 list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cur__w"}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "over-limit list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":%q}}`, requestID, overLimitCursor), code: "invalid_envelope", wantRequestID: true},
+		{name: "wrong scalar list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":12}}`, requestID), code: "invalid_envelope", wantRequestID: true},
+		{name: "duplicate list cursor", messageType: websocket.MessageText, frame: fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":"cur_cGVlcg","cursor":"cur_cGVlcg"}}`, requestID), code: "invalid_envelope", wantRequestID: true},
 		{name: "array envelope", messageType: websocket.MessageText, frame: `[]`, code: "invalid_envelope"},
 		{name: "null envelope", messageType: websocket.MessageText, frame: `null`, code: "invalid_envelope"},
 		{name: "scalar envelope", messageType: websocket.MessageText, frame: `true`, code: "invalid_envelope"},
@@ -399,9 +410,15 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 		exact := prefix + strings.Repeat("x", maxFrameBytes-len(prefix)-len(suffix)) + suffix
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		validList := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, requestID)
+		maximumAddress := strings.Repeat("a", maxAddressBytes)
+		maximumCursor := "cur_" + base64.RawURLEncoding.EncodeToString([]byte(maximumAddress))
+		if len(maximumCursor) != maxCursorBytes {
+			t.Fatalf("maximum cursor length = %d, want %d", len(maximumCursor), maxCursorBytes)
+		}
+		validFirstList := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, requestID)
+		validNextList := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{"cursor":%q}}`, requestID, maximumCursor)
 		validReceived := fmt.Sprintf(`{"v":1,"type":"received","request_id":%q,"payload":{"delivery_id":%q,"message_id":%q}}`, requestID, deliveryID, messageID)
-		for _, operation := range []string{validList, validReceived} {
+		for _, operation := range []string{validFirstList, validNextList, validReceived} {
 			if err := connection.Write(ctx, websocket.MessageText, []byte(operation)); err != nil {
 				t.Fatalf("write valid operation: %v", err)
 			}
@@ -427,8 +444,11 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 				t.Fatalf("operation denial %d = %+v", attempt, response)
 			}
 		}
-		if !listDispatched.Load() || !receivedDispatched.Load() {
-			t.Fatalf("valid typed operations did not all reach dispatcher: list=%t received=%t", listDispatched.Load(), receivedDispatched.Load())
+		if firstCursor, nextCursor := <-listCursors, <-listCursors; firstCursor != "" || nextCursor != maximumAddress {
+			t.Fatalf("decoded list navigation values = (%q, %q)", firstCursor, nextCursor)
+		}
+		if !receivedDispatched.Load() {
+			t.Fatal("valid received operation did not reach dispatcher")
 		}
 	})
 
@@ -475,8 +495,10 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 		t.Fatalf("settle protocol test connections: %v", err)
 	}
 
-	if strings.Contains(logs.String(), "safe-body") || strings.Contains(logs.String(), strings.Repeat("x", 64)) {
-		t.Fatalf("protocol logs exposed frame/body content: %s", logs.String())
+	if strings.Contains(logs.String(), "safe-body") ||
+		strings.Contains(logs.String(), "cur_cGVlcg") ||
+		strings.Contains(logs.String(), strings.Repeat("x", 64)) {
+		t.Fatalf("protocol logs exposed frame, cursor, or body content: %s", logs.String())
 	}
 	if !strings.Contains(logs.String(), `"event":"protocol_rejected"`) ||
 		!strings.Contains(logs.String(), `"event":"operation_denied"`) ||

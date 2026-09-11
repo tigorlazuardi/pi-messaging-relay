@@ -24,6 +24,7 @@ const PRIVATE_KEY_FILENAME = "installation-ed25519.pem";
 const REDACTED = "<redacted>";
 const MAX_PAIR_REQUEST_BYTES = 4096;
 const MAX_PAIR_RESPONSE_BYTES = 4096;
+const MAX_CURSOR_CHARACTERS = 5_856;
 const PAIRING_CODE_BYTES = 32;
 const PAIR_REQUEST_FIXED_BYTES = 94;
 const MAX_PAIRING_CODE_BYTES = Math.min(
@@ -31,7 +32,16 @@ const MAX_PAIRING_CODE_BYTES = Math.min(
   MAX_PAIR_REQUEST_BYTES - PAIR_REQUEST_FIXED_BYTES,
 );
 
-const listPeersParameters = Type.Object({}, { additionalProperties: false });
+const listPeersParameters = Type.Object(
+  {
+    cursor: Type.Optional(Type.String({
+      maxLength: MAX_CURSOR_CHARACTERS,
+      pattern: "^cur_[A-Za-z0-9_-]+$",
+      description: "Opaque next_cursor from the preceding list_peers page; omit for the first page",
+    })),
+  },
+  { additionalProperties: false },
+);
 const agentSendParameters = Type.Object(
   {
     to: Type.String({
@@ -677,7 +687,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "list_peers",
     label: "List Relay Peers",
-    description: "List other authenticated Pi relay sessions that are currently online",
+    description: "List one address-only page of online Pi relay sessions; the result contains peers and optional next_cursor",
     parameters: listPeersParameters,
     async execute() {
       return disconnected("list_peers");
