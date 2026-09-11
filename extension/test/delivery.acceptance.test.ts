@@ -124,6 +124,56 @@ test("agent_send crosses real relay and two real extensions before settling rece
     const recipientAuth = await nextEvent(output, "auth_accepted");
     const recipientAddress = String(recipientAuth.address);
 
+    const offlineAddress = "/srv/absent@workstation#01993ca3-3333-7aaa-8aaa-333333333333";
+    const offlineBodyMarker = "offline-body-must-never-reach-recipient-or-logs";
+    const offlineStarted = Date.now();
+    const offlineResult = await within(sender.executeTool("agent_send", {
+      to: offlineAddress,
+      body: offlineBodyMarker,
+    }), "sender received offline result") as ToolResult;
+    assert.equal(Date.now() - offlineStarted < 4_000, true);
+    assert.deepEqual(Object.keys(offlineResult.details), ["message_id", "status", "reason"]);
+    assert.match(offlineResult.details.message_id, UUID_V7);
+    assert.deepEqual(offlineResult.details, {
+      message_id: offlineResult.details.message_id,
+      status: "timeout",
+      reason: "offline",
+    });
+    assert.deepEqual(offlineResult.content, [{
+      type: "text",
+      text: JSON.stringify(offlineResult.details),
+    }]);
+    assert.deepEqual(recipient.sendUserMessageAttempts, []);
+    assert.deepEqual(recipient.sendMessageAttempts, []);
+
+    const offlineSettled = await nextEvent(output, "send_settled", (event) =>
+      event.message_id === offlineResult.details.message_id);
+    assert.equal(offlineSettled.level, "info");
+    assert.equal(offlineSettled.result, "settled");
+    assert.equal(offlineSettled.reason, "offline");
+    assert.equal(offlineSettled.code, "offline");
+    assert.equal(offlineSettled.type, "send");
+    assert.match(String(offlineSettled.request_id), UUID_V7);
+    assert.equal(offlineSettled.message_id, offlineResult.details.message_id);
+    assert.equal(offlineSettled.delivery_id, undefined);
+    assert.equal(offlineSettled.sender_route, senderAuth.address);
+    assert.equal(offlineSettled.recipient_route, offlineAddress);
+    assert.equal(offlineSettled.status, "timeout");
+    assert.equal(offlineSettled.body, "<redacted>");
+    assert.equal(typeof offlineSettled.latency_ms, "number");
+    assert.equal(output.lines.some((line) => line.includes(offlineBodyMarker)), false);
+    assert.equal(extensionLogs.some((line) => line.includes(offlineBodyMarker)), false);
+
+    const rosterAfterOffline = await within(
+      sender.executeTool("list_peers", {}),
+      "listing peers after offline result",
+    ) as { content: Array<{ type: string; text: string }>; details: { peers: Array<{ address: string }> } };
+    assert.deepEqual(rosterAfterOffline.details, { peers: [{ address: recipientAddress }] });
+    assert.deepEqual(rosterAfterOffline.content, [{
+      type: "text",
+      text: JSON.stringify(rosterAfterOffline.details),
+    }]);
+
     const rejectedMarker = "proxy-content-must-not-cross-any-boundary";
     let proxyTrapCalls = 0;
     const transparentProxy = new Proxy({ value: rejectedMarker }, {});

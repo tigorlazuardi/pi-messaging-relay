@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 This seam replaces the retained socket's one-read placeholder with a bounded post-authentication message loop. It validates the client operation language before any roster, routing, delivery, acknowledgment, or offline behavior can run.
 
 <Aside type="note" title="Implementation boundary">
-The production dispatcher now binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14 and #18 connect delivery, acknowledgment, and offline outcomes. Ticket #24 adds the separate 256 KiB serialized-body rejection. This seam continues to define and test generic dispatch/result behavior without consuming those delivery tickets.
+The production dispatcher now binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14–#18 connect successful delivery, acknowledgment, correlated replies, and immediate offline registry-miss outcomes. Ticket #24 adds the separate 256 KiB serialized-body rejection. This seam continues to define and test generic dispatch/result behavior without consuming those delivery tickets.
 </Aside>
 
 ## Parser states

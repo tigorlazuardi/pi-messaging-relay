@@ -218,6 +218,138 @@ func TestDeliverySettlesOnlyAfterExactRecipientAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestOfflineDestinationSettlesWithoutDeliveryWorkAndKeepsSenderUsable(t *testing.T) {
+	const bodyMarker = "offline-body-must-stay-redacted"
+	var logs lockedBuffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_offline", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	registry := newSessionConnectionRegistryWithLimit(3)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	dispatcher := newDeliveryDispatcher(registry)
+	service.dispatchOperation = dispatcher.dispatch
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	open := func(routeID, cwd string) *websocket.Conn {
+		t.Helper()
+		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		if openErr != nil {
+			t.Fatalf("authenticate %s: %v", cwd, openErr)
+		}
+		return connection
+	}
+
+	sender := open("01993ca1-4111-7aaa-8aaa-111111111111", "/sender")
+	defer sender.CloseNow()
+	departed := open("01993ca1-4222-7aaa-8aaa-222222222222", "/departed")
+	departedAddress := "/departed@host#01993ca1-4222-7aaa-8aaa-222222222222"
+	if err := departed.Close(websocket.StatusNormalClosure, "test departure"); err != nil {
+		t.Fatalf("close formerly published recipient: %v", err)
+	}
+	publicationDeadline := time.Now().Add(time.Second)
+	for !strings.Contains(logs.String(), `"event":"session_disconnected"`) && time.Now().Before(publicationDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !strings.Contains(logs.String(), `"address":"`+departedAddress+`"`) ||
+		!strings.Contains(logs.String(), `"event":"session_disconnected"`) {
+		t.Fatalf("recipient departure was not observed: %s", logs.String())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	neverPublishedAddress := "/never-published@host#01993ca1-4333-7aaa-8aaa-333333333333"
+	type offlineCase struct {
+		requestID string
+		messageID string
+		address   string
+	}
+	cases := []offlineCase{
+		{
+			requestID: "01993ca1-4444-7aaa-8aaa-444444444444",
+			messageID: "01993ca1-4555-7aaa-8aaa-555555555555",
+			address:   departedAddress,
+		},
+		{
+			requestID: "01993ca1-4666-7aaa-8aaa-666666666666",
+			messageID: "01993ca1-4777-7aaa-8aaa-777777777777",
+			address:   neverPublishedAddress,
+		},
+	}
+	for _, current := range cases {
+		frame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+			current.requestID, current.messageID, current.address, bodyMarker)
+		if err := sender.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+			t.Fatalf("write offline send to %q: %v", current.address, err)
+		}
+		messageType, response, readErr := sender.Read(ctx)
+		if readErr != nil {
+			t.Fatalf("read offline result for %q: %v", current.address, readErr)
+		}
+		expected := `{"v":1,"type":"send_result","request_id":"` + current.requestID +
+			`","payload":{"message_id":"` + current.messageID + `","status":"timeout","reason":"offline"}}`
+		if messageType != websocket.MessageText || string(response) != expected {
+			t.Fatalf("offline result = type %d %s, want %s", messageType, response, expected)
+		}
+	}
+
+	if err := sender.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"list","request_id":"01993ca1-4888-7aaa-8aaa-888888888888","payload":{}}`)); err != nil {
+		t.Fatalf("write list after offline results: %v", err)
+	}
+	var roster operationResponseEnvelope
+	if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Type != "roster" ||
+		roster.RequestID != "01993ca1-4888-7aaa-8aaa-888888888888" {
+		t.Fatalf("offline settlements damaged sender session: response=%+v error=%v", roster, err)
+	}
+
+	logDeadline := time.Now().Add(time.Second)
+	for !strings.Contains(logs.String(), `"message_id":"`+cases[1].messageID+`"`) && time.Now().Before(logDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	for _, current := range cases {
+		var settlement map[string]any
+		for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+			var event map[string]any
+			if json.Unmarshal([]byte(line), &event) == nil && event["event"] == "send_settled" &&
+				event["message_id"] == current.messageID {
+				settlement = event
+				break
+			}
+		}
+		if settlement == nil || settlement["result"] != "settled" || settlement["reason"] != "offline" ||
+			settlement["code"] != "offline" || settlement["request_id"] != current.requestID ||
+			settlement["sender_route"] != "/sender@host#01993ca1-4111-7aaa-8aaa-111111111111" ||
+			settlement["recipient_route"] != current.address || settlement["status"] != "timeout" ||
+			settlement["body"] != redacted {
+			t.Fatalf("offline telemetry for %q = %#v", current.address, settlement)
+		}
+		if _, exists := settlement["delivery_id"]; exists {
+			t.Fatalf("offline telemetry generated delivery_id: %#v", settlement)
+		}
+	}
+	if strings.Contains(logs.String(), bodyMarker) {
+		t.Fatalf("offline telemetry leaked body: %s", logs.String())
+	}
+	select {
+	case <-reporter.reported:
+		t.Fatalf("offline result caused fatal runtime failure: %v", reporter.err())
+	default:
+	}
+}
+
 func TestGeneratedServerUUIDv7IsCanonicalAndFresh(t *testing.T) {
 	first, err := generateServerUUIDv7(time.UnixMilli(1_757_564_800_000))
 	if err != nil {

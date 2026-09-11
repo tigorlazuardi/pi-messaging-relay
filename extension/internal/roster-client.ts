@@ -32,11 +32,9 @@ export type RosterPage = {
 };
 
 /** Closed model-visible result returned by one correlated send response. */
-export type SendResult = {
-  message_id: string;
-  status: "received" | "denied" | "timeout";
-  reason?: string;
-};
+export type SendResult =
+  | { message_id: string; status: "received" }
+  | { message_id: string; status: "timeout"; reason: "offline" };
 
 type PendingOperation = {
   kind: "list" | "send";
@@ -371,18 +369,17 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
     throw new Error("invalid send result envelope");
   }
   const payload = frame.payload;
-  if (!isObject(payload) ||
-      (!hasExactKeys(payload, ["message_id", "status"]) &&
-       !hasExactKeys(payload, ["message_id", "status", "reason"])) ||
-      payload.message_id !== messageID ||
-      (payload.status !== "received" && payload.status !== "denied" && payload.status !== "timeout") ||
-      ("reason" in payload && (typeof payload.reason !== "string" || payload.reason.length === 0)) ||
-      (payload.status === "received" && "reason" in payload)) {
+  if (!isObject(payload) || payload.message_id !== messageID) {
     throw new Error("invalid send result payload");
   }
-  return "reason" in payload
-    ? { message_id: messageID, status: payload.status, reason: payload.reason as string }
-    : { message_id: messageID, status: payload.status };
+  if (hasExactKeys(payload, ["message_id", "status"]) && payload.status === "received") {
+    return { message_id: messageID, status: "received" };
+  }
+  if (hasExactKeys(payload, ["message_id", "status", "reason"]) &&
+      payload.status === "timeout" && payload.reason === "offline") {
+    return { message_id: messageID, status: "timeout", reason: "offline" };
+  }
+  throw new Error("invalid send result payload");
 }
 
 function maximumSendBodyBytes(to: string, re: string | undefined): number {

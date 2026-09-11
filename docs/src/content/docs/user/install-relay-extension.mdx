@@ -157,4 +157,5 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - **Connection drops after authentication** — the extension remains safely disconnected. Automatic reconnect and backoff belong to ticket #26; start a new Pi session or pair successfully during the current session for the currently supported one-attempt flow.
 - **Pairing and authentication succeeded but `list_peers` says disconnected** — the retained socket closed or never authenticated. Start a new Pi session or pair successfully during the current session; automatic reconnect remains deferred.
 - **`list_peers` or `agent_send` reports a concurrent request** — wait for the existing outgoing operation to settle. The extension deliberately sends no second operation and creates no operation queue.
-- **`agent_send` times out or disconnects** — offline, missing-ACK, and recipient-disconnect machine results remain deferred. Start a newly authenticated session after the bounded local socket settlement.
+- **`agent_send` returns `timeout/offline`** — the exact destination is not currently published. The retained socket remains usable; refresh `list_peers` or send elsewhere.
+- **`agent_send` locally times out or disconnects** — missing-ACK and recipient-disconnect machine results remain deferred. Start a newly authenticated session after the bounded local socket settlement.

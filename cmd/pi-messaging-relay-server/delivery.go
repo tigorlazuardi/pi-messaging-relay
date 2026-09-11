@@ -79,9 +79,20 @@ func (dispatcher *deliveryDispatcher) send(
 ) (operationResponse, bool, error) {
 	recipient, ok := dispatcher.registry.publishedSession(operation.Send.To)
 	if !ok {
-		// Ticket #18 owns the externally visible offline result. This operation ends
-		// without retaining work until that result vocabulary is implemented.
-		return operationResponse{}, false, nil
+		return operationResponse{
+			Type: "send_result",
+			Payload: sendResultPayload{
+				MessageID: operation.Send.MessageID,
+				Status:    "timeout",
+				Reason:    "offline",
+			},
+			Outcome:        "settled",
+			Code:           "offline",
+			MessageID:      operation.Send.MessageID,
+			SenderRoute:    sender.Address,
+			RecipientRoute: operation.Send.To,
+			Status:         "timeout",
+		}, true, nil
 	}
 	deliveryID, err := generateServerUUIDv7(time.Now())
 	if err != nil {

@@ -582,13 +582,23 @@ test("renderer-invalid message push closes without Pi injection or received ACK"
   await pair.close();
 });
 
-test("wrong destination, duplicate message fields, and send-result desync fail closed", async () => {
+test("wrong destination, duplicate message fields, and malformed or desynchronized send results fail closed", async () => {
   const cases: Array<(requestID: string, messageID: string) => string> = [
     () => `{"v":1,"type":"message","payload":{"delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","from":"sender","to":"other","body":"x"}}`,
     () => `{"v":1,"type":"message","payload":{"delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","from":"sender","to":"recipient","body":"x","body":"y"}}`,
     () => `{"v":1,"type":"message","payload":{"delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","from":"sender","to":"recipient","body":"\\ud800"}}`,
     () => JSON.stringify({ v: 1, type: "message", payload: { delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47", message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df", from: "sender", to: "recipient", body: "x".repeat(512 * 1024) } }),
     (requestID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: REQUEST_ID, status: "received" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied", reason: "offline" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "ack_timeout" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied", reason: "not_authorized" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "received", reason: "offline" } }),
+    (_requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: REQUEST_ID, payload: { message_id: messageID, status: "timeout", reason: "offline" } }),
+    (requestID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: REQUEST_ID, status: "timeout", reason: "offline" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "offline", delivery_id: REQUEST_ID } }),
   ];
   for (const makeFrame of cases) {
     const pair = await socketPair();
