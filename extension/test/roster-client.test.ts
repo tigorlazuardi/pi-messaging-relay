@@ -8,6 +8,7 @@ import { RosterClient, RosterRequestError } from "../internal/roster-client.ts";
 
 const REQUEST_ID = "01993c84-5d38-7d75-8bc1-f945bfa42cdf";
 const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
+const MAX_FRAME_BYTES = 512 * 1024;
 
 async function socketPair(): Promise<{ client: WebSocket; server: WebSocket; close(): Promise<void> }> {
   const listener = new WebSocketServer({ host: "127.0.0.1", port: 0, perMessageDeflate: false });
@@ -253,19 +254,112 @@ test("send generates internal IDs and accepts only exact correlated send_result"
   assert.deepEqual(await resultPromise, { message_id: payload.message_id, status: "received" });
 });
 
-test("send rejects unsupported, unsafe, or over-transport-limit input without consuming the connection", async (context) => {
+test("send accepts canonical objects and rejects unsafe or over-transport-limit input without consuming the connection", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);
   const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
-  const frames: string[] = [];
-  pair.server.on("message", (data) => frames.push(data.toString("utf8")));
-  const objectMarker = "unsupported-object-body-must-not-cross-wire";
+
+  const objectRequestPromise = nextClientFrame(pair.server);
+  const objectResultPromise = client.send(
+    "destination",
+    { "2": "two", "10": "ten", nested: { z: false, a: [null, 1] } },
+    undefined,
+    new AbortController().signal,
+  );
+  const objectFrame = await objectRequestPromise;
+  const objectRequest = JSON.parse(objectFrame) as Record<string, unknown>;
+  const objectPayload = objectRequest.payload as Record<string, unknown>;
+  assert.equal(
+    objectFrame.includes('"body":{"10":"ten","2":"two","nested":{"a":[null,1],"z":false}}'),
+    true,
+  );
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: objectRequest.request_id,
+    payload: { message_id: objectPayload.message_id, status: "received" },
+  }));
+  assert.deepEqual(await objectResultPromise, {
+    message_id: objectPayload.message_id,
+    status: "received",
+  });
+
+  const uuidPlaceholder = "00000000-0000-7000-8000-000000000000";
+  const exactFrameWithoutBody = `{"v":1,"type":"send","request_id":${JSON.stringify(uuidPlaceholder)},` +
+    `"payload":{"message_id":${JSON.stringify(uuidPlaceholder)},"to":"destination","body":}}`;
+  const exactObjectShell = '{"value":""}';
+  const exactValueLength = MAX_FRAME_BYTES -
+    Buffer.byteLength(exactFrameWithoutBody, "utf8") -
+    Buffer.byteLength(exactObjectShell, "utf8");
+  const exactRequestPromise = nextClientFrame(pair.server);
+  const exactResultPromise = client.send(
+    "destination",
+    { value: "x".repeat(exactValueLength) },
+    undefined,
+    new AbortController().signal,
+  );
+  const exactFrame = await exactRequestPromise;
+  assert.equal(Buffer.byteLength(exactFrame, "utf8"), MAX_FRAME_BYTES);
+  const exactRequest = JSON.parse(exactFrame) as Record<string, unknown>;
+  const exactPayload = exactRequest.payload as Record<string, unknown>;
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: exactRequest.request_id,
+    payload: { message_id: exactPayload.message_id, status: "received" },
+  }));
+  assert.equal((await exactResultPromise).status, "received");
+
+  const invalidOutbound: string[] = [];
+  pair.server.on("message", (data) => invalidOutbound.push(data.toString("utf8")));
+  const marker = "unsafe-object-must-not-cross-wire";
+  const cyclic: Record<string, unknown> = { marker };
+  cyclic.self = cyclic;
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({}, "marker", {
+    enumerable: true,
+    get: () => {
+      getterCalls += 1;
+      return marker;
+    },
+  });
+  let trapCalls = 0;
+  const transparentProxy = new Proxy({ marker }, {});
+  const mutatingTarget = { marker };
+  const mutatingProxy = new Proxy(mutatingTarget, {
+    ownKeys(target) {
+      trapCalls += 1;
+      target.marker = "mutated-marker-must-not-cross-wire";
+      return Reflect.ownKeys(target);
+    },
+  });
+  const hugeSparse: unknown[] = [];
+  hugeSparse.length = 0xffffffff;
+  for (const body of [
+    cyclic,
+    accessor,
+    transparentProxy,
+    { nested: transparentProxy },
+    { nested: mutatingProxy },
+    { value: Number.NaN },
+    { value: undefined },
+  ]) {
+    await assert.rejects(
+      client.send("destination", body, undefined, new AbortController().signal),
+      (error: unknown) => error instanceof RosterRequestError &&
+        error.reason === "invalid_arguments" &&
+        error.message === "Relay agent_send body is not safe JSON." &&
+        !error.message.includes(marker),
+    );
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(trapCalls, 0);
+  assert.equal(mutatingTarget.marker, marker);
   await assert.rejects(
-    client.send("destination", { private: objectMarker }, undefined, new AbortController().signal),
+    client.send("destination", { hugeSparse }, undefined, new AbortController().signal),
     (error: unknown) => error instanceof RosterRequestError &&
-      error.reason === "object_body_unsupported" &&
-      error.message === "Relay agent_send object bodies are not supported by this release." &&
-      !error.message.includes(objectMarker),
+      error.reason === "invalid_arguments" &&
+      error.message === "Relay agent_send frame exceeds 512 KiB.",
   );
   await assert.rejects(client.send("destination", "\ud800", undefined, new AbortController().signal), {
     message: "Relay agent_send arguments are invalid.",
@@ -273,46 +367,97 @@ test("send rejects unsupported, unsafe, or over-transport-limit input without co
   await assert.rejects(client.send("destination", "x".repeat(512 * 1024), undefined, new AbortController().signal), {
     message: "Relay agent_send frame exceeds 512 KiB.",
   });
+  await assert.rejects(
+    client.send(
+      "destination",
+      { value: marker + "x".repeat(exactValueLength - marker.length + 1) },
+      undefined,
+      new AbortController().signal,
+    ),
+    (error: unknown) => error instanceof RosterRequestError &&
+      error.reason === "invalid_arguments" &&
+      error.message === "Relay agent_send frame exceeds 512 KiB." &&
+      !error.message.includes(marker),
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(invalidOutbound, []);
+
   const requestPromise = nextClientRequest(pair.server);
   const resultPromise = client.list(undefined, new AbortController().signal);
   const request = await requestPromise;
   assert.equal(request.type, "list");
   pair.server.send(roster(String(request.request_id), { peers: [] }));
   assert.deepEqual(await resultPromise, { peers: [] });
-  assert.equal(frames.length, 1);
-  assert.equal(frames[0].includes(objectMarker), false);
 });
 
-test("message is injected without steering before a fresh exact received ACK", async (context) => {
+test("captured recipient injection renders every body and re variant before exact ACK", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);
   const attempts: unknown[][] = [];
+  let idle = true;
+  const deliverUserMessage = createRecipientDelivery(
+    (...args: unknown[]) => { attempts.push(args); },
+    () => idle,
+    () => true,
+  );
   const client = new RosterClient(pair.client, {
     responseTimeoutMS: 1_000,
     selfAddress: "recipient",
-    deliverUserMessage: (...args: unknown[]) => { attempts.push(args); },
+    deliverUserMessage,
   });
   void client;
-  const ackPromise = nextClientRequest(pair.server);
-  pair.server.send(JSON.stringify({
-    v: 1,
-    type: "message",
-    payload: {
-      delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
-      message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
-      from: "sender",
-      to: "recipient",
-      body: "exact body",
-    },
-  }));
-  const ack = await ackPromise;
-  assert.deepEqual(attempts, [["exact body"]]);
-  assert.equal(ack.type, "received");
-  assert.match(String(ack.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-  assert.deepEqual(ack.payload, {
-    delivery_id: "01993c85-d827-7cd9-966c-07aa3ee42e47",
-    message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
-  });
+
+  const re = "01993c80-40de-79d7-9b2c-1349f88bb408";
+  const from = 'hostile"\\/\n\u0085\u2028\u2029sender';
+  const variants = [
+    { messageID: "01993c84-0001-7000-8000-000000000001", deliveryID: "01993c85-0001-7000-8000-000000000001", body: "  exact\nbody\n", idle: true },
+    { messageID: "01993c84-0002-7000-8000-000000000002", deliveryID: "01993c85-0002-7000-8000-000000000002", body: "string reply", re, idle: false },
+    { messageID: "01993c84-0003-7000-8000-000000000003", deliveryID: "01993c85-0003-7000-8000-000000000003", body: { "2": "two", "10": "ten", nested: { z: 1, a: [true, null] } }, idle: true },
+    { messageID: "01993c84-0004-7000-8000-000000000004", deliveryID: "01993c85-0004-7000-8000-000000000004", body: {}, re, idle: false },
+  ];
+
+  for (const [index, variant] of variants.entries()) {
+    idle = variant.idle;
+    const ackPromise = nextClientRequest(pair.server).then((ack) => {
+      assert.equal(attempts.length, index + 1, "ACK arrived before recipient injection attempt");
+      return ack;
+    });
+    pair.server.send(JSON.stringify({
+      v: 1,
+      type: "message",
+      payload: {
+        delivery_id: variant.deliveryID,
+        message_id: variant.messageID,
+        from,
+        to: "recipient",
+        body: variant.body,
+        ...(variant.re === undefined ? {} : { re: variant.re }),
+      },
+    }));
+    const ack = await ackPromise;
+    const renderedObject = typeof variant.body === "string"
+      ? variant.body
+      : index === 2
+        ? '{"10":"ten","2":"two","nested":{"a":[true,null],"z":1}}'
+        : "{}";
+    const rendered = `[pi-messaging-relay] message from "hostile\\\"\\\\/\\n\\u0085\\u2028\\u2029sender" ` +
+      `(id=${variant.messageID}${variant.re === undefined ? "" : `, re=${variant.re}`}):\n${renderedObject}`;
+    assert.equal(rendered.slice(0, rendered.indexOf("\n")).includes("\u0085"), false);
+    assert.equal(rendered.slice(0, rendered.indexOf("\n")).includes("\u2028"), false);
+    assert.equal(rendered.slice(0, rendered.indexOf("\n")).includes("\u2029"), false);
+    assert.deepEqual(
+      attempts[index],
+      variant.idle ? [rendered] : [rendered, { deliverAs: "followUp" }],
+    );
+    assert.equal(rendered.split("\n", 1)[0].includes("re="), variant.re !== undefined);
+    assert.equal(ack.type, "received");
+    assert.match(String(ack.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.deepEqual(ack.payload, {
+      delivery_id: variant.deliveryID,
+      message_id: variant.messageID,
+    });
+  }
+  assert.equal(JSON.stringify(attempts).includes("steer"), false);
 });
 
 test("retained socket fails safe after its recipient session identity is replaced", { timeout: 2_000 }, async (context) => {
@@ -356,7 +501,10 @@ test("retained socket fails safe after its recipient session identity is replace
 
   const ackFrame = await ackFramePromise;
   const ack = JSON.parse(ackFrame) as Record<string, unknown>;
-  assert.deepEqual(attempts, [["retained socket body", { deliverAs: "followUp" }]]);
+  assert.deepEqual(attempts, [[
+    "[pi-messaging-relay] message from \"sender\" (id=01993c84-fc2b-7e1c-af99-61b8118ac6df):\nretained socket body",
+    { deliverAs: "followUp" },
+  ]]);
   assert.equal(JSON.stringify(attempts).includes("steer"), false);
   assert.match(String(ack.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(ackFrame, JSON.stringify({
@@ -370,7 +518,7 @@ test("retained socket fails safe after its recipient session identity is replace
   }));
 });
 
-test("object message push closes without Pi injection or received ACK", { timeout: 2_000 }, async () => {
+test("renderer-invalid message push closes without Pi injection or received ACK", { timeout: 2_000 }, async () => {
   const pair = await socketPair();
   const attempts: unknown[][] = [];
   const outbound: string[] = [];
@@ -389,7 +537,7 @@ test("object message push closes without Pi injection or received ACK", { timeou
       message_id: "01993c84-fc2b-7e1c-af99-61b8118ac6df",
       from: "hostile-sender",
       to: "recipient",
-      body: { private: "hostile-object-body-must-not-be-injected" },
+      body: { private: "hostile-object-body-must-not-be-injected", invalid: "\ud800" },
     },
   }));
   await peerClosed;

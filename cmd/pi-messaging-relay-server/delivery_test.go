@@ -91,18 +91,44 @@ func TestDeliverySettlesOnlyAfterExactRecipientAcknowledgement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	const objectBodyMarker = "object-delivery-body-must-stay-private"
-	objectFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":"01993c83-1111-7aaa-8aaa-111111111111","payload":{"message_id":"01993c83-2222-7aaa-8aaa-222222222222","to":%q,"body":{"private":%q}}}`,
-		"/recipient@host#01993ca1-2222-7aaa-8aaa-222222222222", objectBodyMarker)
+	const (
+		objectBodyMarker = "object-delivery-body-must-stay-private"
+		objectRequestID  = "01993c83-1111-7aaa-8aaa-111111111111"
+		objectMessageID  = "01993c83-2222-7aaa-8aaa-222222222222"
+	)
+	objectFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":{"private":%q,"2":"two","10":"ten"}}}`,
+		objectRequestID, objectMessageID, "/recipient@host#01993ca1-2222-7aaa-8aaa-222222222222", objectBodyMarker)
 	if err := sender.Write(ctx, websocket.MessageText, []byte(objectFrame)); err != nil {
 		t.Fatalf("write accepted object send: %v", err)
 	}
-	if err := sender.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"list","request_id":"01993c83-3333-7aaa-8aaa-333333333333","payload":{}}`)); err != nil {
-		t.Fatalf("write list after object send: %v", err)
+	var objectOffer messageEnvelope
+	if err := wsjson.Read(ctx, recipient, &objectOffer); err != nil {
+		t.Fatalf("read object recipient offer: %v", err)
+	}
+	if objectOffer.Payload.MessageID != objectMessageID ||
+		string(objectOffer.Payload.Body) != `{"private":"`+objectBodyMarker+`","2":"two","10":"ten"}` {
+		t.Fatalf("object delivery offer = %+v body=%s", objectOffer, objectOffer.Payload.Body)
+	}
+	objectACK := fmt.Sprintf(`{"v":1,"type":"received","request_id":"01993c83-3333-7aaa-8aaa-333333333333","payload":{"delivery_id":%q,"message_id":%q}}`,
+		objectOffer.Payload.DeliveryID, objectMessageID)
+	if err := recipient.Write(ctx, websocket.MessageText, []byte(objectACK)); err != nil {
+		t.Fatalf("acknowledge object offer: %v", err)
+	}
+	var objectResult operationResponseEnvelope
+	if err := wsjson.Read(ctx, sender, &objectResult); err != nil {
+		t.Fatalf("read object sender result: %v", err)
+	}
+	encodedObjectResult, err := json.Marshal(objectResult.Payload)
+	if err != nil || objectResult.Type != "send_result" || objectResult.RequestID != objectRequestID ||
+		string(encodedObjectResult) != `{"message_id":"`+objectMessageID+`","status":"received"}` {
+		t.Fatalf("object sender result = %+v payload=%s error=%v", objectResult, encodedObjectResult, err)
+	}
+	if err := sender.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"list","request_id":"01993c83-4444-7aaa-8aaa-444444444444","payload":{}}`)); err != nil {
+		t.Fatalf("write list after object settlement: %v", err)
 	}
 	var roster operationResponseEnvelope
 	if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Type != "roster" {
-		t.Fatalf("object send damaged sender session: response=%+v error=%v", roster, err)
+		t.Fatalf("object settlement damaged sender session: response=%+v error=%v", roster, err)
 	}
 	sendFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
 		requestID, messageID, "/recipient@host#01993ca1-2222-7aaa-8aaa-222222222222", bodyMarker)

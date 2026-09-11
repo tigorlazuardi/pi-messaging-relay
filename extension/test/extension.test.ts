@@ -253,7 +253,7 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   const stringSend = {
     to: "/srv/backend@host#route-id",
     body: "Review the API contract",
-    re: "original-message-id",
+    re: "01993c80-40de-79d7-9b2c-1349f88bb408",
   };
   const objectSend = {
     to: "/srv/backend@host#route-id",
@@ -262,6 +262,7 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   assert.equal(Value.Check(sendSchema as never, stringSend), true);
   assert.equal(Value.Check(sendSchema as never, objectSend), true);
   assert.equal(Value.Check(sendSchema as never, { ...stringSend, message_id: "client-id" }), false);
+  assert.equal(Value.Check(sendSchema as never, { ...stringSend, re: "not-a-uuidv7" }), false);
   assert.equal(Value.Check(sendSchema as never, { ...stringSend, deliverAs: "steer" }), false);
   assert.equal(Value.Check(sendSchema as never, { ...stringSend, delivery_mode: "followUp" }), false);
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: ["not", "an", "object"] }), false);

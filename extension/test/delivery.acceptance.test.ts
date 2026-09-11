@@ -124,52 +124,59 @@ test("agent_send crosses real relay and two real extensions before settling rece
     const recipientAuth = await nextEvent(output, "auth_accepted");
     const recipientAddress = String(recipientAuth.address);
 
-    const objectMarker = "local-object-body-must-not-cross-wire";
-    await assert.rejects(
-      sender.executeTool("agent_send", { to: recipientAddress, body: { private: objectMarker } }),
-      (error: unknown) => error !== null && typeof error === "object" &&
-        "name" in error && error.name === "RosterRequestError" &&
-        "reason" in error && error.reason === "object_body_unsupported" &&
-        "message" in error && error.message === "Relay agent_send object bodies are not supported by this release.",
-    );
-    const rosterResult = await sender.executeTool("list_peers", {}) as {
-      details: { peers: Array<{ address: string }> };
-    };
-    assert.equal(rosterResult.details.peers.some((peer) => peer.address === recipientAddress), true);
-    assert.equal(recipient.sendUserMessageAttempts.length, 0);
+    const rejectedMarker = "proxy-content-must-not-cross-any-boundary";
+    let proxyTrapCalls = 0;
+    const transparentProxy = new Proxy({ value: rejectedMarker }, {});
+    const mutatingTarget = { value: rejectedMarker };
+    const mutatingProxy = new Proxy(mutatingTarget, {
+      ownKeys(target) {
+        proxyTrapCalls += 1;
+        target.value = "mutated-proxy-content-must-not-cross";
+        return Reflect.ownKeys(target);
+      },
+    });
+    for (const body of [transparentProxy, { nested: transparentProxy }, { nested: mutatingProxy }]) {
+      await assert.rejects(
+        sender.executeTool("agent_send", { to: recipientAddress, body }),
+        (error: unknown) => error instanceof Error &&
+          error.name === "RosterRequestError" &&
+          (error as Error & { reason?: string }).reason === "invalid_arguments" &&
+          error.message === "Relay agent_send body is not safe JSON." &&
+          !error.message.includes(rejectedMarker),
+      );
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(proxyTrapCalls, 0);
+    assert.equal(mutatingTarget.value, rejectedMarker);
+    assert.deepEqual(recipient.sendUserMessageAttempts, []);
+    assert.equal(extensionLogs.some((line) => line.includes(rejectedMarker)), false);
+    assert.equal(output.lines.some((line) => line.includes(rejectedMarker)), false);
 
+    const objectMarker = "local-object-body-crosses-canonically";
     const messageIDs: string[] = [];
     const deliveryIDs: string[] = [];
     const deliveries = [
       {
-        body: "Queue behind active recipient work",
+        body: { "2": "two", "10": "ten", private: objectMarker, nested: { z: false, a: [null, 1] } },
+        renderedBody: `{"10":"ten","2":"two","nested":{"a":[null,1],"z":false},"private":"${objectMarker}"}`,
+        re: "01993c80-40de-79d7-9b2c-1349f88bb408",
         idle: false,
-        expectedAttempt: [
-          "Queue behind active recipient work",
-          { deliverAs: "followUp" },
-        ],
       },
       {
-        body: "Review exact idle text",
+        body: "  Review exact idle text\nwithout normalization\n",
+        renderedBody: "  Review exact idle text\nwithout normalization\n",
         idle: true,
-        expectedAttempt: ["Review exact idle text"],
       },
       {
         body: "Attempt busy delivery even when Pi rejects it",
+        renderedBody: "Attempt busy delivery even when Pi rejects it",
         idle: false,
-        expectedAttempt: [
-          "Attempt busy delivery even when Pi rejects it",
-          { deliverAs: "followUp" },
-        ],
         throwFromPi: true,
       },
       {
         body: "Fail safe when recipient idle observation throws",
+        renderedBody: "Fail safe when recipient idle observation throws",
         idle: true,
-        expectedAttempt: [
-          "Fail safe when recipient idle observation throws",
-          { deliverAs: "followUp" },
-        ],
         throwFromIdleCheck: true,
       },
     ];
@@ -180,10 +187,19 @@ test("agent_send crosses real relay and two real extensions before settling rece
       const resultPromise = sender.executeTool("agent_send", {
         to: recipientAddress,
         body: delivery.body,
+        ...(delivery.re === undefined ? {} : { re: delivery.re }),
       });
       await waitForAttempt(recipient, index + 1);
-      assert.deepEqual(recipient.sendUserMessageAttempts[index], delivery.expectedAttempt);
       const result = await within(resultPromise, "sender received result") as ToolResult;
+      const rendered = `[pi-messaging-relay] message from ${JSON.stringify(String(senderAuth.address))} ` +
+        `(id=${result.details.message_id}${delivery.re === undefined ? "" : `, re=${delivery.re}`}):\n${delivery.renderedBody}`;
+      assert.deepEqual(
+        recipient.sendUserMessageAttempts[index],
+        delivery.idle && !delivery.throwFromIdleCheck
+          ? [rendered]
+          : [rendered, { deliverAs: "followUp" }],
+      );
+      assert.equal(rendered.includes(`id=${result.details.message_id}`), true);
       assert.deepEqual(Object.keys(result.details).sort(), ["message_id", "status"]);
       assert.match(result.details.message_id, UUID_V7);
       assert.equal(result.details.status, "received");
@@ -207,17 +223,16 @@ test("agent_send crosses real relay and two real extensions before settling rece
     assert.deepEqual(recipient.sendMessageAttempts, []);
     assert.deepEqual(sender.sendMessageAttempts, []);
     assert.equal(JSON.stringify(recipient.sendUserMessageAttempts).includes("steer"), false);
-    assert.equal(deliveries.some((delivery) =>
-      extensionLogs.some((line) => line.includes(delivery.body))), false);
+    const stringBodies = deliveries.filter((delivery) => typeof delivery.body === "string")
+      .map((delivery) => delivery.body as string);
+    assert.equal(stringBodies.some((body) =>
+      extensionLogs.some((line) => line.includes(body))), false);
     assert.equal(extensionLogs.some((line) => line.includes(objectMarker)), false);
-    assert.equal(extensionLogs.some((line) => {
-      const event = JSON.parse(line) as Record<string, unknown>;
-      return event.event === "relay_operation_failed" &&
-        event.operation === "agent_send" && event.reason === "object_body_unsupported";
-    }), true);
-    assert.equal(deliveries.some((delivery) =>
-      output.lines.some((line) => line.includes(delivery.body))), false);
+    assert.equal(extensionLogs.some((line) => line.includes("[pi-messaging-relay] message from")), false);
+    assert.equal(stringBodies.some((body) =>
+      output.lines.some((line) => line.includes(body))), false);
     assert.equal(output.lines.some((line) => line.includes(objectMarker)), false);
+    assert.equal(output.lines.some((line) => line.includes("[pi-messaging-relay] message from")), false);
     assert.equal(stderr.length, 0);
   } catch (error: unknown) {
     primaryError = error;

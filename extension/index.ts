@@ -27,6 +27,7 @@ const REDACTED = "<redacted>";
 const MAX_PAIR_REQUEST_BYTES = 4096;
 const MAX_PAIR_RESPONSE_BYTES = 4096;
 const MAX_CURSOR_CHARACTERS = 5_856;
+const UUID_V7_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const PAIRING_CODE_BYTES = 32;
 const PAIR_REQUEST_FIXED_BYTES = 94;
 const MAX_PAIRING_CODE_BYTES = Math.min(
@@ -58,8 +59,8 @@ const agentSendParameters = Type.Object(
     ]),
     re: Type.Optional(
       Type.String({
-        minLength: 1,
-        description: "Original message ID when sending a reply",
+        pattern: UUID_V7_PATTERN,
+        description: "Original UUIDv7 message ID when sending a reply",
       }),
     ),
   },
@@ -726,17 +727,17 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "agent_send",
     label: "Send to Relay Peer",
-    description: "Send text to one online Pi relay session; object bodies are reserved for a later release",
+    description: "Send a string or JSON object to one online Pi relay session",
     parameters: agentSendParameters,
     async execute(_toolCallID, params, signal) {
+      const input = params as {
+        to: string;
+        body: string | Record<string, unknown>;
+        re?: string;
+      };
       const connection = activeConnection;
       if (!connection) return disconnected("agent_send");
       try {
-        const input = params as {
-          to: string;
-          body: string | Record<string, unknown>;
-          re?: string;
-        };
         const result = await connection.send(input.to, input.body, input.re, signal as AbortSignal);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],

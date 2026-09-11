@@ -1,5 +1,11 @@
 import WebSocket from "ws";
 
+import {
+  canonicalCompactJSON,
+  CanonicalJSONError,
+  renderRelayMessage,
+  type JSONObject,
+} from "./message-renderer.ts";
 import { generateUUIDv7 } from "./uuid.ts";
 
 const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
@@ -90,22 +96,33 @@ export class RosterClient {
     re: string | undefined,
     signal: AbortSignal,
   ): Promise<SendResult> {
-    if (typeof body !== "string") {
-      return Promise.reject(new RosterRequestError(
-        "object_body_unsupported",
-        "Relay agent_send object bodies are not supported by this release.",
-      ));
-    }
-    if (!validOpaqueString(to, MAX_ADDRESS_BYTES) || !validText(body) ||
+    if (!validOpaqueString(to, MAX_ADDRESS_BYTES) ||
+        (typeof body !== "string" && !isObject(body)) ||
+        (typeof body === "string" && !validText(body)) ||
         (re !== undefined && !isUUIDv7(re))) {
       return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send arguments are invalid."));
     }
+    let encodedBody: string;
+    try {
+      encodedBody = canonicalCompactJSON(body, maximumSendBodyBytes(to, re));
+    } catch (error) {
+      if (error instanceof CanonicalJSONError && error.failure === "maximum_bytes") {
+        return Promise.reject(new RosterRequestError(
+          "invalid_arguments",
+          "Relay agent_send frame exceeds 512 KiB.",
+        ));
+      }
+      return Promise.reject(new RosterRequestError(
+        "invalid_arguments",
+        "Relay agent_send body is not safe JSON.",
+      ));
+    }
     const requestID = generateUUIDv7();
     const messageID = generateUUIDv7();
-    const payload = re === undefined
-      ? { message_id: messageID, to, body }
-      : { message_id: messageID, to, body, re };
-    const frame = JSON.stringify({ v: 1, type: "send", request_id: requestID, payload });
+    const encodedRe = re === undefined ? "" : `,"re":${JSON.stringify(re)}`;
+    const frame = `{"v":1,"type":"send","request_id":${JSON.stringify(requestID)},` +
+      `"payload":{"message_id":${JSON.stringify(messageID)},"to":${JSON.stringify(to)},` +
+      `"body":${encodedBody}${encodedRe}}}`;
     if (Buffer.byteLength(frame, "utf8") > MAX_FRAME_BYTES) {
       return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send frame exceeds 512 KiB."));
     }
@@ -160,8 +177,9 @@ export class RosterClient {
       if (parsed.type === "message") {
         if (this.inboundProcessing) throw new Error("concurrent inbound delivery");
         const delivery = parseMessage(parsed, this.selfAddress, this.deliverUserMessage);
+        const renderedBody = renderRelayMessage(delivery);
         this.inboundProcessing = true;
-        void this.acceptDelivery(delivery);
+        void this.acceptDelivery(delivery, renderedBody);
         return;
       }
 
@@ -184,10 +202,10 @@ export class RosterClient {
     }
   };
 
-  private async acceptDelivery(delivery: InboundDelivery): Promise<void> {
+  private async acceptDelivery(delivery: InboundDelivery, renderedBody: string): Promise<void> {
     try {
       try {
-        this.deliverUserMessage?.(delivery.body);
+        this.deliverUserMessage?.(renderedBody);
       } catch {
         // received is attempt-at-extension-boundary only; Pi exposes no stronger receipt.
       }
@@ -277,7 +295,13 @@ export class RosterClient {
   }
 }
 
-type InboundDelivery = { deliveryID: string; messageID: string; body: string };
+type InboundDelivery = {
+  deliveryID: string;
+  messageID: string;
+  from: string;
+  re?: string;
+  body: string | JSONObject;
+};
 
 function parseMessage(
   frame: Record<string, unknown>,
@@ -301,11 +325,17 @@ function parseMessage(
       ("re" in payload && (typeof payload.re !== "string" || !isUUIDv7(payload.re)))) {
     throw new Error("invalid message correlation");
   }
-  if (typeof payload.body !== "string" || !validText(payload.body) ||
-      Buffer.byteLength(payload.body, "utf8") > MAX_FRAME_BYTES) {
-    throw new Error("invalid message body text");
+  if ((typeof payload.body !== "string" && !isObject(payload.body)) ||
+      (typeof payload.body === "string" && !validText(payload.body))) {
+    throw new Error("invalid message body");
   }
-  return { deliveryID: payload.delivery_id, messageID: payload.message_id, body: payload.body };
+  return {
+    deliveryID: payload.delivery_id,
+    messageID: payload.message_id,
+    from: payload.from,
+    ...("re" in payload ? { re: payload.re as string } : {}),
+    body: payload.body as string | JSONObject,
+  };
 }
 
 function parseRoster(frame: Record<string, unknown>, requestID: string): RosterPage {
@@ -353,6 +383,15 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
   return "reason" in payload
     ? { message_id: messageID, status: payload.status, reason: payload.reason as string }
     : { message_id: messageID, status: payload.status };
+}
+
+function maximumSendBodyBytes(to: string, re: string | undefined): number {
+  const uuidPlaceholder = "00000000-0000-7000-8000-000000000000";
+  const encodedRe = re === undefined ? "" : `,"re":${JSON.stringify(re)}`;
+  const frameWithoutBody = `{"v":1,"type":"send","request_id":${JSON.stringify(uuidPlaceholder)},` +
+    `"payload":{"message_id":${JSON.stringify(uuidPlaceholder)},"to":${JSON.stringify(to)},` +
+    `"body":${encodedRe}}}`;
+  return MAX_FRAME_BYTES - Buffer.byteLength(frameWithoutBody, "utf8");
 }
 
 function validCursor(cursor: string): boolean {

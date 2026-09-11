@@ -77,11 +77,6 @@ func (dispatcher *deliveryDispatcher) send(
 	sender *authenticatedSession,
 	operation clientOperation,
 ) (operationResponse, bool, error) {
-	if len(operation.Send.Body) > 0 && operation.Send.Body[0] == '{' {
-		// Ticket #16 owns object rendering. Keep its accepted wire shape parseable,
-		// but create no offer or pending state until deterministic rendering exists.
-		return operationResponse{}, false, nil
-	}
 	recipient, ok := dispatcher.registry.publishedSession(operation.Send.To)
 	if !ok {
 		// Ticket #18 owns the externally visible offline result. This operation ends
