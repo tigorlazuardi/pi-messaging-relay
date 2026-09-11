@@ -5,10 +5,10 @@ description: Load the Pi extension, configure its loopback endpoint and private 
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. A paired Pi session now authenticates one WebSocket automatically and receives its opaque route address. `list_peers` accepts a bounded optional pagination cursor, but roster reads and delivery are not implemented, so both model tools remain explicitly disconnected.
+The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. A paired Pi session authenticates one WebSocket automatically and receives its opaque route address. `list_peers` reads bounded live address-only roster pages; `agent_send` remains disconnected until delivery behavior lands.
 
-<Aside type="caution" title="Authentication only">
-An `auth_accepted` event means the session proved possession of an allowlisted installation key. It does not enable peer listing or delivery. Ticket #36 supplies only the pagination schema and transport bounds; ticket #13 and later behavior tickets still own network operations and results. `list_peers` and `agent_send` continue to fail with the stable disconnected error.
+<Aside type="caution" title="Discovery only">
+An `auth_accepted` event means the session proved possession of an allowlisted installation key and can use `list_peers`. It does not enable delivery, Pi message injection, reconnect, persistence, or replay. `agent_send` continues to fail with the stable disconnected error.
 </Aside>
 
 ## Requirements
@@ -122,9 +122,9 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
     {"cursor":"cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"}
     ```
   </TabItem>
-  <TabItem label="list_peers error">
-    ```text
-    Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.
+  <TabItem label="list_peers output">
+    ```json
+    {"peers":[{"address":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"}]}
     ```
   </TabItem>
 </Tabs>
@@ -139,7 +139,7 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - The raw code is present in the localhost request because the relay must verify it. Pairing failure output omits the code entirely, and structured logs use `<redacted>` authentication fields rather than echoing the submitted or current value.
 - The extension reads at most 4,096 pairing-response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
 - Its pinned WebSocket client enforces a 512 KiB socket-wide ceiling before complete message delivery. During authentication, complete challenge and welcome messages still have a 16 KiB semantic ceiling. Shutdown requests graceful close for at most one second, then destroys and settles an unresponsive transport.
-- A `list_peers` cursor is navigation only, not authorization. Copy only `next_cursor` returned by the relay; accepted cursors are at most 5,856 characters, and omitting one starts a fresh traversal. Future roster pages are capped at 48 KiB for the complete WebSocket frame.
+- A `list_peers` cursor is navigation only, not authorization. Copy only `next_cursor` returned by the relay; accepted cursors are at most 5,856 characters, and omitting one starts a fresh traversal. Roster pages are capped at 48 KiB for the complete WebSocket frame and contain only opaque addresses.
 - Pairing failures do not invoke a model, inject a Pi message, or silently claim success.
 - Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
 
@@ -154,4 +154,6 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - **Pairing code rejected by the relay** — the code was incorrect, reached its ten-minute deadline, or was already accepted once; the relay deliberately returns the same message for all three. Obtain a fresh code by restarting the server with a new unused private code-file path.
 - **Authentication rejected after pairing** — confirm Pi still uses the state directory that owns the paired key and the same running relay process. Restart authorization acceptance belongs to ticket #27.
 - **Connection drops after authentication** — the extension remains safely disconnected. Automatic reconnect and backoff belong to ticket #26; start a new Pi session or pair successfully during the current session for the currently supported one-attempt flow.
-- **Pairing and authentication succeeded but tools are disconnected** — expected. The optional `list_peers` cursor schema is installed, but roster reads/results remain ticket #13 and delivery remains deferred.
+- **Pairing and authentication succeeded but `list_peers` says disconnected** — the retained socket closed or never authenticated. Start a new Pi session or pair successfully during the current session; automatic reconnect remains deferred.
+- **`list_peers` reports a concurrent request** — wait for the existing request to settle. The extension deliberately sends or queues only one list operation per retained connection.
+- **`agent_send` remains disconnected** — expected. Delivery remains deferred even though peer discovery is available.

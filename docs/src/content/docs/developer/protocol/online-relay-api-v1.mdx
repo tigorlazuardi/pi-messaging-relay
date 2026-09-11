@@ -58,7 +58,7 @@ A cursor is `cur_` followed by canonical unpadded Base64url of the raw UTF-8 byt
 
 A post-authentication parser starts at a message boundary and either dispatches one complete valid operation or enters a terminal protocol-error state. Binary messages, invalid UTF-8, malformed or trailing JSON, and over-limit messages use `invalid_frame`. A syntax-valid value that is not the closed operation envelope, including duplicate or unknown fields and wrong-direction types, uses `invalid_envelope`. An otherwise shaped envelope whose integer major is not `1` uses `unsupported_protocol`. These stable errors have `close: true`; the server makes one bounded best-effort error write and then hard-closes promptly. `request_id` is included only when the complete JSON has exactly one valid top-level request ID that can be recovered without ambiguity. Error messages and logs never include raw frame or body data; logs omit unrecognized submitted types.
 
-Operation-level denial is a different state transition: a structurally valid operation reaches the operation dispatcher, a canonical result may be returned, and the parser returns to the next message boundary without closing. Tickets #13, #14, and #18 own production roster, delivery, and offline outcomes, so the boundary implementation does not invent a temporary result while those handlers remain disconnected.
+Operation-level denial is a different state transition: a structurally valid operation reaches the operation dispatcher, a canonical result may be returned, and the parser returns to the next message boundary without closing. Tickets #36 and #13 implement live `list`/`roster` discovery, which remains connected after authentication. Ticket #14 owns delivery and acknowledgment outcomes, and ticket #18 owns offline outcomes; those handlers remain disconnected.
 
 <Decision title="Fail closed on protocol ambiguity but keep operation denials recoverable" status="accepted">
 Malformed framing or envelope state makes subsequent interpretation unsafe, so one stable error ends the connection. A valid operation with a business denial remains unambiguous and leaves the authenticated session usable.
@@ -260,7 +260,7 @@ A 48 KiB roster-frame ceiling leaves tool-result wrapper headroom and avoids sna
 </Decision>
 
 <Aside type="note" title="Implementation boundary">
-Ticket #36 implements cursor validation, model-tool schema, and bounded transport only. Production registry reads, page construction, `roster` responses, and model-tool WebSocket operations remain explicitly deferred to ticket #13.
+Tickets #36 and #13 implement this complete discovery seam: strict cursor input, live authenticated-registry reads, deterministic bounded pages, correlated `roster` responses, and the connected `list_peers` model tool. Delivery, Pi message injection, reconnect, persistence, and replay remain outside this boundary.
 </Aside>
 
 ### I/O examples

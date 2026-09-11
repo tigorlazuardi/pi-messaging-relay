@@ -94,6 +94,7 @@ type authenticatedSession struct {
 type trackedSessionConnection struct {
 	connection *websocket.Conn
 	session    *authenticatedSession
+	visible    bool
 }
 
 type sessionAuthenticationResult int
@@ -148,7 +149,7 @@ func (registry *sessionConnectionRegistry) attach(
 	return !registry.closing
 }
 
-func (registry *sessionConnectionRegistry) authenticate(
+func (registry *sessionConnectionRegistry) reserveAuthentication(
 	entry *trackedSessionConnection,
 	session *authenticatedSession,
 ) sessionAuthenticationResult {
@@ -169,7 +170,33 @@ func (registry *sessionConnectionRegistry) authenticate(
 		}
 	}
 	entry.session = session
+	entry.visible = false
 	return sessionAuthenticated
+}
+
+func (registry *sessionConnectionRegistry) publishAuthentication(
+	entry *trackedSessionConnection,
+	session *authenticatedSession,
+) bool {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.closing {
+		return false
+	}
+	if _, exists := registry.entries[entry]; !exists || entry.connection == nil || entry.session != session {
+		return false
+	}
+	entry.visible = true
+	return true
+}
+
+func (registry *sessionConnectionRegistry) clearAuthentication(entry *trackedSessionConnection) {
+	registry.mu.Lock()
+	if _, exists := registry.entries[entry]; exists {
+		entry.visible = false
+		entry.session = nil
+	}
+	registry.mu.Unlock()
 }
 
 func (registry *sessionConnectionRegistry) remove(entry *trackedSessionConnection) {
@@ -220,6 +247,7 @@ type sessionAuthService struct {
 	logger            *eventLogger
 	reportFatal       func(error)
 	dispatchOperation operationDispatcher
+	writeWelcome      func(context.Context, *websocket.Conn, welcomeEnvelope) error
 	authTimeout       time.Duration
 }
 
@@ -234,8 +262,11 @@ func newSessionAuthService(
 		connections:       connections,
 		logger:            logger,
 		reportFatal:       reportFatal,
-		dispatchOperation: noOperationDispatcher,
-		authTimeout:       authDeadline,
+		dispatchOperation: rosterOperationDispatcher(connections),
+		writeWelcome: func(ctx context.Context, connection *websocket.Conn, welcome welcomeEnvelope) error {
+			return wsjson.Write(ctx, connection, welcome)
+		},
+		authTimeout: authDeadline,
 	}
 }
 
@@ -308,7 +339,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		CWD:             hello.Payload.CWD,
 		Address:         address,
 	}
-	switch service.connections.authenticate(entry, session) {
+	switch service.connections.reserveAuthentication(entry, session) {
 	case sessionRegistryClosing:
 		_ = connection.CloseNow()
 		return
@@ -318,7 +349,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		return
 	case sessionAuthenticated:
 	}
-	if err := wsjson.Write(authContext, connection, welcomeEnvelope{
+	if err := service.writeWelcome(authContext, connection, welcomeEnvelope{
 		Version:   1,
 		Type:      "welcome",
 		RequestID: hello.RequestID,
@@ -329,6 +360,10 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		},
 	}); err != nil {
 		service.logRejected("welcome_failed", started, hello.Payload.ClientPublicKey, hello.Payload.RouteID)
+		return
+	}
+	if !service.connections.publishAuthentication(entry, session) {
+		_ = connection.CloseNow()
 		return
 	}
 	service.writeAudit(logEvent{
@@ -349,6 +384,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	cancelAuth()
 
 	service.serveAuthenticated(connection, session)
+	service.connections.clearAuthentication(entry)
 	service.writeAudit(logEvent{
 		Level:           "info",
 		Event:           "session_disconnected",

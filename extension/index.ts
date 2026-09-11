@@ -14,6 +14,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { syncDirectory } from "./internal/directory-durability.ts";
+import { RosterRequestError } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
 
 const DISCONNECTED_ERROR =
@@ -689,8 +690,23 @@ export default function relayExtension(pi: ExtensionAPI): void {
     label: "List Relay Peers",
     description: "List one address-only page of online Pi relay sessions; the result contains peers and optional next_cursor",
     parameters: listPeersParameters,
-    async execute() {
-      return disconnected("list_peers");
+    async execute(_toolCallID, params, signal) {
+      const connection = activeConnection;
+      if (!connection) return disconnected("list_peers");
+      try {
+        const cursor = (params as { cursor?: string }).cursor;
+        const page = await connection.list(cursor, signal as AbortSignal);
+        return {
+          content: [{ type: "text", text: JSON.stringify(page) }],
+          details: page,
+        };
+      } catch (error) {
+        logFailure(
+          "list_peers",
+          error instanceof RosterRequestError ? error.reason : "unexpected_failure",
+        );
+        throw error;
+      }
     },
   });
 

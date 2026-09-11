@@ -8,10 +8,10 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop. Neither seam adds production roster responses, delivery, reconnect, or restart acceptance.
+This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](/developer/protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop, and the [active peer roster](/developer/relay/active-peer-roster/) consumes authenticated presence. Delivery, reconnect, and restart acceptance remain separate.
 
 <Aside type="note" title="Ticket boundaries">
-Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Ticket #36 changes only bounded pagination transport and the extension socket ceiling; ticket #13 still owns roster behavior. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
+Ticket #12 owns the complete post-authentication malformed, duplicate, unknown-field, frame-type, and protocol-major matrix. Tickets #36 and #13 own bounded live roster pagination. Ticket #26 owns reconnect and backoff. Ticket #27 owns restart acceptance. This authentication seam performs only the strict parsing and bounded reads needed to authenticate safely.
 </Aside>
 
 ## Authentication flow
@@ -69,7 +69,7 @@ The allowlisted key identifies the installation. One UUIDv7 identifies this Pi s
 
 The connection registry atomically reserves one of 1,024 slots before `websocket.Accept`. Capacity exhaustion returns bounded HTTP `503` without upgrading and emits one `session_capacity_rejected` event. Accept failure releases the reservation; every successful upgrade attaches to its reservation immediately. Shutdown force-closes and settles reserved authentication or authenticated sockets within the existing five-second process deadline before reporting `server_stopped`.
 
-Under the same registry lock, authentication rejects an active duplicate route UUID or complete opaque address. Each accepted entry stores the authenticated installation key and route UUID separately; no composite-address parsing participates in identity or authorization. Ticket #13 may consume only these unique active entries. Process-lifetime ownership and whether a route becomes reusable after disconnect remain explicitly blocked on reconnect semantics in ticket #26; this slice does not invent reuse or reconnect behavior.
+Under the same registry lock, authentication rejects an active duplicate route UUID or complete opaque address. Each accepted entry stores the authenticated installation key and route UUID separately; no composite-address parsing participates in identity or authorization. The roster consumes only a copy of active opaque address strings and omits reserved or unauthenticated entries. Process-lifetime ownership and whether a route becomes reusable after disconnect remain explicitly blocked on reconnect semantics in ticket #26; this slice does not invent reuse or reconnect behavior.
 
 ## Dependency boundary
 
@@ -78,7 +78,7 @@ The Go server pins `github.com/coder/websocket` v1.8.15 under the ISC license. I
 The extension pins `ws` v8.21.3 under the MIT license as a direct runtime dependency, with no required transitive dependencies. The tagged primary API documents client-side `maxPayload` enforcement and `terminate()`, which destroys the transport. The socket configures `maxPayload: 524288` before connecting and disables compression. During both challenge and welcome phases, the handler measures the bounded complete message and applies the narrower 16 KiB authentication ceiling before parsing it. Normal cleanup requests a graceful close, waits at most one second, then terminates and awaits the terminal close event. This same owner covers connecting, authenticating, retained, and shutdown states. The package and lock sit beside the extension so Nix-installed Pi resolves `ws` from the extension package instead of assuming Pi internals or a global Node installation.
 
 <Decision title="Separate the socket transport ceiling from authentication semantics" status="accepted">
-The intentional bounded contract change raises the extension's pre-materialization limit from 16 KiB to the general 512 KiB socket ceiling required for future roster pages. Challenge and welcome remain semantically limited to 16 KiB after bounded materialization; larger transport input is rejected before message emission, and cleanup still hard-terminates an unresponsive peer.
+The intentional bounded contract change raises the extension's pre-materialization limit from 16 KiB to the general 512 KiB socket ceiling required for bounded roster pages. Challenge and welcome remain semantically limited to 16 KiB after bounded materialization; larger transport input is rejected before message emission, and cleanup still hard-terminates an unresponsive peer.
 </Decision>
 
 ## Telemetry

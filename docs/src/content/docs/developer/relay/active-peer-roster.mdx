@@ -1,0 +1,84 @@
+---
+title: Active peer roster
+description: How authenticated registry membership becomes bounded, live address-only roster pages and correlated Pi tool results.
+status: accepted
+date: 2026-09-11
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Decision from '../../../../components/Decision.astro';
+
+The roster seam connects the server's authenticated session registry to the extension's `list_peers` tool. It publishes only complete opaque addresses. Installation identity, client ID, cwd, hostname, route fields, socket details, connection names, and Pi idle/busy state do not enter roster entries.
+
+## Live registry boundary
+
+A connection reserves capacity before WebSocket upgrade, but a reserved or unauthenticated entry is absent from discovery. Successful authentication atomically installs the session address. Disconnect clears authenticated membership before the server emits `session_disconnected`, then releases the tracked connection after logging, so a request after that event cannot return the removed address.
+
+Each `list` operation takes one concurrency-safe copy of currently authenticated addresses, omits the caller, sorts with Go string ordering, and retains only complete strings strictly greater than the decoded cursor. The server does not parse addresses and does not retain roster or pagination snapshots.
+
+<Decision title="Expose live authenticated addresses through a copy-only registry seam" status="accepted">
+The dispatcher receives no registry map, socket, identity record, or mutable entry. One request gets one address-string copy, limiting accidental identity disclosure and keeping registry synchronization inside its owner.
+</Decision>
+
+<Aside type="note" title="Live pagination">
+Membership can change between pages. A peer added or removed at or before an existing cursor may be missed during that traversal. Restart without a cursor when a fresh view matters.
+</Aside>
+
+## Deterministic page construction
+
+Candidates remain in sorted order. The page is the longest consecutive prefix whose complete compact `roster` envelope is at most 49,152 UTF-8 bytes. If all candidates fit, the response omits `next_cursor`. Otherwise, every tested prefix includes the exact cursor for its last address, and the selected response includes that cursor. This prevents silent truncation.
+
+The size pass encodes each peer once, accumulates prefix sizes, and computes each candidate cursor once. It does not repeatedly serialize every growing page. The protocol encoder applies the 49,152-byte ceiling again; any dispatcher or encoder invariant failure reaches the fatal runtime owner. A write failure caused by client disconnect remains local to that connection.
+
+<Decision title="Recheck roster size at the protocol encoder" status="accepted">
+Page construction owns the exact longest-prefix calculation, while the final encoder independently prevents an oversized roster from crossing the wire if an internal invariant regresses.
+</Decision>
+
+The existing server `operation_settled` event remains the single settled-operation log. A list event adds only bounded `count`; it never records the cursor or peer array.
+
+## Extension request lifecycle
+
+The authenticated connection owns one deep `list` request API. It generates a UUIDv7 request ID, sends one closed `list` envelope, and accepts only the exactly correlated `roster` response. The complete roster frame is limited to 49,152 bytes and must be valid UTF-8 with no duplicate JSON keys. Envelope, payload, peer entries, value types, address byte bounds, and cursor spelling are closed and validated.
+
+One list request may be in flight per retained connection. A second attempt fails locally without a send or queue. The response deadline is five seconds. Abort or timeout closes and settles the socket because a later response could otherwise desynchronize correlation. Socket close rejects an in-flight request. A malformed, unsolicited, or wrong-correlation roster also fails closed and force-settles the transport.
+
+<Decision title="Allow exactly one list operation per retained connection" status="accepted">
+A single-flight request keeps correlation and cleanup bounded until delivery introduces a broader multiplexing owner. This is a local operational ceiling, not a new wire status.
+</Decision>
+
+Stable local errors are:
+
+| Condition | Tool error |
+|---|---|
+| Already in flight | `Relay list_peers already has one request in flight.` |
+| Aborted | `Relay list_peers request was aborted.` |
+| Five-second deadline | `Relay list_peers response timed out.` |
+| Socket closes | `Relay disconnected during list_peers.` |
+| Invalid or wrongly correlated response | `Relay returned an invalid list_peers response.` |
+
+A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain only `peers` and optional `next_cursor`. `agent_send` remains disconnected until its delivery tickets land.
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Wire request">
+    ```json
+    {"v":1,"type":"list","request_id":"01993c7a-7d2c-7699-b159-851da079f09f","payload":{}}
+    ```
+  </TabItem>
+  <TabItem label="Wire response">
+    ```json
+    {"v":1,"type":"roster","request_id":"01993c7a-7d2c-7699-b159-851da079f09f","payload":{"peers":[{"address":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"}]}}
+    ```
+  </TabItem>
+  <TabItem label="Pi tool result">
+    ```json
+    {"content":[{"type":"text","text":"{\"peers\":[{\"address\":\"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222\"}]}"}],"details":{"peers":[{"address":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"}]}}
+    ```
+  </TabItem>
+  <TabItem label="Concurrent local call">
+    ```text
+    Relay list_peers already has one request in flight.
+    ```
+  </TabItem>
+</Tabs>

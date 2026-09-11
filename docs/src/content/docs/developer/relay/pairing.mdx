@@ -8,10 +8,10 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-Pairing remains the trust bootstrap: a real `/relay-pair CODE` command calls `POST /v1/pair`, and the relay persists the accepted installation's public identity. During an active Pi session, successful pairing may then trigger one WebSocket authentication attempt with that identity. Pairing does not enable either model tool or add roster, delivery, reconnect, or restart behavior.
+Pairing remains the trust bootstrap: a real `/relay-pair CODE` command calls `POST /v1/pair`, and the relay persists the accepted installation's public identity. During an active Pi session, successful pairing may then trigger one WebSocket authentication attempt with that identity and enable connected `list_peers` discovery. Pairing itself does not implement roster, delivery, reconnect, or restart behavior.
 
 <Aside type="note" title="Ticket boundaries">
-Ticket #10 adds deterministic invalid, expired, and reused-code behavior coverage to the successful pairing seam from #9. Ticket #11 supplies the nonce/signature WebSocket authentication attempt after successful pairing in an active session. Ticket #13 owns roster behavior, ticket #26 owns reconnect, and ticket #27 owns restart restoration acceptance. Delivery remains deferred. Pairing itself remains limited to trust bootstrap.
+Ticket #10 adds deterministic invalid, expired, and reused-code behavior coverage to the successful pairing seam from #9. Ticket #11 supplies the nonce/signature WebSocket authentication attempt after successful pairing in an active session. The active-peer roster consumes authenticated membership, while ticket #26 owns reconnect and ticket #27 owns restart restoration acceptance. Delivery remains deferred. Pairing itself remains limited to trust bootstrap.
 </Aside>
 
 ## Startup code ownership

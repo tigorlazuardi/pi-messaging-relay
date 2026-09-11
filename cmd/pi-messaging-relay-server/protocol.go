@@ -49,10 +49,11 @@ type clientOperation struct {
 }
 
 type operationResponse struct {
-	Type    string
-	Payload any
-	Outcome string
-	Code    string
+	Type      string
+	Payload   any
+	Outcome   string
+	Code      string
+	PeerCount *int
 }
 
 type operationResponseEnvelope struct {
@@ -153,6 +154,7 @@ func (service *sessionAuthService) serveAuthenticated(
 			Code:      response.Code,
 			Type:      operation.Type,
 			RequestID: operation.RequestID,
+			Count:     response.PeerCount,
 		}) {
 			_ = connection.CloseNow()
 			return
@@ -563,6 +565,9 @@ func encodeOperationResponse(
 	})
 	if err != nil {
 		return nil, errors.New("operation dispatcher returned a response that cannot be encoded")
+	}
+	if response.Type == "roster" && len(encoded) > maxRosterFrameBytes {
+		return nil, errors.New("operation dispatcher returned a roster response above the frame ceiling")
 	}
 	return encoded, nil
 }

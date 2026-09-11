@@ -48,6 +48,7 @@ type logEvent struct {
 	Signature       string `json:"signature,omitempty"`
 	ExpiresAt       string `json:"expires_at,omitempty"`
 	LatencyMS       *int64 `json:"latency_ms,omitempty"`
+	Count           *int   `json:"count,omitempty"`
 }
 
 type eventWriteRequest struct {

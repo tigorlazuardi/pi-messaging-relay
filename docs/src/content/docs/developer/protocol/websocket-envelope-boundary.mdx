@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 This seam replaces the retained socket's one-read placeholder with a bounded post-authentication message loop. It validates the client operation language before any roster, routing, delivery, acknowledgment, or offline behavior can run.
 
 <Aside type="note" title="Implementation boundary">
-The production dispatcher intentionally emits no temporary public result. Ticket #36 adds only the accepted bounded `list` cursor transport; ticket #13 still owns live registry reads, page filling, `roster` responses, and model-tool WebSocket operations. Tickets #14 and #18 connect delivery, acknowledgment, and offline outcomes. Ticket #24 adds the separate 256 KiB serialized-body rejection. This seam defines and tests dispatch/result behavior with an injected handler without consuming those tickets.
+The production dispatcher now binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14 and #18 connect delivery, acknowledgment, and offline outcomes. Ticket #24 adds the separate 256 KiB serialized-body rejection. This seam continues to define and test generic dispatch/result behavior without consuming those delivery tickets.
 </Aside>
 
 ## Parser states
@@ -52,7 +52,7 @@ A list cursor is `cur_` plus canonical unpadded Base64url of the last returned o
 Application-owned body objects may contain arbitrary JSON field names and nested value types. They are not normalized here. Only duplicate object names are prohibited at every body depth. The general frame ceiling bounds string and object bodies in this seam; body-specific serialized-size enforcement remains ticket #24.
 
 <Decision title="Keep pagination decoding inside the protocol boundary" status="accepted">
-Malformed cursors fail terminally with other invalid typed payloads before ticket #13 can read presence state. Future roster logic receives a bounded opaque navigation value rather than attacker-controlled encoding.
+Malformed cursors fail terminally with other invalid typed payloads before the roster dispatcher can read presence state. Roster logic receives a bounded opaque navigation value rather than attacker-controlled encoding.
 </Decision>
 
 <Decision title="Token-scan before typed decoding" status="accepted">

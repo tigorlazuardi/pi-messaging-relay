@@ -10,4 +10,6 @@ This namespace documents the service from an operator's and user's perspective.
 
 Use **[Start and configure the relay server](./start-relay-server/)** to build the Go process, select a loopback port, choose temporary or durable allowlist state, and obtain a startup code through a private operator file.
 
-Use **[Install and pair the relay extension](./install-relay-extension/)** to configure the loopback endpoint and establish one Ed25519 installation identity with `/relay-pair CODE`. Session authentication and the bounded optional `list_peers` cursor schema are available, but both model tools remain disconnected while roster and delivery behavior are deferred.
+Use **[Install and pair the relay extension](./install-relay-extension/)** to configure the loopback endpoint and establish one Ed25519 installation identity with `/relay-pair CODE`.
+
+Use **[List online relay peers](./list-peers/)** to read bounded live address-only pages, continue with an opaque cursor, and refresh after presence changes. Message delivery remains deferred, so `agent_send` is still disconnected.

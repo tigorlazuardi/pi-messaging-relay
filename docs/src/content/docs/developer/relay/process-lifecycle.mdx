@@ -8,7 +8,7 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and implements installation pairing and session authentication. Roster responses, routing, and delivery remain deferred.
+The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and implements installation pairing, session authentication, and connected live `list`/`roster` discovery for authenticated sessions. Message routing and delivery/acknowledgment outcomes remain deferred to ticket #14; offline outcomes remain deferred to ticket #18.
 
 ## Startup boundary
 

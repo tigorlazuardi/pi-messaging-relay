@@ -1,0 +1,68 @@
+---
+title: List online relay peers
+description: Use list_peers safely, continue bounded live pages, and refresh after sessions disconnect.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import Decision from '../../../components/Decision.astro';
+
+`list_peers` returns one bounded page of other authenticated Pi sessions that are online now. Each peer has only an opaque `address`. The roster does not expose idle/busy state, a connection name, installation identity, or separate cwd, hostname, and route fields.
+
+## List and continue
+
+<Steps>
+1. Call `list_peers` with `{}` for a fresh first page.
+2. Use every returned `peers[].address` as one opaque value. Do not split or reinterpret it.
+3. If the result contains `next_cursor`, call `list_peers` again with that exact value.
+4. Stop when `next_cursor` is absent. Start again with `{}` whenever a fresh current view matters.
+</Steps>
+
+Pages use lexicographic address order. A cursor selects only addresses strictly greater than the last address from the preceding page. The relay reads live presence separately for every call; it does not freeze a roster snapshot across pages.
+
+<Aside type="note" title="Presence can change while paging">
+A session can connect or disconnect between calls. Changes at or before the cursor can be missed during one traversal. Restart from `{}` to inspect current presence again.
+</Aside>
+
+<Decision title="Treat pagination cursors as opaque live-navigation values" status="accepted">
+Copy only a `next_cursor` returned by the relay. A cursor is not a peer identity, permission, or durable roster checkpoint.
+</Decision>
+
+## Disconnect and local limits
+
+A disconnected peer is absent from later pages after its disconnect settles. If your own retained relay connection closes, `list_peers` fails instead of returning a stale roster. Automatic reconnect is not available yet; start a new Pi session or use the currently supported pairing connection flow.
+
+Only one `list_peers` operation can be in flight on one retained connection. A concurrent call fails locally without being sent or queued. A request also fails and settles the connection when it is aborted, exceeds its five-second response deadline, receives malformed or wrongly correlated data, or loses the socket. Retry from a newly authenticated connection; do not reuse a cursor when you need a fresh view.
+
+| Condition | Error |
+|---|---|
+| No authenticated connection | `Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.` |
+| Another list is in flight | `Relay list_peers already has one request in flight.` |
+| Request aborted | `Relay list_peers request was aborted.` |
+| Response deadline | `Relay list_peers response timed out.` |
+| Socket disconnected | `Relay disconnected during list_peers.` |
+| Invalid relay response | `Relay returned an invalid list_peers response.` |
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="First page input">
+    ```json
+    {}
+    ```
+  </TabItem>
+  <TabItem label="Page output">
+    ```json
+    {"peers":[{"address":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"}],"next_cursor":"cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"}
+    ```
+  </TabItem>
+  <TabItem label="Next page input">
+    ```json
+    {"cursor":"cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"}
+    ```
+  </TabItem>
+  <TabItem label="Final page output">
+    ```json
+    {"peers":[{"address":"/srv/frontend@workstation-c#01993ca3-3333-7ccc-accc-333333333333"}]}
+    ```
+  </TabItem>
+</Tabs>
