@@ -14,7 +14,7 @@ The roster seam connects the server's authenticated session registry to the exte
 
 A connection reserves capacity before WebSocket upgrade, but a reserved or unauthenticated entry is absent from discovery. Successful authentication atomically installs the session address. Disconnect clears authenticated membership before the server emits `session_disconnected`, then releases the tracked connection after logging, so a request after that event cannot return the removed address.
 
-Each `list` operation takes one concurrency-safe copy of currently authenticated addresses, omits the caller, sorts with Go string ordering, and retains only complete strings strictly greater than the decoded cursor. The server does not parse addresses and does not retain roster or pagination snapshots.
+Each `list` operation takes one concurrency-safe copy of currently authenticated addresses, omits the caller, sorts with Go string ordering, and retains only complete strings strictly greater than the decoded cursor. Server lists execute synchronously one at a time in the connection's sole reader: they may overlap admitted SEND workers, consume no 128-send capacity, and are never queued. The server does not parse addresses and does not retain roster or pagination snapshots.
 
 <Decision title="Expose live authenticated addresses through a copy-only registry seam" status="accepted">
 The dispatcher receives no registry map, socket, identity record, or mutable entry. One request gets one address-string copy, limiting accidental identity disclosure and keeping registry synchronization inside its owner.
@@ -43,7 +43,7 @@ The authenticated connection owns one deep `list` request API. It generates a UU
 One outgoing list or send request may be in flight per retained connection. A second attempt fails locally without a send or queue. Validated server-pushed delivery offers remain acceptable while that operation waits. The `list_peers` response deadline remains five seconds; `agent_send` uses its separate eight-second deadline so the relay's complete five-second recipient ACK path can answer. Abort or local response timeout closes and settles the socket because a later response could otherwise desynchronize correlation. Socket close rejects an in-flight request. A malformed, unsolicited, or wrong-correlation roster also fails closed and force-settles the transport.
 
 <Decision title="Allow exactly one outgoing operation per retained connection" status="accepted">
-A shared single-flight owner correlates list and send responses while still accepting bounded recipient pushes. This is a local operational ceiling, not a new wire status or queue.
+A shared extension single-flight owner correlates list and send responses while still accepting bounded recipient pushes. This local ceiling intentionally does not expose the server's 128-send raw-client capacity and adds no extension queue.
 </Decision>
 
 Stable local errors are:

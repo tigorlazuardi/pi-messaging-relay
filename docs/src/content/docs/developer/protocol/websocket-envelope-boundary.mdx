@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 This seam replaces the retained socket's one-read placeholder with a bounded post-authentication message loop. It validates the client operation language before any roster, routing, delivery, acknowledgment, or offline behavior can run.
 
 <Aside type="note" title="Implementation boundary">
-The production dispatcher binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14–#24 connect delivery outcomes through the same strict parser, including the separate recoverable 256 KiB serialized-body denial. The generic 512 KiB frame boundary remains independent.
+The production dispatcher binds valid `list` operations to live registry reads and bounded `roster` responses. Tickets #14–#25 connect delivery outcomes through the same strict parser, including recoverable serialized-body and exact sender-capacity denials. The generic 512 KiB frame boundary remains independent.
 </Aside>
 
 ## Parser states
@@ -67,10 +67,11 @@ Duplicate keys are semantically ambiguous but ordinary map and struct decoding r
 | `invalid_envelope` | Non-object JSON, duplicate or unknown fields, missing or mistyped fields, invalid UUIDv7, malformed typed payload, or unknown/wrong-direction type | Best-effort error, then hard close |
 | `unsupported_protocol` | Closed envelope shape with an integer major other than `1` | Best-effort error, then hard close |
 | `body_too_large` | Strictly valid `send` whose trimmed raw body JSON value exceeds 262,144 UTF-8 bytes | Correlated `send_result` denial; keep open |
+| `sender_capacity` | Legal dedupe-new `send` when its exact authenticated sender session already owns 128 in-flight distinct sends | Correlated `send_result` denial; keep open |
 
-Every protocol error response is a server-created bounded object with `close: true`. Stable messages are `Invalid WebSocket frame`, `Invalid protocol envelope`, and `Unsupported protocol version`; no decoder diagnostic or attacker-controlled value is reflected. A canonical, unique top-level `request_id` is included only after complete JSON parsing proves it safe. Malformed JSON, duplicate top-level request IDs, binary messages, invalid UTF-8, and over-limit messages omit it.
+Every protocol error response is a server-created bounded object with `close: true`. Detection atomically blocks further normal response publication, makes the exact session ineligible for new routing, and cancels its send producers without waiting for the normal FIFO. Revocation synchronizes with that session's final write lease before notifying delivery cleanup: an offer already writing may finish before the fence completes, but a queued or preselected offer revalidates as unavailable afterward. The sole response writer discards claimed work still waiting on its start gate and all queued normal responses with their bounded ownership. A normal write rejected during this transition also yields to exactly one separately bounded protocol-error write and audit before hard close. If the claimed normal write succeeds but its audit fails after terminal admission has won, the failure remains fatal-owned while the sole writer still performs that terminal attempt; a write or audit failure that wins first retains immediate fatal termination. This preserves one WebSocket writer and prevents post-fence offers to an ambiguous session. Stable messages are `Invalid WebSocket frame`, `Invalid protocol envelope`, and `Unsupported protocol version`; no decoder diagnostic or attacker-controlled value is reflected. A canonical, unique top-level `request_id` is included only after complete JSON parsing proves it safe. Malformed JSON, duplicate top-level request IDs, binary messages, invalid UTF-8, and over-limit messages omit it.
 
-A valid operation crosses an injected dispatcher seam. A canonical operation denial or settlement is validated and encoded before its bounded network write. After a successful write, its structured event is emitted and the loop remains at `MessageBoundary`. The real-wire acceptance sends a denied operation and then another valid operation on the same authenticated socket. This distinguishes recoverable business outcomes from terminal parser state without giving the production no-op dispatcher an invented business reason.
+A valid operation crosses operation handling after precedence is resolved. Strict protocol errors and `body_too_large` come first; legal sends then observe dedupe before a dedupe-new send tries the nonblocking 128-slot exact-session reservation. A canonical operation denial or settlement reserves its exact share of the 256-position normal-response budget before validation and encoding, then reaches its bounded network write. After a successful write, its structured event is emitted and the loop remains at `MessageBoundary`. The real-wire acceptance sends a denied operation and then another valid operation on the same authenticated socket. This distinguishes recoverable business outcomes from terminal parser state without giving the production no-op dispatcher an invented business reason.
 
 An incomplete, non-object, or unencodable dispatcher response is a local contract failure, not a peer write failure. It reaches the fatal runtime owner once with only the validated operation type and request ID as correlation, then the socket closes without a result body or `operation_denied`/`operation_settled` event. Errors after successful validation and encoding remain bounded peer/network connection outcomes.
 
@@ -80,7 +81,7 @@ The boundary owns framing, syntax, shape, and stable terminal errors. Operation 
 
 ## Telemetry
 
-`protocol_rejected` is a warning with `result: "rejected"`, stable `code` and `reason`, and validated request/type correlation when safe. Unknown submitted types, raw frames, parser diagnostics, addresses embedded in malformed operations, and bodies are omitted. Nesting beyond 64 containers is `invalid_frame`. `operation_denied` is a warning; `operation_settled` is informational. A body-limit denial includes request ID, message ID, authenticated sender route, `status: "denied"`, exact `reason`/`code: "body_too_large"`, and `body: "<redacted>"`. It omits recipient route because rejection precedes recipient lookup. Invalid dispatcher responses emit neither operation event; fatal diagnostics omit payload values and encoder details that could contain body data.
+`protocol_rejected` is a warning with `result: "rejected"`, stable `code` and `reason`, and validated request/type correlation when safe. Unknown submitted types, raw frames, parser diagnostics, addresses embedded in malformed operations, and bodies are omitted. Nesting beyond 64 containers is `invalid_frame`. `operation_denied` is a warning; `operation_settled` is informational. Body-limit and sender-capacity denials include request ID, message ID, authenticated sender route, `status: "denied"`, their exact reason/code, and `body: "<redacted>"`. Both omit recipient route and delivery ID because rejection precedes recipient lookup. Invalid dispatcher responses emit neither operation event; fatal diagnostics omit payload values and encoder details that could contain body data.
 
 The event sink remains part of settlement correctness. A failed event write reaches the fatal runtime latch, closes the affected socket, prevents a successful `server_stopped` report, and causes non-zero process termination. No protocol event contains authentication secrets, nonce, signature, private key, or message body.
 
@@ -154,6 +155,24 @@ The event sink remains part of settlement correctness. A failed event write reac
   <TabItem label="Denial event">
     ```json
     {"level":"warn","event":"operation_denied","result":"denied","reason":"body_too_large","code":"body_too_large","type":"send","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","status":"denied","body":"<redacted>","latency_ms":0}
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Full sender input">
+    ```text
+    input: legal dedupe-new send while the exact authenticated sender session owns 128 in-flight distinct sends
+    ```
+  </TabItem>
+  <TabItem label="Recoverable capacity denial">
+    ```json
+    {"v":1,"type":"send_result","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","payload":{"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"sender_capacity"}}
+    ```
+  </TabItem>
+  <TabItem label="Denial event">
+    ```json
+    {"level":"warn","event":"operation_denied","result":"denied","reason":"sender_capacity","code":"sender_capacity","type":"send","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","status":"denied","body":"<redacted>","latency_ms":0}
     ```
   </TabItem>
 </Tabs>

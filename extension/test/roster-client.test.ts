@@ -494,6 +494,22 @@ test("send accepts exact server denials and keeps the socket usable", async (con
     reason: "body_too_large",
   });
 
+  const capacityRequestPromise = nextClientRequest(pair.server);
+  const capacityResultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  const capacityRequest = await capacityRequestPromise;
+  const capacityMessageID = String((capacityRequest.payload as Record<string, unknown>).message_id);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: capacityRequest.request_id,
+    payload: { message_id: capacityMessageID, status: "denied", reason: "sender_capacity" },
+  }));
+  assert.deepEqual(await capacityResultPromise, {
+    message_id: capacityMessageID,
+    status: "denied",
+    reason: "sender_capacity",
+  });
+
   const listRequestPromise = nextClientRequest(pair.server);
   const listResultPromise = client.list(undefined, new AbortController().signal);
   const listRequest = await listRequestPromise;

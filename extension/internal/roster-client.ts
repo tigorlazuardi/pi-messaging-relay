@@ -44,7 +44,8 @@ export type SendResult =
   | { message_id: string; status: "timeout"; reason: "ack_timeout" }
   | { message_id: string; status: "timeout"; reason: "recipient_disconnected" }
   | { message_id: string; status: "denied"; reason: "message_id_conflict" }
-  | { message_id: string; status: "denied"; reason: "body_too_large" };
+  | { message_id: string; status: "denied"; reason: "body_too_large" }
+  | { message_id: string; status: "denied"; reason: "sender_capacity" };
 
 type ResponseDeadline = {
   cancel(): void;
@@ -501,7 +502,9 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
     return { message_id: messageID, status: "timeout", reason: payload.reason };
   }
   if (hasExactKeys(payload, ["message_id", "status", "reason"]) && payload.status === "denied" &&
-      (payload.reason === "message_id_conflict" || payload.reason === "body_too_large")) {
+      (payload.reason === "message_id_conflict" ||
+       payload.reason === "body_too_large" ||
+       payload.reason === "sender_capacity")) {
     return { message_id: messageID, status: "denied", reason: payload.reason };
   }
   throw new Error("invalid send result payload");

@@ -100,11 +100,6 @@ func noOperationDispatcher(
 	return operationResponse{}, false, nil
 }
 
-type authenticatedRead struct {
-	operation clientOperation
-	failure   *protocolFailure
-}
-
 type authenticatedResponseWork struct {
 	encoded        []byte
 	log            logEvent
@@ -114,56 +109,12 @@ type authenticatedResponseWork struct {
 	done           chan<- bool
 }
 
-type authenticatedOperationAdmission struct {
-	mu        sync.Mutex
-	available bool
-	terminal  bool
-}
-
-func newAuthenticatedOperationAdmission() *authenticatedOperationAdmission {
-	return &authenticatedOperationAdmission{available: true}
-}
-
-func (admission *authenticatedOperationAdmission) claim(shutdown <-chan struct{}) bool {
-	admission.mu.Lock()
-	defer admission.mu.Unlock()
-	select {
-	case <-shutdown:
-		admission.terminal = true
-	default:
-	}
-	if admission.terminal || !admission.available {
-		admission.terminal = true
-		admission.available = false
-		return false
-	}
-	admission.available = false
-	return true
-}
-
-func (admission *authenticatedOperationAdmission) publish(shutdown <-chan struct{}) bool {
-	admission.mu.Lock()
-	defer admission.mu.Unlock()
-	select {
-	case <-shutdown:
-		admission.terminal = true
-	default:
-	}
-	if admission.terminal || admission.available {
-		admission.terminal = true
-		admission.available = false
-		return false
-	}
-	admission.available = true
-	return true
-}
-
-func (admission *authenticatedOperationAdmission) terminate() {
-	admission.mu.Lock()
-	admission.terminal = true
-	admission.available = false
-	admission.mu.Unlock()
-}
+const (
+	// ponytail: fixed to v1's exact authenticated-session ceiling.
+	maxInFlightSendsPerSession = 128
+	// Each admitted logical send can own one original and one attached retry response.
+	maxSequencedResponsesPerSession = maxInFlightSendsPerSession * 2
+)
 
 func (service *sessionAuthService) serveAuthenticated(
 	connection *websocket.Conn,
@@ -171,28 +122,29 @@ func (service *sessionAuthService) serveAuthenticated(
 	markUnavailable func(),
 ) {
 	serveContext, cancelServe := context.WithCancel(context.Background())
-	reads := make(chan authenticatedRead)
-	readDone := make(chan struct{})
-	admission := newAuthenticatedOperationAdmission()
-	// One preceding logical operation can still own its original+retry pair
-	// after the first response becomes peer-visible. The next conforming logical
-	// send can then own its own original+retry pair: four is the exact maximum.
-	responseQueue := make(chan authenticatedResponseWork, 4)
-	responseSlots := make(chan struct{}, 4)
+	producerContext, cancelProducers := context.WithCancel(serveContext)
+	responseQueue := make(chan authenticatedResponseWork, maxSequencedResponsesPerSession)
+	responseSlots := make(chan struct{}, maxSequencedResponsesPerSession)
 	responseDone := make(chan struct{})
+	terminalQueue := make(chan authenticatedResponseWork, 1)
+	terminalSignal := make(chan struct{})
+	sendCapacity := make(chan struct{}, maxInFlightSendsPerSession)
+	var sendWorkers sync.WaitGroup
+	var responseAdmissionMu sync.Mutex
+	terminalStarted := false
 
 	var terminateOnce sync.Once
 	terminate := func() {
 		terminateOnce.Do(func() {
-			admission.terminate()
 			markUnavailable()
+			cancelProducers()
 			cancelServe()
 			_ = connection.CloseNow()
 		})
 	}
 	defer func() {
 		terminate()
-		<-readDone
+		sendWorkers.Wait()
 		<-responseDone
 	}()
 
@@ -202,6 +154,9 @@ func (service *sessionAuthService) serveAuthenticated(
 		operationStarted time.Time,
 		start <-chan struct{},
 	) (authenticatedResponseWork, error) {
+		if service.beforeResponsePreparation != nil {
+			service.beforeResponsePreparation(operation)
+		}
 		encodedResponse, err := encodeOperationResponse(operation, response)
 		if err != nil {
 			return authenticatedResponseWork{}, err
@@ -242,49 +197,145 @@ func (service *sessionAuthService) serveAuthenticated(
 			start:          start,
 		}, nil
 	}
-	enqueueResponse := func(work authenticatedResponseWork) bool {
-		select {
-		case responseSlots <- struct{}{}:
-		default:
-			return false
-		}
-		select {
-		case responseQueue <- work:
-			return true
-		case <-serveContext.Done():
+
+	releaseResponseSlots := func(count int) {
+		for range count {
 			<-responseSlots
+		}
+	}
+	reserveResponseBatch := func(operation clientOperation, count int) bool {
+		if service.beforeResponseBatchReservation != nil {
+			service.beforeResponseBatchReservation(operation, count)
+		}
+		reserved := 0
+		for reserved < count {
+			select {
+			case responseSlots <- struct{}{}:
+				reserved++
+				if service.afterResponseSlotReservation != nil {
+					service.afterResponseSlotReservation(count, reserved)
+				}
+			case <-producerContext.Done():
+				releaseResponseSlots(reserved)
+				return false
+			}
+		}
+		return true
+	}
+	publishReservedResponseBatch := func(works []authenticatedResponseWork) bool {
+		// Publication and the terminal transition share this lock. Once the
+		// transition wins, no completely reserved normal batch can enter the queue.
+		responseAdmissionMu.Lock()
+		defer responseAdmissionMu.Unlock()
+		if terminalStarted {
+			releaseResponseSlots(len(works))
 			return false
 		}
+		select {
+		case <-producerContext.Done():
+			releaseResponseSlots(len(works))
+			return false
+		default:
+		}
+		for _, work := range works {
+			// Response slots and queue capacity have the same ceiling. An active
+			// writer owns a slot outside the queue, so a reserved batch always fits.
+			responseQueue <- work
+		}
+		return true
+	}
+
+	finishResponse := func(work authenticatedResponseWork, settled bool) {
+		if work.done == nil {
+			return
+		}
+		select {
+		case work.done <- settled:
+		default:
+		}
+	}
+	discardQueuedResponses := func() {
+		for {
+			select {
+			case work := <-responseQueue:
+				finishResponse(work, false)
+				releaseResponseSlots(1)
+			default:
+				return
+			}
+		}
+	}
+	terminalIsStarted := func() bool {
+		responseAdmissionMu.Lock()
+		defer responseAdmissionMu.Unlock()
+		return terminalStarted
+	}
+	claimNormalResponse := func() bool {
+		responseAdmissionMu.Lock()
+		defer responseAdmissionMu.Unlock()
+		return !terminalStarted
 	}
 
 	go func() {
 		defer close(responseDone)
 		for {
+			if terminalIsStarted() {
+				discardQueuedResponses()
+				select {
+				case terminalWork := <-terminalQueue:
+					writeContext, cancelWrite := context.WithTimeout(
+						context.Background(), protocolResponseWriteTimeout,
+					)
+					writeErr := service.connections.writeToConnection(writeContext, connection, terminalWork.encoded)
+					cancelWrite()
+					if service.beforeResponseAudit != nil {
+						service.beforeResponseAudit(terminalWork.log)
+					}
+					audited := service.writeAudit(terminalWork.log)
+					finishResponse(terminalWork, writeErr == nil && audited)
+				case <-serveContext.Done():
+				}
+				return
+			}
+
 			select {
 			case work := <-responseQueue:
-				finish := func(settled bool) {
-					if work.done == nil {
-						return
-					}
-					select {
-					case work.done <- settled:
-					default:
-					}
+				// Claiming under the admission lock defines the one normal work
+				// item allowed to finish after a terminal transition begins.
+				if !claimNormalResponse() {
+					finishResponse(work, false)
+					releaseResponseSlots(1)
+					continue
+				}
+				if service.afterNormalResponseClaim != nil {
+					service.afterNormalResponseClaim(work.log)
 				}
 				select {
 				case <-work.start:
 				case <-serveContext.Done():
-					finish(false)
-					<-responseSlots
+					finishResponse(work, false)
+					releaseResponseSlots(1)
+					discardQueuedResponses()
 					return
+				}
+				// A claimed response whose producer had not opened its start gate is
+				// not the active write permitted to cross a terminal transition.
+				if terminalIsStarted() {
+					finishResponse(work, false)
+					releaseResponseSlots(1)
+					continue
 				}
 				writeContext, cancelWrite := context.WithTimeout(serveContext, protocolResponseWriteTimeout)
 				err := service.connections.writeToSession(writeContext, session, work.encoded)
 				cancelWrite()
 				if err != nil {
-					finish(false)
-					<-responseSlots
+					finishResponse(work, false)
+					releaseResponseSlots(1)
+					if terminalIsStarted() {
+						continue
+					}
 					terminate()
+					discardQueuedResponses()
 					return
 				}
 				if work.measureLatency {
@@ -294,14 +345,21 @@ func (service *sessionAuthService) serveAuthenticated(
 					service.beforeResponseAudit(work.log)
 				}
 				if !service.writeAudit(work.log) {
-					finish(false)
-					<-responseSlots
+					finishResponse(work, false)
+					releaseResponseSlots(1)
+					if terminalIsStarted() {
+						continue
+					}
 					terminate()
+					discardQueuedResponses()
 					return
 				}
-				finish(true)
-				<-responseSlots
+				finishResponse(work, true)
+				releaseResponseSlots(1)
+			case <-terminalSignal:
+				// The next loop discards queued normal work before terminal I/O.
 			case <-serveContext.Done():
+				discardQueuedResponses()
 				return
 			}
 		}
@@ -309,110 +367,129 @@ func (service *sessionAuthService) serveAuthenticated(
 
 	immediateStart := make(chan struct{})
 	close(immediateStart)
-	go func() {
-		defer close(readDone)
-		defer close(reads)
-		for {
-			operation, failure, err := readClientOperation(serveContext, connection)
-			if err != nil {
-				terminate()
-				return
-			}
-
-			// ACKs have no response by contract. Dispatch them synchronously in the
-			// sole reader so a recipient role can overlap its own outgoing operation.
-			if failure == nil && operation.Type == "received" {
-				_, respond, dispatchErr := service.dispatchOperation(serveContext, session, operation)
-				if dispatchErr != nil {
-					service.reportFatal(fmt.Errorf("dispatch received operation: %w", dispatchErr))
-					terminate()
-					return
-				}
-				if respond {
-					service.reportFatal(errors.New("received operation unexpectedly produced a response"))
-					terminate()
-					return
-				}
-				continue
-			}
-
-			operationStarted := time.Now()
-			operation.ObservedAt = operationStarted
-			if failure == nil && operation.Type == "send" && !operation.Send.BodyTooLarge {
-				if service.beforeRepeatedSendObservation != nil {
-					service.beforeRepeatedSendObservation(operation)
-				}
-				observation, observeErr := service.connections.dedupe.observe(session, operation)
-				if observeErr != nil {
-					service.reportFatal(fmt.Errorf("classify repeated send: %w", observeErr))
-					terminate()
-					return
-				}
-				switch observation.kind {
-				case dedupePendingAttached:
-					continue
-				case dedupeImmediate:
-					operation.Dedupe = observation.dedupe
-					work, prepareErr := prepareResponse(operation, observation.response, operationStarted, immediateStart)
-					if prepareErr != nil {
-						service.reportFatal(fmt.Errorf("prepare repeated send response: %w", prepareErr))
-						terminate()
-						return
-					}
-					if !enqueueResponse(work) {
-						terminate()
-						return
-					}
-					service.connections.dedupe.releaseCurrent(observation.record)
-					continue
-				case dedupeOverflow:
-					terminate()
-					return
-				}
-			}
-
-			if service.beforeOperationAdmissionDecision != nil {
-				service.beforeOperationAdmissionDecision(operation)
-			}
-			admitted := admission.claim(service.connections.closingSignal())
-			if service.afterOperationAdmissionDecision != nil {
-				service.afterOperationAdmissionDecision(operation, admitted)
-			}
-			if !admitted {
-				terminate()
-				return
-			}
-			if failure == nil && operation.Type == "send" && !operation.Send.BodyTooLarge {
-				if beginErr := service.connections.dedupe.begin(session, &operation); beginErr != nil {
-					service.reportFatal(fmt.Errorf("begin send dedupe record: %w", beginErr))
-					terminate()
-					return
-				}
-			} else if failure == nil && operation.Type == "list" {
-				// Frame ordering proves a retry emitted for the previous logical send
-				// would already have been classified before this admitted list.
-				service.connections.dedupe.advanceSender(session)
-			}
-			select {
-			case reads <- authenticatedRead{operation: operation, failure: failure}:
-			case <-serveContext.Done():
-				return
-			}
-			if failure != nil {
-				return
-			}
+	enqueuePreparedResponse := func(
+		operation clientOperation,
+		response operationResponse,
+		operationStarted time.Time,
+	) bool {
+		if !reserveResponseBatch(operation, 1) {
+			return false
 		}
-	}()
+		work, err := prepareResponse(operation, response, operationStarted, immediateStart)
+		if err != nil {
+			releaseResponseSlots(1)
+			service.reportFatal(fmt.Errorf("prepare %s operation response: %w", operation.Type, err))
+			terminate()
+			return false
+		}
+		return publishReservedResponseBatch([]authenticatedResponseWork{work})
+	}
+	dispatchSynchronous := func(operation clientOperation, operationStarted time.Time) bool {
+		response, respond, err := service.dispatchOperation(producerContext, session, operation)
+		if err != nil {
+			service.reportFatal(fmt.Errorf("dispatch %s operation: %w", operation.Type, err))
+			terminate()
+			return false
+		}
+		if !respond {
+			return true
+		}
+		return enqueuePreparedResponse(operation, response, operationStarted)
+	}
 
-	for read := range reads {
-		operation, failure := read.operation, read.failure
+	startSend := func(operation clientOperation, operationStarted time.Time) {
+		sendWorkers.Add(1)
+		go func() {
+			defer sendWorkers.Done()
+			capacityOwned := true
+			releaseCapacity := func() {
+				if !capacityOwned {
+					return
+				}
+				<-sendCapacity
+				capacityOwned = false
+			}
+			defer releaseCapacity()
+
+			response, respond, err := service.dispatchOperation(producerContext, session, operation)
+			attached := service.connections.dedupe.complete(operation.Record, response, respond)
+			if err != nil {
+				service.reportFatal(fmt.Errorf("dispatch send operation: %w", err))
+				terminate()
+				return
+			}
+			if !respond {
+				return
+			}
+
+			batchSize := 1
+			if attached != nil {
+				batchSize = 2
+			}
+			if !reserveResponseBatch(operation, batchSize) {
+				return
+			}
+
+			start := make(chan struct{})
+			works := make([]authenticatedResponseWork, 0, batchSize)
+			work, prepareErr := prepareResponse(operation, response, operationStarted, start)
+			if prepareErr != nil {
+				releaseResponseSlots(batchSize)
+				service.reportFatal(fmt.Errorf(
+					"prepare send operation response for request %s: %w",
+					operation.RequestID,
+					prepareErr,
+				))
+				terminate()
+				return
+			}
+			works = append(works, work)
+			if attached != nil {
+				attachedStarted := operationStarted
+				if !attached.ObservedAt.IsZero() {
+					attachedStarted = attached.ObservedAt
+				}
+				attachedWork, attachedErr := prepareResponse(*attached, response, attachedStarted, start)
+				if attachedErr != nil {
+					releaseResponseSlots(batchSize)
+					service.reportFatal(fmt.Errorf("prepare attached send response: %w", attachedErr))
+					terminate()
+					return
+				}
+				works = append(works, attachedWork)
+			}
+			if !publishReservedResponseBatch(works) {
+				return
+			}
+			if attached != nil {
+				service.connections.dedupe.releaseCurrent(operation.Record)
+			}
+			if service.afterOperationResponseReservation != nil {
+				service.afterOperationResponseReservation(operation)
+			}
+			// Capacity becomes reusable only after every response for this logical
+			// send owns bounded sequencer space. Opening start afterward prevents a
+			// peer-visible response from racing ahead of that release point.
+			releaseCapacity()
+			close(start)
+		}()
+	}
+
+	for {
+		operation, failure, err := readClientOperation(serveContext, connection)
+		if err != nil {
+			return
+		}
+		operationStarted := time.Now()
+		operation.ObservedAt = operationStarted
+
 		if failure != nil {
 			encoded, encodeErr := encodeProtocolError(*failure)
 			if encodeErr != nil {
 				return
 			}
 			done := make(chan bool, 1)
-			if !enqueueResponse(authenticatedResponseWork{
+			terminalWork := authenticatedResponseWork{
 				encoded: encoded,
 				log: logEvent{
 					Level:     "warn",
@@ -426,7 +503,25 @@ func (service *sessionAuthService) serveAuthenticated(
 				started: time.Now(),
 				start:   immediateStart,
 				done:    done,
-			}) {
+			}
+
+			// Terminal input wins atomically over normal response publication.
+			// Unpublication then cancels all exact-session producers before the
+			// dedicated terminal work is handed to the sole writer.
+			responseAdmissionMu.Lock()
+			if !terminalStarted {
+				terminalStarted = true
+				cancelProducers()
+				close(terminalSignal)
+			}
+			responseAdmissionMu.Unlock()
+			markUnavailable()
+			if service.afterProtocolTerminalTransition != nil {
+				service.afterProtocolTerminalTransition()
+			}
+			select {
+			case terminalQueue <- terminalWork:
+			case <-serveContext.Done():
 				return
 			}
 			select {
@@ -436,59 +531,94 @@ func (service *sessionAuthService) serveAuthenticated(
 			return
 		}
 
-		operationStarted := time.Now()
-		response, respond, err := service.dispatchOperation(serveContext, session, operation)
-		attached := service.connections.dedupe.complete(operation.Record, response, respond)
-		if err != nil {
-			service.reportFatal(fmt.Errorf("dispatch %s operation: %w", operation.Type, err))
-			return
+		// ACK candidates have no response and remain synchronous reader work, so
+		// they can settle any of this exact session's concurrently held sends.
+		if operation.Type == "received" {
+			if !dispatchSynchronous(operation, operationStarted) {
+				return
+			}
+			continue
 		}
 
-		start := make(chan struct{})
-		if respond {
-			work, prepareErr := prepareResponse(operation, response, operationStarted, start)
-			if prepareErr != nil {
-				service.reportFatal(fmt.Errorf(
-					"prepare %s operation response for request %s: %w",
-					operation.Type,
-					operation.RequestID,
-					prepareErr,
-				))
+		// Body size is classified before dedupe and sender capacity by contract.
+		if operation.Type == "send" && operation.Send.BodyTooLarge {
+			if !dispatchSynchronous(operation, operationStarted) {
 				return
 			}
-			if !enqueueResponse(work) {
-				return
-			}
-			if attached != nil {
-				attachedStarted := operationStarted
-				if !attached.ObservedAt.IsZero() {
-					attachedStarted = attached.ObservedAt
-				}
-				attachedWork, attachedErr := prepareResponse(*attached, response, attachedStarted, start)
-				if attachedErr != nil {
-					service.reportFatal(fmt.Errorf("prepare attached send response: %w", attachedErr))
-					return
-				}
-				if !enqueueResponse(attachedWork) {
-					return
-				}
-			}
-			if attached != nil {
-				service.connections.dedupe.releaseCurrent(operation.Record)
-			}
-			if service.afterOperationResponseReservation != nil {
-				service.afterOperationResponseReservation(operation)
-			}
+			continue
 		}
-		if !admission.publish(service.connections.closingSignal()) {
+
+		if operation.Type == "send" {
+			if service.beforeRepeatedSendObservation != nil {
+				service.beforeRepeatedSendObservation(operation)
+			}
+			observation, observeErr := service.connections.dedupe.observe(session, operation)
+			if observeErr != nil {
+				service.reportFatal(fmt.Errorf("classify repeated send: %w", observeErr))
+				terminate()
+				return
+			}
+			switch observation.kind {
+			case dedupePendingAttached:
+				continue
+			case dedupeImmediate:
+				operation.Dedupe = observation.dedupe
+				if !enqueuePreparedResponse(operation, observation.response, operationStarted) {
+					return
+				}
+				service.connections.dedupe.releaseCurrent(observation.record)
+				continue
+			case dedupeOverflow:
+				return
+			}
+
+			admitted := false
+			select {
+			case sendCapacity <- struct{}{}:
+				admitted = true
+			default:
+			}
+			if !admitted {
+				if !enqueuePreparedResponse(operation, senderCapacityResponse(session, operation.Send.MessageID), operationStarted) {
+					return
+				}
+				continue
+			}
+			if beginErr := service.connections.dedupe.begin(session, &operation); beginErr != nil {
+				<-sendCapacity
+				service.reportFatal(fmt.Errorf("begin send dedupe record: %w", beginErr))
+				terminate()
+				return
+			}
+			startSend(operation, operationStarted)
+			continue
+		}
+
+		// Lists run one at a time in the sole reader. They may overlap admitted
+		// sends but cannot create a queue or consume sender SEND capacity.
+		service.connections.dedupe.advanceSender(session)
+		if !dispatchSynchronous(operation, operationStarted) {
 			return
-		}
-		close(start)
-		if service.afterOperationAdmissionPublication != nil {
-			service.afterOperationAdmissionPublication(operation)
 		}
 	}
 }
+
+func senderCapacityResponse(sender *authenticatedSession, messageID string) operationResponse {
+	return operationResponse{
+		Type: "send_result",
+		Payload: sendResultPayload{
+			MessageID: messageID,
+			Status:    "denied",
+			Reason:    "sender_capacity",
+		},
+		Outcome:     "denied",
+		Code:        "sender_capacity",
+		MessageID:   messageID,
+		SenderRoute: sender.Address,
+		Status:      "denied",
+	}
+}
+
 func readClientOperation(
 	ctx context.Context,
 	connection *websocket.Conn,

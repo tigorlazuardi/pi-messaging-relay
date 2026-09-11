@@ -108,17 +108,18 @@ const (
 )
 
 type sessionConnectionRegistry struct {
-	mu                   sync.Mutex
-	lifecycleMu          sync.Mutex
-	closing              bool
-	limit                int
-	entries              map[*trackedSessionConnection]struct{}
-	changed              chan struct{}
-	closed               chan struct{}
-	shutdownOnce         sync.Once
-	onSessionUnavailable func(*authenticatedSession)
-	onShutdown           func()
-	dedupe               *dedupeLedger
+	mu                      sync.Mutex
+	lifecycleMu             sync.Mutex
+	closing                 bool
+	limit                   int
+	entries                 map[*trackedSessionConnection]struct{}
+	changed                 chan struct{}
+	closed                  chan struct{}
+	shutdownOnce            sync.Once
+	onSessionUnavailable    func(*authenticatedSession)
+	onShutdown              func()
+	beforeSessionWriteLease func(*authenticatedSession)
+	dedupe                  *dedupeLedger
 }
 
 func newSessionConnectionRegistry() *sessionConnectionRegistry {
@@ -205,11 +206,22 @@ func (registry *sessionConnectionRegistry) clearAuthentication(entry *trackedSes
 	var unavailable *authenticatedSession
 	if _, exists := registry.entries[entry]; exists {
 		unavailable = entry.session
+		// Revocation blocks new selection immediately. Synchronizing on writeMu
+		// below then fences every preselected write before cleanup is published.
 		entry.visible = false
-		entry.session = nil
 	}
 	onUnavailable := registry.onSessionUnavailable
 	registry.mu.Unlock()
+
+	if unavailable != nil {
+		entry.writeMu.Lock()
+		registry.mu.Lock()
+		if _, exists := registry.entries[entry]; exists && entry.session == unavailable {
+			entry.session = nil
+		}
+		registry.mu.Unlock()
+		entry.writeMu.Unlock()
+	}
 	registry.notifySessionUnavailable(unavailable, onUnavailable)
 }
 
@@ -328,11 +340,41 @@ func (registry *sessionConnectionRegistry) writeToSession(
 			break
 		}
 	}
+	beforeLease := registry.beforeSessionWriteLease
 	registry.mu.Unlock()
-	return writeTrackedConnection(ctx, destination, frame)
+	if destination == nil {
+		return errors.New("tracked destination is unavailable")
+	}
+	if beforeLease != nil {
+		beforeLease(session)
+	}
+
+	destination.writeMu.Lock()
+	defer destination.writeMu.Unlock()
+	registry.mu.Lock()
+	_, tracked := registry.entries[destination]
+	available := tracked && destination.visible && destination.session == session && destination.connection != nil
+	registry.mu.Unlock()
+	if !available {
+		return errors.New("tracked destination is unavailable")
+	}
+	return destination.connection.Write(ctx, websocket.MessageText, frame)
 }
 
-func writeTrackedConnection(ctx context.Context, destination *trackedSessionConnection, frame []byte) error {
+func (registry *sessionConnectionRegistry) writeToConnection(
+	ctx context.Context,
+	connection *websocket.Conn,
+	frame []byte,
+) error {
+	registry.mu.Lock()
+	var destination *trackedSessionConnection
+	for entry := range registry.entries {
+		if entry.connection == connection {
+			destination = entry
+			break
+		}
+	}
+	registry.mu.Unlock()
 	if destination == nil || destination.connection == nil {
 		return errors.New("tracked destination is unavailable")
 	}
@@ -342,19 +384,21 @@ func writeTrackedConnection(ctx context.Context, destination *trackedSessionConn
 }
 
 type sessionAuthService struct {
-	pairing                            *pairingService
-	connections                        *sessionConnectionRegistry
-	logger                             *eventLogger
-	reportFatal                        func(error)
-	dispatchOperation                  operationDispatcher
-	writeWelcome                       func(context.Context, *websocket.Conn, welcomeEnvelope) error
-	beforeOperationAdmissionDecision   func(clientOperation)
-	afterOperationAdmissionDecision    func(clientOperation, bool)
-	afterOperationAdmissionPublication func(clientOperation)
-	beforeRepeatedSendObservation      func(clientOperation)
-	afterOperationResponseReservation  func(clientOperation)
-	beforeResponseAudit                func(logEvent)
-	authTimeout                        time.Duration
+	pairing                           *pairingService
+	connections                       *sessionConnectionRegistry
+	logger                            *eventLogger
+	reportFatal                       func(error)
+	dispatchOperation                 operationDispatcher
+	writeWelcome                      func(context.Context, *websocket.Conn, welcomeEnvelope) error
+	beforeRepeatedSendObservation     func(clientOperation)
+	beforeResponseBatchReservation    func(clientOperation, int)
+	afterResponseSlotReservation      func(batchSize int, reserved int)
+	beforeResponsePreparation         func(clientOperation)
+	afterOperationResponseReservation func(clientOperation)
+	afterNormalResponseClaim          func(logEvent)
+	afterProtocolTerminalTransition   func()
+	beforeResponseAudit               func(logEvent)
+	authTimeout                       time.Duration
 }
 
 func newSessionAuthService(
