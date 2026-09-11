@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import test from "node:test";
 
 import WebSocket, { WebSocketServer } from "ws";
@@ -288,6 +289,132 @@ test("send generates internal IDs and accepts only exact correlated send_result"
     payload: { message_id: payload.message_id, status: "received" },
   }));
   assert.deepEqual(await resultPromise, { message_id: payload.message_id, status: "received" });
+});
+
+test("send accepts exact ack_timeout and keeps the socket usable for list", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  const request = await requestPromise;
+  const messageID = String((request.payload as Record<string, unknown>).message_id);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: request.request_id,
+    payload: { message_id: messageID, status: "timeout", reason: "ack_timeout" },
+  }));
+  assert.deepEqual(await resultPromise, {
+    message_id: messageID,
+    status: "timeout",
+    reason: "ack_timeout",
+  });
+
+  const listRequestPromise = nextClientRequest(pair.server);
+  const listResultPromise = client.list(undefined, new AbortController().signal);
+  const listRequest = await listRequestPromise;
+  pair.server.send(roster(String(listRequest.request_id), { peers: [] }));
+  assert.deepEqual(await listResultPromise, { peers: [] });
+});
+
+test("operation defaults schedule five-second list and eight-second send response deadlines", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const scheduled: Array<{ durationMS: number; cancelled: boolean }> = [];
+  const client = new RosterClient(pair.client, {
+    responseDeadlineFactory: (_expire: () => void, durationMS: number) => {
+      const deadline = { durationMS, cancelled: false };
+      scheduled.push(deadline);
+      return { cancel: () => { deadline.cancelled = true; } };
+    },
+  });
+
+  const listRequestPromise = nextClientRequest(pair.server);
+  const listResultPromise = client.list(undefined, new AbortController().signal);
+  assert.equal(scheduled[0]?.durationMS, 5_000);
+  const listRequest = await listRequestPromise;
+  pair.server.send(roster(String(listRequest.request_id), { peers: [] }));
+  assert.deepEqual(await listResultPromise, { peers: [] });
+  assert.equal(scheduled[0]?.cancelled, true);
+
+  const sendRequestPromise = nextClientRequest(pair.server);
+  const sendResultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  assert.equal(scheduled[1]?.durationMS, 8_000);
+  assert.equal(scheduled[1]?.durationMS > 5_000 + 1_000 + 1_000, true);
+  const sendRequest = await sendRequestPromise;
+  const messageID = String((sendRequest.payload as Record<string, unknown>).message_id);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: sendRequest.request_id,
+    payload: { message_id: messageID, status: "received" },
+  }));
+  assert.deepEqual(await sendResultPromise, { message_id: messageID, status: "received" });
+  assert.equal(scheduled[1]?.cancelled, true);
+});
+
+test("synchronous response expiry owns pending send before any frame write", { timeout: 2_000 }, async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const controller = new AbortController();
+  const outbound: string[] = [];
+  let deadlineCancellations = 0;
+  let settlementCalls = 0;
+  pair.server.on("message", (data) => outbound.push(data.toString("utf8")));
+  const client = new RosterClient(pair.client, {
+    responseDeadlineFactory: (expire: () => void, durationMS: number) => {
+      assert.equal(durationMS, 8_000);
+      expire();
+      return { cancel: () => { deadlineCancellations += 1; } };
+    },
+    settle: async () => { settlementCalls += 1; },
+  });
+
+  const result = client.send("opaque-destination", "private-body", undefined, controller.signal);
+  await assert.rejects(result, (error: unknown) => {
+    assert.ok(error instanceof RosterRequestError);
+    assert.equal(error.reason, "timeout");
+    assert.equal(error.message, "Relay agent_send response timed out.");
+    return true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(deadlineCancellations, 1);
+  assert.equal(settlementCalls, 1);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.deepEqual(outbound, []);
+  assert.equal(pair.client.readyState, WebSocket.OPEN);
+  assert.equal(pair.server.readyState, WebSocket.OPEN);
+});
+
+test("response deadline factory failure rejects generically without writing or leaking abort ownership", { timeout: 2_000 }, async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const controller = new AbortController();
+  const outbound: string[] = [];
+  let settlementCalls = 0;
+  pair.server.on("message", (data) => outbound.push(data.toString("utf8")));
+  const client = new RosterClient(pair.client, {
+    responseDeadlineFactory: () => {
+      throw new Error("deadline-factory-private-marker");
+    },
+    settle: async () => { settlementCalls += 1; },
+  });
+
+  const result = client.send("opaque-destination", "private-body", undefined, controller.signal);
+  await assert.rejects(result, (error: unknown) => {
+    assert.ok(error instanceof RosterRequestError);
+    assert.equal(error.reason, "disconnected");
+    assert.equal(error.message, "Relay disconnected during agent_send.");
+    assert.equal(error.message.includes("deadline-factory-private-marker"), false);
+    return true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settlementCalls, 1);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.deepEqual(outbound, []);
+  assert.equal(pair.client.readyState, WebSocket.OPEN);
+  assert.equal(pair.server.readyState, WebSocket.OPEN);
 });
 
 test("send accepts canonical objects and rejects unsafe or over-transport-limit input without consuming the connection", async (context) => {
@@ -592,12 +719,15 @@ test("wrong destination, duplicate message fields, and malformed or desynchroniz
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied", reason: "offline" } }),
-    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "ack_timeout" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied", reason: "ack_timeout" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "received", reason: "ack_timeout" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "ack_timeout", extra: true } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied", reason: "not_authorized" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "received", reason: "offline" } }),
     (_requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: REQUEST_ID, payload: { message_id: messageID, status: "timeout", reason: "offline" } }),
     (requestID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: REQUEST_ID, status: "timeout", reason: "offline" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "future_timeout" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "offline", delivery_id: REQUEST_ID } }),
   ];
   for (const makeFrame of cases) {

@@ -12,7 +12,9 @@ const MAX_ROSTER_FRAME_BYTES = 48 * 1024;
 const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_ADDRESS_BYTES = 4_389;
 const MAX_CURSOR_CHARACTERS = 5_856;
-const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
+const DEFAULT_LIST_RESPONSE_TIMEOUT_MS = 5_000;
+// ponytail: fixed to 8s; make configurable when another production deadline profile exists.
+const DEFAULT_SEND_RESPONSE_TIMEOUT_MS = 8_000;
 
 /** Stable local retained-socket failure with a telemetry-safe reason. */
 export class RosterRequestError extends Error {
@@ -34,7 +36,14 @@ export type RosterPage = {
 /** Closed model-visible result returned by one correlated send response. */
 export type SendResult =
   | { message_id: string; status: "received" }
-  | { message_id: string; status: "timeout"; reason: "offline" };
+  | { message_id: string; status: "timeout"; reason: "offline" }
+  | { message_id: string; status: "timeout"; reason: "ack_timeout" };
+
+type ResponseDeadline = {
+  cancel(): void;
+};
+
+type ResponseDeadlineFactory = (expire: () => void, durationMS: number) => ResponseDeadline;
 
 type PendingOperation = {
   kind: "list" | "send";
@@ -42,13 +51,14 @@ type PendingOperation = {
   messageID?: string;
   resolve(value: RosterPage | SendResult): void;
   reject(error: Error): void;
-  timer: NodeJS.Timeout;
+  deadline: ResponseDeadline;
   signal: AbortSignal;
   onAbort(): void;
 };
 
 type RosterClientOptions = {
   responseTimeoutMS?: number;
+  responseDeadlineFactory?: ResponseDeadlineFactory;
   settle?: () => Promise<void>;
   selfAddress?: string;
   deliverUserMessage?: (body: string) => void;
@@ -57,7 +67,8 @@ type RosterClientOptions = {
 /** Single-flight operation and inbound-delivery owner for one authenticated socket. */
 export class RosterClient {
   private readonly socket: WebSocket;
-  private readonly responseTimeoutMS: number;
+  private readonly responseTimeoutMS: number | undefined;
+  private readonly responseDeadlineFactory: ResponseDeadlineFactory;
   private readonly settle: () => Promise<void>;
   private readonly selfAddress: string | undefined;
   private readonly deliverUserMessage: ((body: string) => void) | undefined;
@@ -68,7 +79,8 @@ export class RosterClient {
 
   constructor(socket: WebSocket, options: RosterClientOptions = {}) {
     this.socket = socket;
-    this.responseTimeoutMS = options.responseTimeoutMS ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+    this.responseTimeoutMS = options.responseTimeoutMS;
+    this.responseDeadlineFactory = options.responseDeadlineFactory ?? startResponseDeadline;
     this.settle = options.settle ?? (() => terminateAndWait(socket));
     this.selfAddress = options.selfAddress;
     this.deliverUserMessage = options.deliverUserMessage;
@@ -150,11 +162,37 @@ export class RosterClient {
 
     return new Promise<RosterPage | SendResult>((resolve, reject) => {
       const onAbort = () => void this.failTerminal(this.operationError(kind, "aborted"));
-      const timer = setTimeout(() => {
-        void this.failTerminal(this.operationError(kind, "timeout"));
-      }, this.responseTimeoutMS);
-      this.pending = { kind, requestID, messageID, resolve, reject, timer, signal, onAbort };
+      const pending: PendingOperation = {
+        kind,
+        requestID,
+        messageID,
+        resolve,
+        reject,
+        deadline: { cancel: () => undefined },
+        signal,
+        onAbort,
+      };
+      this.pending = pending;
       signal.addEventListener("abort", onAbort, { once: true });
+
+      const timeoutMS = this.responseTimeoutMS ?? (kind === "list"
+        ? DEFAULT_LIST_RESPONSE_TIMEOUT_MS
+        : DEFAULT_SEND_RESPONSE_TIMEOUT_MS);
+      let deadline: ResponseDeadline;
+      try {
+        deadline = this.responseDeadlineFactory(() => {
+          void this.failTerminal(this.operationError(kind, "timeout"));
+        }, timeoutMS);
+        if (!deadline || typeof deadline.cancel !== "function") throw new Error("invalid response deadline");
+      } catch {
+        void this.failTerminal(this.operationError(kind, "disconnected"));
+        return;
+      }
+      if (this.pending !== pending) {
+        cancelResponseDeadline(deadline);
+        return;
+      }
+      pending.deadline = deadline;
       void this.write(frame).catch(() => {
         void this.failTerminal(this.operationError(kind, "disconnected"));
       });
@@ -264,7 +302,7 @@ export class RosterClient {
   private clearPending(): void {
     const pending = this.pending;
     if (!pending) return;
-    clearTimeout(pending.timer);
+    cancelResponseDeadline(pending.deadline);
     pending.signal.removeEventListener("abort", pending.onAbort);
     this.pending = undefined;
   }
@@ -376,8 +414,9 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
     return { message_id: messageID, status: "received" };
   }
   if (hasExactKeys(payload, ["message_id", "status", "reason"]) &&
-      payload.status === "timeout" && payload.reason === "offline") {
-    return { message_id: messageID, status: "timeout", reason: "offline" };
+      payload.status === "timeout" &&
+      (payload.reason === "offline" || payload.reason === "ack_timeout")) {
+    return { message_id: messageID, status: "timeout", reason: payload.reason };
   }
   throw new Error("invalid send result payload");
 }
@@ -515,6 +554,19 @@ function assertUnambiguousJSON(text: string): void {
   value(1);
   whitespace();
   if (cursor !== text.length) throw new Error("trailing JSON");
+}
+
+function cancelResponseDeadline(deadline: ResponseDeadline): void {
+  try {
+    deadline.cancel();
+  } catch {
+    // Deadline cleanup must not replace the operation's stable terminal result.
+  }
+}
+
+function startResponseDeadline(expire: () => void, durationMS: number): ResponseDeadline {
+  const timer = setTimeout(expire, durationMS);
+  return { cancel: () => clearTimeout(timer) };
 }
 
 function terminateAndWait(socket: WebSocket): Promise<void> {

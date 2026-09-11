@@ -37,18 +37,28 @@ type pendingDelivery struct {
 	cancelled    chan struct{}
 }
 
+type deliveryDeadline struct {
+	expired <-chan time.Time
+	stop    func() bool
+}
+
 type deliveryDispatcher struct {
-	registry *sessionConnectionRegistry
-	roster   operationDispatcher
-	mu       sync.Mutex
-	pending  map[string]*pendingDelivery
+	registry        *sessionConnectionRegistry
+	roster          operationDispatcher
+	deadlineFactory func(time.Duration) deliveryDeadline
+	mu              sync.Mutex
+	pending         map[string]*pendingDelivery
 }
 
 func newDeliveryDispatcher(registry *sessionConnectionRegistry) *deliveryDispatcher {
 	dispatcher := &deliveryDispatcher{
 		registry: registry,
 		roster:   rosterOperationDispatcher(registry),
-		pending:  make(map[string]*pendingDelivery),
+		deadlineFactory: func(duration time.Duration) deliveryDeadline {
+			timer := time.NewTimer(duration)
+			return deliveryDeadline{expired: timer.C, stop: timer.Stop}
+		},
+		pending: make(map[string]*pendingDelivery),
 	}
 	registry.onSessionUnavailable = dispatcher.cancelRecipient
 	return dispatcher
@@ -115,12 +125,14 @@ func (dispatcher *deliveryDispatcher) send(
 	dispatcher.pending[deliveryID] = pending
 	dispatcher.unlock()
 
-	remove := func() {
+	remove := func() bool {
 		dispatcher.lock()
-		if dispatcher.pending[deliveryID] == pending {
-			delete(dispatcher.pending, deliveryID)
+		defer dispatcher.unlock()
+		if dispatcher.pending[deliveryID] != pending {
+			return false
 		}
-		dispatcher.unlock()
+		delete(dispatcher.pending, deliveryID)
+		return true
 	}
 
 	frame, err := json.Marshal(messageEnvelope{
@@ -153,10 +165,7 @@ func (dispatcher *deliveryDispatcher) send(
 		return operationResponse{}, false, nil
 	}
 
-	timer := time.NewTimer(deliveryACKCeiling)
-	defer timer.Stop()
-	select {
-	case <-pending.acknowledged:
+	received := func() (operationResponse, bool, error) {
 		return operationResponse{
 			Type:           "send_result",
 			Payload:        sendResultPayload{MessageID: operation.Send.MessageID, Status: "received"},
@@ -168,20 +177,52 @@ func (dispatcher *deliveryDispatcher) send(
 			RecipientRoute: recipient.Address,
 			Status:         "received",
 		}, true, nil
+	}
+	claimedOutcome := func() (operationResponse, bool, error) {
+		select {
+		case <-pending.acknowledged:
+			return received()
+		case <-pending.cancelled:
+			return operationResponse{}, false, nil
+		}
+	}
+
+	deadline := dispatcher.deadlineFactory(deliveryACKCeiling)
+	defer deadline.stop()
+	select {
+	case <-pending.acknowledged:
+		return received()
 	case <-pending.cancelled:
-		remove()
 		return operationResponse{}, false, nil
 	case <-dispatcher.registry.closingSignal():
-		remove()
-		return operationResponse{}, false, nil
+		if remove() {
+			return operationResponse{}, false, nil
+		}
+		return claimedOutcome()
 	case <-ctx.Done():
-		remove()
-		return operationResponse{}, false, nil
-	case <-timer.C:
-		// Ticket #19 owns the externally visible ack_timeout result. The internal
-		// ceiling already releases capacity and makes a late ACK harmless.
-		remove()
-		return operationResponse{}, false, nil
+		if remove() {
+			return operationResponse{}, false, nil
+		}
+		return claimedOutcome()
+	case <-deadline.expired:
+		if !remove() {
+			return claimedOutcome()
+		}
+		return operationResponse{
+			Type: "send_result",
+			Payload: sendResultPayload{
+				MessageID: operation.Send.MessageID,
+				Status:    "timeout",
+				Reason:    "ack_timeout",
+			},
+			Outcome:        "settled",
+			Code:           "ack_timeout",
+			MessageID:      operation.Send.MessageID,
+			DeliveryID:     deliveryID,
+			SenderRoute:    sender.Address,
+			RecipientRoute: recipient.Address,
+			Status:         "timeout",
+		}, true, nil
 	}
 }
 
