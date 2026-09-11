@@ -233,6 +233,42 @@ test("abort, timeout, and socket close reject in-flight list and settle resource
   }
 });
 
+test("send rejects malformed reply correlation locally without consuming the socket", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+  const outbound: string[] = [];
+  const privateBodyMarker = "malformed-re-private-body-7d9219f4-must-stay-local";
+  pair.server.on("message", (data) => outbound.push(data.toString("utf8")));
+
+  for (const re of [
+    "hostile-malformed-re",
+    "01993C80-40DE-79D7-9B2C-1349F88BB408",
+    "01993c80-40de-49d7-9b2c-1349f88bb408",
+    "01993c80-40de-79d7-7b2c-1349f88bb408",
+  ]) {
+    await assert.rejects(
+      client.send("opaque-destination", privateBodyMarker, re, new AbortController().signal),
+      (error: unknown) => {
+        assert.ok(error instanceof RosterRequestError);
+        assert.equal(error.reason, "invalid_arguments");
+        assert.equal(error.message, "Relay agent_send arguments are invalid.");
+        assert.equal(error.message.includes(re), false);
+        assert.equal(error.message.includes(privateBodyMarker), false);
+        return true;
+      },
+    );
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(outbound, []);
+
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.list(undefined, new AbortController().signal);
+  const request = await requestPromise;
+  pair.server.send(roster(String(request.request_id), { peers: [] }));
+  assert.deepEqual(await resultPromise, { peers: [] });
+});
+
 test("send generates internal IDs and accepts only exact correlated send_result", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);

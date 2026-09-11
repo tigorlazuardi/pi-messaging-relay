@@ -228,15 +228,13 @@ test("configured key with missing endpoint rejects startup before WebSocket crea
   assert.deepEqual(host.sendUserMessageAttempts, []);
 });
 
-test("publishes closed tool schemas matching the accepted model intents", { concurrency: false }, async () => {
+test("publishes the closed list_peers schema", { concurrency: false }, async () => {
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
   relayExtension(host.api as never);
 
   const listSchema = host.tools.get("list_peers")?.parameters;
-  const sendSchema = host.tools.get("agent_send")?.parameters;
   assert.ok(listSchema);
-  assert.ok(sendSchema);
 
   const maximumCursor = `cur_${Buffer.from("a".repeat(4_389), "utf8").toString("base64url")}`;
   assert.equal(maximumCursor.length, 5_856);
@@ -249,6 +247,22 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   assert.equal(Value.Check(listSchema as never, { cursor: `${maximumCursor}a` }), false);
   assert.equal(Value.Check(listSchema as never, { cursor: 12 }), false);
   assert.equal(Value.Check(listSchema as never, { unexpected: true }), false);
+});
+
+test("publishes only to, body, and optional canonical reply correlation for agent_send", { concurrency: false }, async () => {
+  const host = new FakePiHost();
+  const relayExtension = await loadRelayExtension();
+  relayExtension(host.api as never);
+
+  const sendSchema = host.tools.get("agent_send")?.parameters as {
+    properties?: Record<string, unknown>;
+    required?: string[];
+    additionalProperties?: boolean;
+  } | undefined;
+  assert.ok(sendSchema);
+  assert.deepEqual(Object.keys(sendSchema.properties ?? {}), ["to", "body", "re"]);
+  assert.deepEqual(sendSchema.required, ["to", "body"]);
+  assert.equal(sendSchema.additionalProperties, false);
 
   const stringSend = {
     to: "/srv/backend@host#route-id",
@@ -261,10 +275,24 @@ test("publishes closed tool schemas matching the accepted model intents", { conc
   };
   assert.equal(Value.Check(sendSchema as never, stringSend), true);
   assert.equal(Value.Check(sendSchema as never, objectSend), true);
-  assert.equal(Value.Check(sendSchema as never, { ...stringSend, message_id: "client-id" }), false);
-  assert.equal(Value.Check(sendSchema as never, { ...stringSend, re: "not-a-uuidv7" }), false);
-  assert.equal(Value.Check(sendSchema as never, { ...stringSend, deliverAs: "steer" }), false);
-  assert.equal(Value.Check(sendSchema as never, { ...stringSend, delivery_mode: "followUp" }), false);
+  for (const re of [
+    "not-a-uuidv7",
+    "01993C80-40DE-79D7-9B2C-1349F88BB408",
+    "01993c80-40de-49d7-9b2c-1349f88bb408",
+    "01993c80-40de-79d7-7b2c-1349f88bb408",
+  ]) {
+    assert.equal(Value.Check(sendSchema as never, { ...stringSend, re }), false);
+  }
+  for (const extra of [
+    { message_id: "01993c80-40de-79d7-9b2c-1349f88bb408" },
+    { request_id: "01993c80-40de-79d7-9b2c-1349f88bb408" },
+    { delivery_id: "01993c80-40de-79d7-9b2c-1349f88bb408" },
+    { mode: "reply" },
+    { deliverAs: "steer" },
+    { delivery_mode: "followUp" },
+  ]) {
+    assert.equal(Value.Check(sendSchema as never, { ...stringSend, ...extra }), false);
+  }
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: ["not", "an", "object"] }), false);
   assert.equal(Value.Check(sendSchema as never, { to: "", body: "message" }), false);
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: null }), false);

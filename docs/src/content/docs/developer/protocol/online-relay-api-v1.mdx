@@ -1,6 +1,6 @@
 ---
 title: Online relay API v1
-description: Accepted client/server contract for authenticated pairing, online presence, unicast delivery, replies, and reconnect failures.
+description: Accepted client/server contract for authenticated pairing, online presence, and successful unicast delivery with correlated replies.
 status: accepted
 date: 2026-09-08
 ---
@@ -46,7 +46,7 @@ Every WebSocket text frame is one JSON object:
 - `type` comes from a closed operation set.
 - `request_id` is a sender-generated UUIDv7 used only to correlate one request and response. Server-pushed events may omit it.
 - `payload` is an object whose schema depends on `type`.
-- `message_id` identifies a logical message across retry and reply correlation. It is not a request ID.
+- `message_id` identifies a logical message and supports reply correlation. It is not a request ID.
 - `delivery_id` identifies one server offer to a recipient and is used only for the recipient extension ACK.
 - `body` is either a string or a JSON object. The recipient extension converts an object to canonical compact JSON before Pi injection.
 
@@ -366,8 +366,14 @@ sequenceDiagram
     R->>SE: send_result(received)
     SE->>SA: received
     Note over RP: Later turn; task completion is not guaranteed
-    RP->>RE: agent_send(to=original from, re=original message_id)
+    RP->>RE: ordinary agent_send(to=original from, re=original message_id)
+    RE->>RE: generate fresh request_id and message_id
     RE->>R: send(new message_id, re=original message_id)
+    R->>SE: message(new delivery_id, new message_id, re=original message_id)
+    SE->>SA: sendUserMessage(rendered reply)
+    SE->>R: received(new delivery_id, new message_id)
+    R->>RE: independent send_result(received)
+    RE->>RP: received for new message_id
 ```
 
 <Decision title="Define received at the extension boundary" status="accepted">
@@ -379,9 +385,11 @@ When Pi is busy, the extension always uses `deliverAs: "followUp"`. A sender can
 </Decision>
 
 <Aside type="note" title="Implementation boundary">
-Tickets #14–#16 implement successful string and object delivery: extension-generated request and message IDs, exact opaque-address routing to a published authenticated session, server-generated delivery ID, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact one-argument idle injection, exact busy `{ deliverAs: "followUp" }` injection, exact recipient ACK authorization, and correlated `received`. No sender field can select delivery mode or steer current work. Replies (#17), offline/ACK-timeout/recipient-disconnect results (#18–#20), sender-disconnect assertions (#21), retry/dedupe (#22–#23), 256 KiB body denial (#24), and 128-send pipelining (#25) remain incomplete.
+Tickets #14–#17 implement successful string and object delivery plus correlated replies through the same ordinary send path: extension-generated request and message IDs, exact opaque-address routing to a published authenticated session, server-generated delivery ID, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact one-argument idle injection, exact busy `{ deliverAs: "followUp" }` injection, exact recipient ACK authorization, and independently correlated `received` results. The reply destination and `re` value are copied from the original injected provenance; no sender field can select a generated ID, delivery mode, or steering.
 
-The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs fail content-free before IDs or socket work. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
+A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. Offline/ACK-timeout/recipient-disconnect results (#18–#20), sender-disconnect assertions (#21), retry/dedupe (#22–#23), 256 KiB body denial (#24), and 128-send pipelining (#25) remain incomplete.
+
+The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs and malformed `re` values fail content-free before IDs or socket work. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
 </Aside>
 
 ### I/O examples
@@ -466,7 +474,7 @@ The local extension accepts safe string or JSON-object bodies under its closed t
   </TabItem>
 </Tabs>
 
-A reply uses `send` with a new extension-generated `message_id`; `re` contains the original message ID. It receives an independent `send_result`. The model cannot supply `message_id`; an internal bounded transport retry reuses the generated ID.
+A reply uses the same ordinary `agent_send({ to, body, re })` and wire `send` operations. The receiving agent copies `to` from the original header's complete JSON-quoted `from` value and copies `re` from its `id`. The extension generates a fresh request ID and reply `message_id`; the relay generates a fresh delivery ID. The reply ACK and `send_result` settle only that reply call, independently of the original result. The model cannot supply any of those generated IDs. There is no automatic reply, special reply operation, server message-history lookup, or guarantee of completion or another reply. `re` carries correlation only and grants no routing authority. Internal retry remains deferred to ticket #22.
 
 The recipient injects one user message with this exact shape:
 
@@ -475,95 +483,26 @@ The recipient injects one user message with this exact shape:
 <body>
 ```
 
-The `re` segment exists only when a valid supplied UUIDv7 is present. This rendering acceptance does not implement the correlated reply workflow in ticket #17. The full opaque sender address is JSON-quoted, then any raw U+0085, U+2028, and U+2029 are emitted as exact lowercase `\\u0085`, `\\u2028`, and `\\u2029`, preserving the opaque value and one physical header line. Ordinary addresses show double quotes; embedded quote, backslash, control, and newline characters are escaped so the provenance stays on one header line. Exactly one LF separates header and body.
+The `re` segment exists only when a valid supplied UUIDv7 is present. Ticket #17 verifies that a recipient can copy the displayed `from` and `id` into a second ordinary send and receive an independently correlated result. The full opaque sender address is JSON-quoted, then any raw U+0085, U+2028, and U+2029 are emitted as exact lowercase `\\u0085`, `\\u2028`, and `\\u2029`, preserving the opaque value and one physical header line. Ordinary addresses show double quotes; embedded quote, backslash, control, and newline characters are escaped so the provenance stays on one header line. Exactly one LF separates header and body.
 
 String bodies follow that LF unchanged, with no trim or normalization. Object bodies use a project-specific canonical compact encoder. At every object depth it sorts own enumerable string keys by ECMAScript lexical comparison of UTF-16 code units and emits entries directly in that order; integer-like keys are therefore lexical (`"10"` before `"2"`) rather than JavaScript property-enumeration order. Arrays preserve order. Null, booleans, finite numbers, and strings use deterministic `JSON.stringify` primitive representations. No whitespace is added. This algorithm is not claimed to implement RFC 8785 or JCS.
 
-## Failure and reconnect flow
+## Current delivery failure boundary
 
-```mermaid
-flowchart TD
-    S[Sender submits send] --> V{Envelope valid and authorized?}
-    V -->|no| D[send_result denied]
-    V -->|yes| L{Recipient route connected?}
-    L -->|no| O[send_result timeout / offline]
-    L -->|yes| P[Server pushes message and starts ACK deadline]
-    P --> A{received ACK arrives?}
-    A -->|yes| R[send_result received]
-    A -->|deadline expires| T[send_result timeout]
-    A -->|recipient disconnects| T
-    T --> C[Pending entry removed]
-    C --> N[Recipient reconnects with same persisted route ID]
-    N --> W[Server returns same opaque session address]
-    W --> E[No automatic message replay]
-```
+The only finalized sender outcome for delivery is the successful path documented above: the intended recipient extension sends the exact `received` acknowledgment and the relay returns the correlated `send_result` with `status: "received"`.
 
-Reconnect uses exponential backoff with jitter and a cap. The same Pi session reclaims its address; a new or forked session receives a new address. Pending messages are never replayed automatically after server restart.
+Offline delivery (#18), ACK expiry (#19), and recipient disconnect (#20) do not yet produce a final machine-readable `send_result`. The relay releases retained work after its exact five-second ACK ceiling and may release it earlier when the recipient disconnects or the server shuts down; expiry itself returns no sender result. The sender extension waits its own exact five-second response deadline, then rejects the local call with `Relay agent_send response timed out.` and closes the retained socket.
 
-Fixed v1 ceilings are a 256 KiB body, 512 KiB frame, 5-second ACK deadline, 128 pending sends per sender connection, 1,024 dedupe message IDs per recipient session, and a single-use pairing code whose exact 10-minute deadline is the first expired instant.
+The currently enforced shared ceilings are:
 
-### I/O examples
+- 512 KiB for each complete reassembled WebSocket message before JSON decoding;
+- 64 nested object or array containers, counting the outer envelope as depth 1;
+- 4,389 UTF-8 bytes for an opaque address;
+- exactly five seconds for both the relay's pending ACK wait and the extension's independent response wait;
+- 1,024 tracked server connections; and
+- one use and exactly ten minutes for a pairing code, with the deadline itself expired.
 
-<Tabs>
-  <TabItem label="Denied">
-    ```json
-    {
-      "v": 1,
-      "type": "send_result",
-      "request_id": "01993c8b-09ee-7747-af31-a0cbd269a2c3",
-      "payload": {
-        "message_id": "01993c8b-5150-799e-87dd-263bbdbc3441",
-        "status": "denied",
-        "reason": "not_authorized"
-      }
-    }
-    ```
-  </TabItem>
-  <TabItem label="Offline">
-    ```json
-    {
-      "v": 1,
-      "type": "send_result",
-      "request_id": "01993c8c-13df-747d-9cb5-28dd313c0261",
-      "payload": {
-        "message_id": "01993c8c-839b-76c7-a554-d6d0c6233692",
-        "status": "timeout",
-        "reason": "offline"
-      }
-    }
-    ```
-  </TabItem>
-  <TabItem label="ACK timeout">
-    ```json
-    {
-      "v": 1,
-      "type": "send_result",
-      "request_id": "01993c8d-b0df-793e-a06a-a66fd74eb7d3",
-      "payload": {
-        "message_id": "01993c8d-e68e-77b2-80fc-c53ddb9a4feb",
-        "status": "timeout",
-        "reason": "ack_timeout"
-      }
-    }
-    ```
-  </TabItem>
-  <TabItem label="ID conflict">
-    ```json
-    {
-      "v": 1,
-      "type": "send_result",
-      "request_id": "01993c8f-9719-7c29-89ac-6233d701ba39",
-      "payload": {
-        "message_id": "01993c8d-e68e-77b2-80fc-c53ddb9a4feb",
-        "status": "denied",
-        "reason": "message_id_conflict"
-      }
-    }
-    ```
-  </TabItem>
-</Tabs>
-
-A duplicate `message_id` with an identical immutable envelope is idempotent and returns the already known result when available. Reusing it with different `to`, `re`, or `body` is denied as `message_id_conflict`.
+Sender-disconnect assertions (#21), retry and idempotence (#22), dedupe behavior (#23), the distinct 256 KiB body rule (#24), 128-send pipelining (#25), reconnect (#26), restart authentication (#27), replay behavior (#28), and additional diagnostics (#29) remain deferred. This version publishes no I/O shape or runtime guarantee for those seams.
 
 ## Operational evidence
 
@@ -604,9 +543,8 @@ A `received` result remains an extension-boundary acknowledgment only. Reload, c
 ## Implementation requirements derived from the contract
 
 1. Keep model access limited to `list_peers` and `agent_send`.
-2. Reject malformed, unauthenticated, oversized, and conflicting-ID input at the trust boundary.
+2. Reject malformed, unauthenticated, and oversized input at the trust boundary.
 3. Keep allowlisted client identity separate from ephemeral online session routing.
-4. Bound pending sends, ACK waits, and dedupe memory using the fixed v1 ceilings.
+4. Bound currently implemented pending sends and ACK waits using the enforced ceilings.
 5. Redact message bodies and all authentication material from logs.
-6. Test each documented happy path and stable failure reason at the wire boundary.
-7. Preserve the same route address across reconnect without replaying messages.
+6. Test each documented current happy path and implemented stable failure at the wire boundary.

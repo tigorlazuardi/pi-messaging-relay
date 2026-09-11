@@ -1,6 +1,6 @@
 ---
 title: Authenticated message delivery
-description: How online string and object delivery renders deterministic provenance, preserves busy recipient work, and acknowledges the Pi attempt.
+description: How ordinary online sends and correlated replies render provenance, preserve busy work, and settle independently at the Pi boundary.
 status: accepted
 date: 2026-09-11
 ---
@@ -47,6 +47,43 @@ Delivery mode is recipient-local. Sender input remains the closed `to`, `body`, 
 
 Only an ACK from the exact recipient session with both exact IDs removes and settles pending work. Unknown, late, wrong-session, wrong-delivery, and wrong-message ACKs produce no response, do not settle a sender, and leave a healthy connection usable.
 
+## Correlated reply flow and state
+
+```mermaid
+sequenceDiagram
+    participant A as Original sender Pi
+    participant AE as Original sender extension
+    participant R as Relay
+    participant BE as Recipient extension
+    participant B as Recipient Pi
+    A->>AE: agent_send(to=B, body)
+    AE->>R: send(original request_id, original message_id)
+    R->>BE: message(original delivery_id, from=A, id=original)
+    BE->>B: inject header with quoted from and id
+    B->>BE: ordinary agent_send(to=copied from, re=copied id, body=reply)
+    BE->>R: send(fresh request_id, fresh message_id, re=original)
+    R->>AE: message(fresh delivery_id, id=fresh, re=original)
+    AE->>A: inject reply header and body
+    AE->>R: received(fresh delivery_id, fresh message_id)
+    R->>BE: send_result(fresh message_id, received)
+```
+
+The recipient agent uses the same `agent_send` tool as any other sender. It copies the complete decoded opaque value displayed after `from` into `to`, and copies the displayed `id` into `re`. The model supplies no reply message ID, request ID, delivery ID, operation mode, or role. The extension validates `re` as a canonical lowercase UUIDv7 before creating IDs or consuming the socket, then generates a new request ID and message ID. The relay authorizes only against the authenticated sending session and exact currently published destination; it does not search retained history or verify that `re` names an earlier message.
+
+| State owner | Original send | Reply send |
+| --- | --- | --- |
+| Extension request correlation | Original generated request ID | Fresh generated request ID |
+| Logical message | Original generated message ID | Fresh generated message ID, with `re=original message ID` |
+| Relay offer | Original generated delivery ID | Fresh generated delivery ID |
+| Recipient ACK | Settles only original pending offer | Settles only reply pending offer |
+| Model-visible result | Original call's result | Independent reply call's result |
+
+<Decision title="Treat re as correlation metadata, never authorization or history proof" status="accepted">
+`re` changes only the rendered correlation header and immutable send envelope. It grants no authority, triggers no automatic reply, and proves neither that an original message exists nor that any model completed work. A successful reply `received` result does not guarantee completion or a further reply.
+</Decision>
+
+Ticket #17 verifies only the successful independent `received` path. Final machine-readable reply outcomes for an offline destination, ACK expiry, or recipient disconnect remain deferred to tickets #18–#20.
+
 ## Deterministic provenance rendering
 
 The exact injected form without correlation is:
@@ -56,7 +93,7 @@ The exact injected form without correlation is:
 <body>
 ```
 
-When a valid `re` value is supplied, `, re=<original-id>` appears after the message ID. Rendering `re` does not implement the correlated reply workflow; ticket #17 still owns creation and independent settlement of a new reply message.
+When a valid `re` value is supplied, `, re=<original-id>` appears after the fresh message ID. Ticket #17 verifies creation and independent settlement of that ordinary correlated reply.
 
 <Decision title="Quote the complete opaque sender as one JSON string" status="accepted">
 The renderer applies the platform's deterministic `JSON.stringify` string quoting to the complete sender address, then additionally escapes raw U+0085, U+2028, and U+2029 as `\\u0085`, `\\u2028`, and `\\u2029` before inserting the result after `from `. Ordinary addresses therefore appear inside double quotes. Embedded quote, backslash, control characters—including newline—and Unicode line separators cannot create another provenance line. No address component is parsed or rewritten.
@@ -75,10 +112,10 @@ One retained extension socket owns both `list_peers` and `agent_send` operations
 Complete frames are bounded to 512 KiB, JSON nesting to 64 containers, addresses to 4,389 UTF-8 bytes, and the pending ACK wait to five seconds. Canonical encoding requires an explicit UTF-8 byte budget derived from the complete send-frame overhead, accounts tokens incrementally without building output beyond that budget, and rejects impossible array lengths before any length-sized work. The recipient uses the same general transport ceiling for canonical rendering; ticket #24 still owns a distinct 256 KiB body rule. Abort, timeout, malformed or wrongly correlated response, unsolicited response, and close settle extension listeners and timers; ambiguity force-settles the socket. The server has at most one actively dispatched send per connection under this seam and no more than 1,024 tracked connections, so pending memory and waiters remain bounded. Pending bodies are memory-only and are never persisted, replayed, or logged.
 
 <Aside type="caution" title="Interim incomplete failures">
-Ticket #18 owns the offline sender result, #19 owns `ack_timeout`, #20 owns recipient-disconnected settlement, and #21 owns immediate sender-disconnect cleanup assertions. Until those tickets land, these paths may end without `send_result`; the extension's five-second response deadline then closes its socket. The relay still removes pending work at its five-second ceiling, on recipient removal, or on shutdown. There is no retry (#22), 256 KiB body rejection (#24), or 128-send pipelining (#25).
+Ticket #18 owns the offline sender result, #19 owns the ACK-expiry result, #20 owns recipient-disconnected settlement, and #21 owns immediate sender-disconnect cleanup assertions. Until those tickets land, these paths may end without `send_result`; the extension's exact five-second response deadline then closes its socket. The relay still removes pending work at its exact five-second ACK ceiling, on recipient removal, or on shutdown, but ACK expiry itself returns no sender result. Retry and idempotence (#22), dedupe (#23), the distinct 256 KiB body rule (#24), 128-send pipelining (#25), reconnect (#26), restart authentication (#27), replay behavior (#28), and additional diagnostics (#29) are also deferred.
 </Aside>
 
-Busy follow-up routing is implemented by #15. Ticket #16 adds this provenance and object-rendering boundary. A safe local object is encoded canonically before the send frame is created; the server forwards the accepted object body as the same JSON value without interpreting or rebuilding it; and the recipient canonicalizes it for Pi text injection. Optional valid `re` is rendered, but reply behavior remains #17. No string body, object content, or rendered provenance header enters an error or log.
+Busy follow-up routing is implemented by #15. Ticket #16 adds provenance and object rendering; #17 proves the existing ordinary send path carries a correlated reply with fresh IDs and independent settlement. A safe local object is encoded canonically before the send frame is created; the server forwards the accepted object body as the same JSON value without interpreting or rebuilding it; and the recipient canonicalizes it for Pi text injection. No string body, object content, or rendered provenance header enters an error or log.
 
 ## Telemetry
 
@@ -111,6 +148,22 @@ One successful send produces one server-owned `send_settled` JSON event after th
   <TabItem label="Tool result">
     ```json
     {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"received"}
+    ```
+  </TabItem>
+  <TabItem label="Reply tool input">
+    ```json
+    {"to":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","body":{"answer":"Reviewed","ready":true},"re":"01993c84-fc2b-7e1c-af99-61b8118ac6df"}
+    ```
+  </TabItem>
+  <TabItem label="Reply recipient body">
+    ```text
+    [pi-messaging-relay] message from "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222" (id=01993c88-2bc4-7432-87e8-16ca3c324a3f, re=01993c84-fc2b-7e1c-af99-61b8118ac6df):
+    {"answer":"Reviewed","ready":true}
+    ```
+  </TabItem>
+  <TabItem label="Independent reply result">
+    ```json
+    {"message_id":"01993c88-2bc4-7432-87e8-16ca3c324a3f","status":"received"}
     ```
   </TabItem>
   <TabItem label="Settlement log">

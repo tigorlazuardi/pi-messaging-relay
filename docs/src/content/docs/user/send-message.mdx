@@ -1,6 +1,6 @@
 ---
 title: Send an online message
-description: Use agent_send for provenance-labelled string or JSON-object delivery that preserves a busy recipient's active work.
+description: Use ordinary agent_send calls for provenance-labelled messages and independently settled correlated replies.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -22,9 +22,26 @@ The extension creates the message ID. Do not add `message_id`, delivery options,
 `received` does not mean Pi persisted or queued the text, a model read it, work completed, or a reply will arrive. Relay restart, extension reload, process termination, or crash can lose downstream work.
 </Aside>
 
+## Reply using the provenance header
+
+An incoming message starts with a header like:
+
+```text
+[pi-messaging-relay] message from "/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111" (id=01993c84-fc2b-7e1c-af99-61b8118ac6df):
+```
+
+<Steps>
+1. Copy the complete quoted `from` value, decode the displayed JSON string, and use that whole opaque address as `to`.
+2. Copy the displayed `id` exactly and use it as `re`.
+3. Call the same ordinary `agent_send({ to, body, re })` tool. Do not add `message_id`, request/delivery IDs, modes, or role fields.
+4. Read the returned fresh `message_id` and status as the independent result for this reply only.
+</Steps>
+
+The extension generates a new reply message ID; it never reuses the original ID. The relay generates a new delivery ID and settles the reply independently from the original send. `re` is correlation metadata only: it does not authorize delivery, trigger a special reply operation, or prove that a retained original exists. The server performs no message-history or existence lookup. Replies are never automatic, and `received` guarantees neither completed work nor another reply.
+
 ## Current limits
 
-This release completes successful idle and busy string/object delivery with deterministic provenance. String bodies are unchanged after the one LF that separates the header. Object keys are sorted recursively by JavaScript UTF-16 lexical order, including integer-like names; arrays retain their order and output is compact JSON. Replies (#17) remain unavailable: supplying valid `re` renders correlation but does not create or guarantee a reply. Offline destinations (#18), missing ACKs (#19), and recipient disconnects (#20) do not yet return their final machine-readable results; after five seconds the sender extension times out and closes its relay socket. Automatic reconnect is not available.
+This release completes successful idle and busy string/object delivery with deterministic provenance, including ordinary correlated replies with fresh IDs and independent `received` results. String bodies are unchanged after the one LF that separates the header. Object keys are sorted recursively by JavaScript UTF-16 lexical order, including integer-like names; arrays retain their order and output is compact JSON. Offline destinations (#18), missing ACKs (#19), and recipient disconnects (#20) do not yet return their final machine-readable results; after five seconds the sender extension times out and closes its relay socket. Their accepted `denied`/`timeout` result shapes are not claimed as implemented by reply support. Automatic reconnect is not available.
 
 Only one `list_peers` or `agent_send` request may be active on one extension connection. A concurrent request fails locally without being queued. There is no transport retry, offline inbox, persistence, replay, broadcast, or delivery history. The final 256 KiB body rejection behavior belongs to #24; every complete transport frame is currently bounded to 512 KiB.
 
@@ -57,6 +74,22 @@ Only one `list_peers` or `agent_send` request may be active on one extension con
     {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"received"}
     ```
   </TabItem>
+  <TabItem label="Reply input copied from header">
+    ```json
+    {"to":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","body":{"answer":"Reviewed","ready":true},"re":"01993c84-fc2b-7e1c-af99-61b8118ac6df"}
+    ```
+  </TabItem>
+  <TabItem label="Reply injection">
+    ```text
+    [pi-messaging-relay] message from "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222" (id=01993c88-2bc4-7432-87e8-16ca3c324a3f, re=01993c84-fc2b-7e1c-af99-61b8118ac6df):
+    {"answer":"Reviewed","ready":true}
+    ```
+  </TabItem>
+  <TabItem label="Independent reply output">
+    ```json
+    {"message_id":"01993c88-2bc4-7432-87e8-16ca3c324a3f","status":"received"}
+    ```
+  </TabItem>
   <TabItem label="Concurrent local error">
     ```text
     Relay agent_send already has one request in flight.
@@ -77,4 +110,4 @@ Message bodies are not persisted or logged. Successful server telemetry includes
 - **Disconnected error:** pair and authenticate the installation, or start a new Pi session if the retained socket closed. Reconnect is deferred.
 - **Unsafe JSON object error:** use only JSON values in plain objects and dense arrays. Cycles, accessors, nonfinite numbers, `undefined`, bigint, symbols, functions, custom object prototypes, and malformed Unicode are rejected before transport without logging content.
 - **Concurrent request error:** wait for the current list or send operation to settle; no request was queued.
-- **Need proof of completion:** ask for a later ordinary reply after reply support lands. `received` is intentionally not proof of model work.
+- **Need proof of completion:** ask the recipient to send a later ordinary correlated reply. That reply is separate evidence, not a guarantee; either `received` result is intentionally not proof of model work.
