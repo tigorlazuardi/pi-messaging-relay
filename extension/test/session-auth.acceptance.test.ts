@@ -275,6 +275,7 @@ test("real WebSocket boundary authenticates paired extension and rejects unautho
       },
     });
     const rawAccepted = await nextServerEvent(output, "auth_accepted");
+    assert.equal(rawAccepted.request_id, displayValues.requestID);
     assert.equal(rawAccepted.client_id, pairAccepted.client_id);
     assert.equal(rawAccepted.cwd, displayValues.cwd);
     assert.equal(rawAccepted.hostname, displayValues.hostname);
@@ -301,6 +302,7 @@ test("real WebSocket boundary authenticates paired extension and rejects unautho
     assert.notEqual((await unknownClosePromise).code, 1000);
     const unknownRejected = await nextServerEvent(output, "auth_rejected");
     assert.equal(unknownRejected.reason, "not_authorized");
+    assert.equal(unknownRejected.request_id, unknownValues.requestID);
 
     const invalidRaw = await openChallenge(wsEndpoint);
     const invalidValues = {
@@ -320,6 +322,7 @@ test("real WebSocket boundary authenticates paired extension and rejects unautho
     await invalidClosePromise;
     const invalidRejected = await nextServerEvent(output, "auth_rejected");
     assert.equal(invalidRejected.reason, "not_authorized");
+    assert.equal(invalidRejected.request_id, invalidValues.requestID);
 
     assert.equal(new Set([validRaw.nonce, unknownRaw.nonce, invalidRaw.nonce]).size, 3);
     assert.equal(structuredEvents(logs.lines).some((event) =>

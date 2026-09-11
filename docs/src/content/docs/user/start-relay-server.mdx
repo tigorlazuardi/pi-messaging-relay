@@ -59,7 +59,7 @@ Linux path trust covers the complete absolute path, not only its last component.
 
 A well-formed incorrect, expired, or already used code receives the same `pairing_code_invalid` rejection and never adds an allowlist entry. The raw submitted code crosses only into the localhost request; the response omits it rather than echoing a redacted copy, while structured logs keep `pairing_code` and `private_key` as `<redacted>`. A wrong code does not consume the current code. Success consumes it and removes the code file. An expired file can remain until shutdown, but its contents no longer authorize pairing; stop and restart the relay with a new unused file path to obtain a fresh code.
 
-Every structured stdout or stderr event has a one-second delivery deadline, and every HTTP response write has a two-second deadline. A stopped log reader or non-reading local client therefore cannot retain request handling indefinitely. If stdout cannot record a settled pairing or authentication event, the process stops accepting work, drains for at most five seconds, attempts `server_failed` on stderr, and exits non-zero even when SIGINT or SIGTERM arrives concurrently. An identity already returned as accepted remains in explicit durable state; do not retry it as though acceptance had rolled back.
+Every structured stdout or stderr event has a one-second delivery deadline, and every HTTP response write has a two-second deadline. Normal server lifecycle, pairing, authentication, protocol, and settlement JSONL goes to stdout. Only fatal `server_failed` goes to server stderr. The Pi extension independently writes its JSONL diagnostics to the Pi process's stderr. A stopped log reader or non-reading local client therefore cannot retain request handling indefinitely. If stdout cannot record a settled pairing or authentication event, the process stops accepting work, drains for at most five seconds, attempts `server_failed` on stderr, and exits non-zero even when SIGINT or SIGTERM arrives concurrently. An identity already returned as accepted remains in explicit durable state; do not retry it as though acceptance had rolled back.
 
 `/v1/connect` reserves one of 1,024 tracked session slots before WebSocket upgrade, sends one fresh nonce, and requires signed authentication within five seconds. At capacity, it returns HTTP `503` without upgrading and emits `session_capacity_rejected`. Unknown keys and invalid signatures receive `not_authorized` and a policy close. An active duplicate route UUID or opaque address is rejected; authenticated entries bind the installation key and route UUID without parsing the address. Graceful shutdown force-closes and settles every reserved or upgraded socket before `server_stopped`.
 
@@ -74,6 +74,12 @@ For deduplication, each exact recipient session retains at most 1,024 settled `r
 The authenticated `list` payload is exactly `{}` for a fresh first page or `{"cursor":"..."}` for continuation. A cursor is `cur_` plus canonical unpadded Base64url of the previous page's last opaque address, up to 5,856 characters. Malformed, padded, noncanonical, invalid-UTF-8, duplicate, mistyped, unknown-field, and over-limit cursor input returns terminal `invalid_envelope`; cursor content never grants authorization. A valid request reads current authenticated sessions and returns a live lexicographic address-only page. Complete roster frames are capped at 49,152 bytes, and the server retains no pagination snapshot.
 
 Ponytail: event delivery is fixed to one second, pairing lifetime to ten minutes, pair requests to 4,096 bytes, authentication and recipient ACK to five seconds, the one extension retry trigger to four seconds from logical-operation start inside an eight-second send deadline, hello frames to 16 KiB, serialized JSON body values to 256 KiB, post-authentication messages to 512 KiB, roster frames to 48 KiB, cursors to 5,856 characters, retained settled IDs to 1,024 per exact recipient session, sender-current results to one per exact sender session, in-flight sends to 128 and response ownership to 256 per exact authenticated session, tracked sessions to 1,024, response writes to one second for authenticated WebSockets and two seconds for HTTP, and shutdown drain to five seconds.
+
+## Correlate diagnostics safely
+
+Start from the extension's `relay_send_settled.message_id`, authenticated `sender_route`, and requested `recipient_route`. Find the server stdout `send_settled` with that message ID; it adds the transport `request_id` and, when an offer existed, the server-generated `delivery_id`. Match route and public key through extension authentication/reconnect events and server `auth_accepted`; accepted and post-hello rejected server authentication events also retain the validated hello request ID when available. The extension intentionally does not expose send request or delivery IDs that its model-tool boundary does not own.
+
+Logs keep public keys, client IDs, complete opaque routes, cwd, hostname, and correlation IDs visible. They replace every emitted `pairing_code`, `nonce`, `signature`, `private_key`, and `body` with literal `<redacted>`. Do not attach the raw pairing file, installation PEM, transport captures, or message text to a support report. WebSocket ping/pong heartbeat control traffic is deliberately silent at normal log levels. Relay v1 has no OpenTelemetry, metrics, or traces. Full event schemas: [Structured relay diagnostics](../developer/relay/structured-diagnostics/).
 
 ## Select a port
 
@@ -103,8 +109,8 @@ Send SIGINT with <kbd>Ctrl</kbd>+<kbd>C</kbd>, or send SIGTERM from a process su
   </TabItem>
   <TabItem label="Startup output">
     ```json
-    {"level":"info","event":"server_ready","address":"127.0.0.1:8080","state_dir":"/home/operator/.local/state/pi-messaging-relay"}
-    {"level":"info","event":"pairing_code_created","pairing_code":"<redacted>","private_key":"<redacted>","expires_at":"2026-09-10T14:10:00Z"}
+    {"level":"info","event":"server_ready","address":"127.0.0.1:8080","state_dir":"/home/operator/.local/state/pi-messaging-relay","result":"ready"}
+    {"level":"info","event":"pairing_code_created","result":"created","pairing_code":"<redacted>","private_key":"<redacted>","expires_at":"2026-09-10T14:10:00Z"}
     ```
   </TabItem>
   <TabItem label="Failure output">

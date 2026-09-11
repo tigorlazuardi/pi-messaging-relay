@@ -21,7 +21,7 @@ import {
   RECONNECT_MAX_RETRIES,
   type ReconnectDeadline,
 } from "./internal/reconnect.ts";
-import { RosterRequestError } from "./internal/roster-client.ts";
+import { RosterRequestError, type SendResult } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
 
 const DISCONNECTED_ERROR =
@@ -85,15 +85,50 @@ class PairingError extends Error {
   }
 }
 
-function logFailure(operation: string, reason: string): void {
-  console.error(
-    JSON.stringify({
-      level: "warn",
-      event: "relay_operation_failed",
-      operation,
-      reason,
-    }),
-  );
+function emitDiagnostic(event: Record<string, unknown>): void {
+  try {
+    console.error(JSON.stringify(event));
+  } catch {
+    // Diagnostics must never replace lifecycle, transport, or model-tool ownership.
+  }
+}
+
+function logFailure(
+  operation: string,
+  reason: string,
+  fields: { recipientRoute?: string; body?: boolean; latencyMS?: number } = {},
+): void {
+  emitDiagnostic({
+    level: "warn",
+    event: "relay_operation_failed",
+    operation,
+    result: "failed",
+    reason,
+    ...(fields.recipientRoute ? { recipient_route: fields.recipientRoute } : {}),
+    ...(fields.body ? { body: REDACTED } : {}),
+    ...(fields.latencyMS === undefined ? {} : { latency_ms: fields.latencyMS }),
+  });
+}
+
+function logSendSettlement(
+  result: SendResult,
+  senderRoute: string,
+  recipientRoute: string,
+  latencyMS: number,
+): void {
+  emitDiagnostic({
+    level: result.status === "received" ? "info" : "warn",
+    event: "relay_send_settled",
+    operation: "agent_send",
+    result: "settled",
+    reason: "reason" in result ? result.reason : result.status,
+    message_id: result.message_id,
+    sender_route: senderRoute,
+    recipient_route: recipientRoute,
+    status: result.status,
+    body: REDACTED,
+    latency_ms: latencyMS,
+  });
 }
 
 function logPairing(
@@ -101,24 +136,22 @@ function logPairing(
   result: "accepted" | "rejected",
   fields: { reason?: string; clientPublicKey?: string; clientID?: string; latencyMS: number },
 ): void {
-  console.error(
-    JSON.stringify({
-      level,
-      event: result === "accepted" ? "relay_pair_accepted" : "relay_pair_rejected",
-      operation: "relay-pair",
-      result,
-      ...(fields.reason ? { reason: fields.reason } : {}),
-      pairing_code: REDACTED,
-      private_key: REDACTED,
-      ...(fields.clientPublicKey ? { client_public_key: fields.clientPublicKey } : {}),
-      ...(fields.clientID ? { client_id: fields.clientID } : {}),
-      latency_ms: fields.latencyMS,
-    }),
-  );
+  emitDiagnostic({
+    level,
+    event: result === "accepted" ? "relay_pair_accepted" : "relay_pair_rejected",
+    operation: "relay-pair",
+    result,
+    ...(fields.reason ? { reason: fields.reason } : {}),
+    pairing_code: REDACTED,
+    private_key: REDACTED,
+    ...(fields.clientPublicKey ? { client_public_key: fields.clientPublicKey } : {}),
+    ...(fields.clientID ? { client_id: fields.clientID } : {}),
+    latency_ms: fields.latencyMS,
+  });
 }
 
-function disconnected(operation: "list_peers" | "agent_send"): never {
-  logFailure(operation, "disconnected");
+function disconnected(operation: "list_peers" | "agent_send", body = false): never {
+  logFailure(operation, "disconnected", { body });
   throw new Error(DISCONNECTED_ERROR);
 }
 
@@ -565,18 +598,21 @@ export default function relayExtension(pi: ExtensionAPI): void {
   let pairingAttempted = false;
   let lifecycleGeneration = 0;
   let retryIndex = 0;
+  let reconnectExhausted = false;
   let retryDeadline: { deadline: ReconnectDeadline } | undefined;
   let activeSessionIdle: (() => boolean) | undefined;
   let activeAttempt: SessionSocketAttempt | undefined;
   let activeTask: Promise<void> | undefined;
   let activeConnection: Awaited<SessionSocketAttempt["result"]> | undefined;
+  let sessionAddress: string | undefined;
+  let sessionClientPublicKey: string | undefined;
 
   const logAuthentication = (
     level: "info" | "warn",
     result: "accepted" | "rejected" | "disconnected",
     fields: { reason?: string; address?: string; routeID?: string; clientPublicKey?: string; latencyMS?: number },
   ) => {
-    console.error(JSON.stringify({
+    emitDiagnostic({
       level,
       event: result === "accepted"
         ? "relay_auth_accepted"
@@ -592,7 +628,36 @@ export default function relayExtension(pi: ExtensionAPI): void {
       signature: REDACTED,
       private_key: REDACTED,
       ...(fields.latencyMS === undefined ? {} : { latency_ms: fields.latencyMS }),
-    }));
+    });
+  };
+
+  const logReconnect = (
+    event: "relay_reconnect_scheduled" | "relay_reconnect_attempted" |
+      "relay_reconnect_succeeded" | "relay_reconnect_exhausted",
+    level: "info" | "warn",
+    result: "scheduled" | "attempted" | "connected" | "exhausted",
+    fields: {
+      reason?: string;
+      retryIndex: number;
+      delayMS?: number;
+      address?: string;
+      routeID: string;
+      clientPublicKey: string;
+      latencyMS?: number;
+    },
+  ): void => {
+    emitDiagnostic({
+      level,
+      event,
+      result,
+      ...(fields.reason ? { reason: fields.reason } : {}),
+      retry_index: fields.retryIndex,
+      ...(fields.delayMS === undefined ? {} : { delay_ms: fields.delayMS }),
+      ...(fields.address ? { address: fields.address } : {}),
+      route_id: fields.routeID,
+      client_public_key: fields.clientPublicKey,
+      ...(fields.latencyMS === undefined ? {} : { latency_ms: fields.latencyMS }),
+    });
   };
 
   const now = (): number => {
@@ -621,6 +686,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
   const launchConnection = async (
     identity: ConnectionIdentity,
     generation: number,
+    cause: { kind: "startup" | "pairing" } | { kind: "reconnect"; retryIndex: number },
   ): Promise<void> => {
     if (!isCurrent(generation, identity.routeID) || activeConnection) return;
     if (activeTask) {
@@ -629,6 +695,13 @@ export default function relayExtension(pi: ExtensionAPI): void {
       if (!isCurrent(generation, identity.routeID) || activeConnection || activeTask) return;
     }
 
+    if (cause.kind === "reconnect") {
+      logReconnect("relay_reconnect_attempted", "info", "attempted", {
+        retryIndex: cause.retryIndex,
+        routeID: identity.routeID,
+        clientPublicKey: identity.clientPublicKey,
+      });
+    }
     const operation = (async () => {
       let started: number;
       try {
@@ -660,7 +733,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
             clientPublicKey: identity.clientPublicKey,
           });
           if (wasCurrent && isCurrent(generation, identity.routeID)) {
-            scheduleRetry(identity, generation);
+            scheduleRetry(identity, generation, "session_disconnected");
           }
         },
       });
@@ -679,13 +752,25 @@ export default function relayExtension(pi: ExtensionAPI): void {
         const latencyMS = now() - started;
         activeConnection = connection;
         retained = true;
+        sessionAddress = connection.address;
         retryIndex = 0;
-        logAuthentication("info", "accepted", {
-          address: connection.address,
-          routeID: identity.routeID,
-          clientPublicKey: identity.clientPublicKey,
-          latencyMS,
-        });
+        reconnectExhausted = false;
+        if (cause.kind === "reconnect") {
+          logReconnect("relay_reconnect_succeeded", "info", "connected", {
+            retryIndex: cause.retryIndex,
+            address: connection.address,
+            routeID: identity.routeID,
+            clientPublicKey: identity.clientPublicKey,
+            latencyMS,
+          });
+        } else {
+          logAuthentication("info", "accepted", {
+            address: connection.address,
+            routeID: identity.routeID,
+            clientPublicKey: identity.clientPublicKey,
+            latencyMS,
+          });
+        }
       } catch (error) {
         if (!isCurrent(generation, identity.routeID)) return;
         const reason = error !== null && typeof error === "object" && "reason" in error &&
@@ -704,7 +789,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
           clientPublicKey: identity.clientPublicKey,
           latencyMS,
         });
-        scheduleRetry(identity, generation);
+        scheduleRetry(identity, generation, reason);
       } finally {
         if (activeAttempt === attempt) activeAttempt = undefined;
       }
@@ -717,15 +802,27 @@ export default function relayExtension(pi: ExtensionAPI): void {
     await trackedTask;
   };
 
-  function scheduleRetry(identity: ConnectionIdentity, generation: number): void {
-    if (!isCurrent(generation, identity.routeID) || activeConnection || retryDeadline ||
-        retryIndex >= RECONNECT_MAX_RETRIES) return;
+  function scheduleRetry(identity: ConnectionIdentity, generation: number, reason: string): void {
+    if (!isCurrent(generation, identity.routeID) || activeConnection || retryDeadline) return;
+    if (retryIndex >= RECONNECT_MAX_RETRIES) {
+      if (!reconnectExhausted) {
+        reconnectExhausted = true;
+        logReconnect("relay_reconnect_exhausted", "warn", "exhausted", {
+          reason,
+          retryIndex,
+          routeID: identity.routeID,
+          clientPublicKey: identity.clientPublicKey,
+        });
+      }
+      return;
+    }
     let delayMS: number;
     try {
       delayMS = reconnectDelayMS(retryIndex, reconnect.randomUnit);
     } catch {
       return;
     }
+    const scheduledRetryIndex = retryIndex + 1;
     retryIndex += 1;
 
     let deadline: ReconnectDeadline | undefined;
@@ -737,7 +834,10 @@ export default function relayExtension(pi: ExtensionAPI): void {
       }
       if (retryDeadline?.deadline !== deadline) return;
       retryDeadline = undefined;
-      void launchConnection(identity, generation).catch(() => undefined);
+      void launchConnection(identity, generation, {
+        kind: "reconnect",
+        retryIndex: scheduledRetryIndex,
+      }).catch(() => undefined);
     };
     try {
       deadline = reconnect.schedule(fire, delayMS);
@@ -745,8 +845,18 @@ export default function relayExtension(pi: ExtensionAPI): void {
     } catch {
       return;
     }
+    logReconnect("relay_reconnect_scheduled", "info", "scheduled", {
+      reason,
+      retryIndex: scheduledRetryIndex,
+      delayMS,
+      routeID: identity.routeID,
+      clientPublicKey: identity.clientPublicKey,
+    });
     if (firedSynchronously) {
-      void launchConnection(identity, generation).catch(() => undefined);
+      void launchConnection(identity, generation, {
+        kind: "reconnect",
+        retryIndex: scheduledRetryIndex,
+      }).catch(() => undefined);
       return;
     }
     retryDeadline = { deadline };
@@ -800,7 +910,11 @@ export default function relayExtension(pi: ExtensionAPI): void {
     if (!routeID || !cwd || !sessionIdle) return;
 
     cancelRetry();
-    if (cause === "pairing") retryIndex = 0;
+    if (cause === "pairing") {
+      retryIndex = 0;
+      reconnectExhausted = false;
+    }
+    sessionClientPublicKey = clientPublicKey;
     const identity = {
       endpoint,
       privateKey,
@@ -810,10 +924,14 @@ export default function relayExtension(pi: ExtensionAPI): void {
       hostname,
       sessionIdle,
     };
-    await launchConnection(identity, lifecycleGeneration);
+    await launchConnection(identity, lifecycleGeneration, { kind: cause });
   };
 
-  const stopSession = async (): Promise<void> => {
+  const stopSession = async (reportGraceful = false): Promise<void> => {
+    const wasStarted = sessionStarted;
+    const stoppedRouteID = sessionRouteID;
+    const stoppedAddress = sessionAddress;
+    const stoppedClientPublicKey = sessionClientPublicKey;
     sessionStarted = false;
     lifecycleGeneration += 1;
     activeSessionIdle = undefined;
@@ -825,14 +943,31 @@ export default function relayExtension(pi: ExtensionAPI): void {
     activeConnection = undefined;
     if (connection) await connection.closeAndWait();
     retryIndex = 0;
+    reconnectExhausted = false;
     sessionRouteID = undefined;
     sessionCWD = undefined;
+    sessionAddress = undefined;
+    sessionClientPublicKey = undefined;
+    if (reportGraceful && wasStarted) {
+      emitDiagnostic({
+        level: "info",
+        event: "relay_session_stopped",
+        result: "graceful",
+        ...(stoppedAddress ? { address: stoppedAddress } : {}),
+        ...(stoppedRouteID ? { route_id: stoppedRouteID } : {}),
+        ...(stoppedClientPublicKey ? { client_public_key: stoppedClientPublicKey } : {}),
+      });
+    }
   };
 
   pi.on("session_start", async (event, ctx) => {
     await stopSession();
     sessionStarted = true;
-    const reason = (event as { reason?: unknown }).reason;
+    const submittedReason = (event as { reason?: unknown }).reason;
+    const reason = typeof submittedReason === "string" &&
+        ["startup", "reload", "resume", "new", "fork"].includes(submittedReason)
+      ? submittedReason
+      : "unknown";
     const mayRetainRoute = reason === "startup" || reason === "reload" || reason === "resume";
     const retainedRouteID = mayRetainRoute
       ? retainedSessionRouteID(ctx as unknown as { sessionManager: { getEntries(): unknown[] } })
@@ -844,6 +979,13 @@ export default function relayExtension(pi: ExtensionAPI): void {
         route_id: sessionRouteID,
       });
     }
+    emitDiagnostic({
+      level: "info",
+      event: "relay_session_started",
+      result: "started",
+      reason,
+      route_id: sessionRouteID,
+    });
     sessionCWD = ctx.cwd;
     activeSessionIdle = () => ctx.isIdle();
     startupAttempted = false;
@@ -851,7 +993,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
     await connectOnce("startup");
   });
 
-  pi.on("session_shutdown", stopSession);
+  pi.on("session_shutdown", () => stopSession(true));
 
   pi.registerCommand("relay-pair", {
     description: "Pair this Pi installation with the configured relay server",
@@ -912,15 +1054,25 @@ export default function relayExtension(pi: ExtensionAPI): void {
     description: "Send a string or JSON object to one online Pi relay session",
     parameters: agentSendParameters,
     async execute(_toolCallID, params, signal) {
+      const started = Date.now();
       const input = params as {
-        to: string;
-        body: string | Record<string, unknown>;
-        re?: string;
+        to?: unknown;
+        body?: unknown;
+        re?: unknown;
       };
+      const destination = input.to;
+      const body = input.body;
+      const replyTo = input.re;
       const connection = activeConnection;
-      if (!connection) return disconnected("agent_send");
+      if (!connection) return disconnected("agent_send", true);
       try {
-        const result = await connection.send(input.to, input.body, input.re, signal as AbortSignal);
+        const result = await connection.send(
+          destination as string,
+          body as string | Record<string, unknown>,
+          replyTo as string | undefined,
+          signal as AbortSignal,
+        );
+        logSendSettlement(result, connection.address, destination as string, Date.now() - started);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           details: result,
@@ -929,6 +1081,11 @@ export default function relayExtension(pi: ExtensionAPI): void {
         logFailure(
           "agent_send",
           error instanceof RosterRequestError ? error.reason : "unexpected_failure",
+          {
+            recipientRoute: typeof destination === "string" ? destination : undefined,
+            body: true,
+            latencyMS: Date.now() - started,
+          },
         );
         throw error;
       }

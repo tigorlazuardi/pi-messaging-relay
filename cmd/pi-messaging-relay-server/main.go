@@ -283,6 +283,7 @@ func runWithContext(
 		Event:    "server_ready",
 		Address:  selectedAddress,
 		StateDir: state.path,
+		Result:   "ready",
 	}); err != nil {
 		_ = server.Close()
 		<-serveResult
@@ -291,6 +292,7 @@ func runWithContext(
 	if err := logger.write(logEvent{
 		Level:       "info",
 		Event:       "pairing_code_created",
+		Result:      "created",
 		PairingCode: redacted,
 		PrivateKey:  redacted,
 		ExpiresAt:   pairing.expiresAt.UTC().Format(time.RFC3339Nano),

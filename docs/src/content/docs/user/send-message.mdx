@@ -121,7 +121,7 @@ The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each
     ```text
     input serialized body: 262,145 UTF-8 bytes
     thrown error: Relay agent_send body exceeds 256 KiB.
-    log reason: body_too_large; body omitted
+    log reason: body_too_large; body: <redacted>
     ```
   </TabItem>
   <TabItem label="Raw-client denial">
@@ -169,7 +169,7 @@ The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each
 
 ## Security and troubleshooting
 
-Message bodies are not persisted or logged. Server telemetry includes public route, request, and message identifiers while the `body` field contains only `<redacted>`. Successful delivery also includes a delivery ID. Offline settlement includes `status: "timeout"`, `reason`/`code: "offline"`, and the exact requested destination, but no delivery ID. Raw-client body and sender-capacity denials include request/message IDs, sender route, `status: "denied"`, exact reason/code, and `body: "<redacted>"`, but no recipient route or delivery ID because nothing is looked up or forwarded. Recipient-disconnect and ACK-timeout settlements include the generated delivery ID, `status: "timeout"`, and exact `reason`/`code: "recipient_disconnected"` or `"ack_timeout"`; stale competing events emit no second settlement. Sender-abandoned work has no result or `send_settled`; use the existing `session_disconnected` event as lifecycle evidence.
+Message bodies are not persisted or logged. Server telemetry includes public route, request, and message identifiers while the `body` field contains only `<redacted>`. Successful delivery also includes a delivery ID. Offline settlement includes `status: "timeout"`, `reason`/`code: "offline"`, and the exact requested destination, but no delivery ID. Raw-client body and sender-capacity denials include request/message IDs, sender route, `status: "denied"`, exact reason/code, and `body: "<redacted>"`, but no recipient route or delivery ID because nothing is looked up or forwarded. Recipient-disconnect and ACK-timeout settlements include the generated delivery ID, `status: "timeout"`, and exact `reason`/`code: "recipient_disconnected"` or `"ack_timeout"`; stale competing events emit no second settlement. Sender-abandoned work has no result or `send_settled`; use the existing `session_disconnected` event as lifecycle evidence. The extension's `relay_send_settled` records its tool outcome with the retained authenticated sender route, message ID, and requested recipient route but omits server-owned request and delivery IDs. Match `message_id` and both routes to the authoritative server event for deeper diagnosis.
 
 - **Offline result:** refresh `list_peers` or choose another destination. The retained connection is still usable; retrying the same absent address does not create an inbox or history.
 - **Recipient-disconnected result:** the relay found the listed recipient but observed its exact session disappear or could not write the offer before ACK. Every affected pending slot is released once. The sender socket stays usable; a later recipient connection receives no old offer.

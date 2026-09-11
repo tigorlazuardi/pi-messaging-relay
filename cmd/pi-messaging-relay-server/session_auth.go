@@ -460,19 +460,25 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		Type:    "challenge",
 		Payload: challengePayload{Nonce: nonce},
 	}); err != nil {
-		service.logRejected("challenge_failed", started, "", "")
+		service.logRejected("challenge_failed", started, "", "", "")
 		return
 	}
 
 	hello, err := readHello(authContext, connection)
 	if err != nil {
-		service.logRejected("invalid_hello", started, "", "")
+		service.logRejected("invalid_hello", started, "", "", "")
 		_ = connection.CloseNow()
 		return
 	}
 	clientID, publicKey, authorized := service.pairing.authorizedKey(hello.Payload.ClientPublicKey)
 	if !authorized || !verifyHelloSignature(publicKey, nonce, hello) {
-		if !service.logRejected("not_authorized", started, hello.Payload.ClientPublicKey, hello.Payload.RouteID) {
+		if !service.logRejected(
+			"not_authorized",
+			started,
+			hello.Payload.ClientPublicKey,
+			hello.Payload.RouteID,
+			hello.RequestID,
+		) {
 			_ = connection.CloseNow()
 			return
 		}
@@ -495,7 +501,13 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		_ = connection.CloseNow()
 		return
 	case sessionRouteConflict:
-		service.logRejected("route_conflict", started, hello.Payload.ClientPublicKey, hello.Payload.RouteID)
+		service.logRejected(
+			"route_conflict",
+			started,
+			hello.Payload.ClientPublicKey,
+			hello.Payload.RouteID,
+			hello.RequestID,
+		)
 		_ = connection.CloseNow()
 		return
 	case sessionAuthenticated:
@@ -510,7 +522,13 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 			MaxBodyBytes: maxBodyBytes,
 		},
 	}); err != nil {
-		service.logRejected("welcome_failed", started, hello.Payload.ClientPublicKey, hello.Payload.RouteID)
+		service.logRejected(
+			"welcome_failed",
+			started,
+			hello.Payload.ClientPublicKey,
+			hello.Payload.RouteID,
+			hello.RequestID,
+		)
 		return
 	}
 	if !service.connections.publishAuthentication(entry, session) {
@@ -521,6 +539,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		Level:           "info",
 		Event:           "auth_accepted",
 		Result:          "accepted",
+		RequestID:       hello.RequestID,
 		Address:         address,
 		ClientPublicKey: hello.Payload.ClientPublicKey,
 		ClientID:        clientID,
@@ -556,12 +575,14 @@ func (service *sessionAuthService) logRejected(
 	started time.Time,
 	publicKey string,
 	routeID string,
+	requestID string,
 ) bool {
 	return service.writeAudit(logEvent{
 		Level:           "warn",
 		Event:           "auth_rejected",
 		Result:          "rejected",
 		Reason:          reason,
+		RequestID:       requestID,
 		ClientPublicKey: publicKey,
 		RouteID:         routeID,
 		Nonce:           redacted,

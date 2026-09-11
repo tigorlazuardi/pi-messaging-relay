@@ -336,6 +336,28 @@ test("relay-pair fails closed when endpoint configuration is absent", { concurre
   assert.equal(logs.lines[0].includes(VALID_PAIRING_CODE), false);
 });
 
+test("diagnostic sink failure never replaces lifecycle or disconnected tool ownership", { concurrency: false }, async () => {
+  const host = new FakePiHost();
+  const relayExtension = await loadRelayExtension();
+  relayExtension(host.api as never);
+  const originalError = console.error;
+  console.error = () => { throw new Error("simulated diagnostic sink failure"); };
+
+  try {
+    await host.emit("session_start", { type: "session_start", reason: "startup" });
+    await assert.rejects(
+      host.executeTool("agent_send", {
+        to: "/srv/backend@host#route-id",
+        body: "private-body-must-not-reach-the-sink",
+      }),
+      { name: "Error", message: EXPECTED_DISCONNECTED_ERROR },
+    );
+    await host.emit("session_shutdown");
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test("both tools fail through Pi's thrown-error path while disconnected", { concurrency: false }, async () => {
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
@@ -366,13 +388,16 @@ test("both tools fail through Pi's thrown-error path while disconnected", { conc
         level: "warn",
         event: "relay_operation_failed",
         operation: "list_peers",
+        result: "failed",
         reason: "disconnected",
       },
       {
         level: "warn",
         event: "relay_operation_failed",
         operation: "agent_send",
+        result: "failed",
         reason: "disconnected",
+        body: "<redacted>",
       },
     ],
   );

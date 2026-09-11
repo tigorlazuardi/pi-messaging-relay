@@ -106,8 +106,8 @@ Ponytail: event writes and logger close are fixed to one second, response writes
   </TabItem>
   <TabItem label="Ready stdout">
     ```json
-    {"level":"info","event":"server_ready","address":"127.0.0.1:43127","state_dir":"/tmp/pi-messaging-relay-2486170958"}
-    {"level":"info","event":"pairing_code_created","pairing_code":"<redacted>","private_key":"<redacted>","expires_at":"2026-09-10T14:10:00Z"}
+    {"level":"info","event":"server_ready","address":"127.0.0.1:43127","state_dir":"/tmp/pi-messaging-relay-2486170958","result":"ready"}
+    {"level":"info","event":"pairing_code_created","result":"created","pairing_code":"<redacted>","private_key":"<redacted>","expires_at":"2026-09-10T14:10:00Z"}
     ```
   </TabItem>
   <TabItem label="SIGTERM stdout and exit">

@@ -73,6 +73,9 @@ func TestSessionAuthenticationDeadlineClosesSilentPeer(t *testing.T) {
 		!strings.Contains(logs.String(), `"nonce":"<redacted>"`) {
 		t.Fatalf("deadline rejection log is incomplete: %s", logs.String())
 	}
+	if strings.Contains(logs.String(), `"request_id"`) {
+		t.Fatalf("incomplete hello rejection invented request correlation: %s", logs.String())
+	}
 }
 
 func TestSessionAndProtocolAuditFailureReachesFatalRuntimeOwner(t *testing.T) {
@@ -232,6 +235,10 @@ func TestConcurrentDuplicateActiveRouteFailsClosedForSameAndDifferentInstallatio
 	}
 	if count := strings.Count(logs.String(), `"event":"auth_accepted"`); count != 1 {
 		t.Fatalf("accepted route count = %d, want original only; logs: %s", count, logs.String())
+	}
+	const helloRequestID = "01993c79-8ad7-79fa-83e3-9789dcaca168"
+	if count := strings.Count(logs.String(), `"request_id":"`+helloRequestID+`"`); count != 3 {
+		t.Fatalf("complete hello request correlation count = %d, want accepted plus two conflicts; logs: %s", count, logs.String())
 	}
 }
 

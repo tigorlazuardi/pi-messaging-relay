@@ -59,6 +59,8 @@ The state directory must be owned by the current user with mode `0700`. The exte
 
 After an attempt fails or an authenticated socket closes, automatic retries use a nominal 500 ms initial delay, multiplier 2, uniform ±25% jitter, a 30-second maximum actual delay, and at most ten retries for that uninterrupted failure sequence. Authentication success resets the progression. The active Pi session keeps its exact route UUID, cwd, hostname, and complete address throughout those attempts. A new or forked Pi session always gets a fresh route UUID. Reload and resume restore the current session route from hidden non-model session state when valid.
 
+Extension JSONL diagnostics are written to the Pi process's stderr. Follow `relay_session_disconnected` with `relay_reconnect_scheduled`, `relay_reconnect_attempted`, and `relay_reconnect_succeeded`; `retry_index` is one-based and `delay_ms` is the actual jittered delay. Ten failed retries end with warning-level `relay_reconnect_exhausted`. Initial or pairing-owned success remains `relay_auth_accepted`; automatic retry success uses only `relay_reconnect_succeeded`, avoiding a duplicate transition.
+
 To isolate a temporary test installation:
 
 ```console
@@ -114,6 +116,11 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
     {"level":"info","event":"relay_auth_accepted","result":"accepted","address":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","route_id":"01993ca1-1111-7aaa-8aaa-111111111111","client_public_key":"ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E=","nonce":"<redacted>","signature":"<redacted>","private_key":"<redacted>","latency_ms":18}
     ```
   </TabItem>
+  <TabItem label="Reconnect schedule log">
+    ```json
+    {"level":"info","event":"relay_reconnect_scheduled","result":"scheduled","reason":"session_disconnected","retry_index":1,"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111","client_public_key":"ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E="}
+    ```
+  </TabItem>
   <TabItem label="First-page model tool input">
     ```json
     {}
@@ -141,10 +148,13 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - The raw code is present in the localhost request because the relay must verify it. Pairing failure output omits the code entirely, and structured logs use `<redacted>` authentication fields rather than echoing the submitted or current value.
 - The extension reads at most 4,096 pairing-response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
 - Its pinned WebSocket client enforces a 512 KiB socket-wide ceiling before complete message delivery. During authentication, complete challenge and welcome messages still have a 16 KiB semantic ceiling. Shutdown requests graceful close for at most one second, then destroys and settles an unresponsive transport.
-- Message destinations are complete opaque addresses, never authorization components. A successful `received` means only that the intended extension attempted `pi.sendUserMessage`; message bodies are neither persisted nor logged.
+- Message destinations are complete opaque addresses, never authorization components. A successful `received` means only that the intended extension attempted `pi.sendUserMessage`; message bodies are neither persisted nor logged. `relay_send_settled` describes the `agent_send` tool result with authenticated sender route, message ID, requested recipient route, status, reason, latency, and `body: "<redacted>"`; it does not claim stronger Pi receipt.
 - A `list_peers` cursor is navigation only, not authorization. Copy only `next_cursor` returned by the relay; accepted cursors are at most 5,856 characters, and omitting one starts a fresh traversal. Roster pages are capped at 48 KiB for the complete WebSocket frame and contain only opaque addresses.
 - Pairing failures do not invoke a model, inject a Pi message, or silently claim success.
 - Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
+- Public keys, complete routes, and opaque message IDs remain visible for support correlation. Pairing code, nonce, signature, private-key, and body fields use literal `<redacted>`. Heartbeat ping/pong ticks are not logged at normal levels.
+- The extension does not expose send transport request IDs or server-generated delivery IDs in its settlement event because the model-tool boundary does not own them. Match `message_id` and both routes to the server's authoritative `send_settled` when deeper transport correlation is needed.
+- Relay v1 emits logs only. It has no OpenTelemetry exporter, metrics endpoint, or traces. See [Structured relay diagnostics](../developer/relay/structured-diagnostics/) for complete event schemas and support workflow.
 
 ## Troubleshooting
 

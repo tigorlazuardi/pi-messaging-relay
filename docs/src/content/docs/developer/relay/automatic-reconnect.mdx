@@ -66,8 +66,8 @@ An interrupted `list_peers` or `agent_send` still settles through the retained s
 
 The accepted recipient delivery-stream seam now spans both lifecycle losses. It deliberately drops—not delays—a recipient ACK before terminating that exact socket, proves the sender receives `timeout/recipient_disconnected`, then authenticates the same recipient route and checks the live roster before bounded quiet turns. No settled or interrupted offer appears on the replacement socket; only a fresh send produces the next message frame and Pi injection. The same stream then drops another ACK before graceful server shutdown, starts a replacement child on the same address and allowlist state, reauthenticates both extensions, and again observes only welcome traffic until a fresh post-restart send. Exact message IDs, delivery IDs, bodies, socket generations, and injection order distinguish absence of replay from a mere timing delay.
 
-<Aside type="note" title="Diagnostics remain a separate seam">
-Ticket #26 preserves existing `relay_auth_accepted`, `relay_auth_rejected`, and `relay_session_disconnected` events. It defines no new reconnect event vocabulary. Ticket #29 owns reconnect-state diagnostics and their complete redaction acceptance.
+<Aside type="note" title="Reconnect diagnostics are explicit">
+The extension emits one `relay_reconnect_scheduled` event with one-based retry index and actual jittered delay, one `relay_reconnect_attempted` when that deadline fires, and either `relay_reconnect_succeeded` or the existing `relay_auth_rejected`. Ten failed retries end with one warning-level `relay_reconnect_exhausted`. Initial authentication remains `relay_auth_accepted`; reconnect success uses its reconnect event instead of duplicating the same extension-owned transition. See [Structured relay diagnostics](./structured-diagnostics/).
 </Aside>
 
 ### I/O examples

@@ -106,6 +106,7 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			const (
+				helloRequestID   = "01993c79-8ad7-79fa-83e3-9789dcaca168"
 				callerRouteID    = "01993ca1-1111-7aaa-8aaa-111111111111"
 				candidateRouteID = "01993ca1-2222-7aaa-8aaa-222222222222"
 				callerAddress    = "/caller@host#" + callerRouteID
@@ -120,13 +121,19 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 			var candidateRejectedOnce sync.Once
 			logger := newEventLogger(writerFunc(func(data []byte) (int, error) {
 				line := string(data)
-				if strings.Contains(line, `"event":"auth_accepted"`) && strings.Contains(line, `"address":"`+callerAddress+`"`) {
+				if strings.Contains(line, `"event":"auth_accepted"`) &&
+					strings.Contains(line, `"request_id":"`+helloRequestID+`"`) &&
+					strings.Contains(line, `"address":"`+callerAddress+`"`) {
 					callerAcceptedOnce.Do(func() { close(callerAccepted) })
 				}
-				if strings.Contains(line, `"event":"auth_accepted"`) && strings.Contains(line, `"address":"`+candidateAddress+`"`) {
+				if strings.Contains(line, `"event":"auth_accepted"`) &&
+					strings.Contains(line, `"request_id":"`+helloRequestID+`"`) &&
+					strings.Contains(line, `"address":"`+candidateAddress+`"`) {
 					candidateAcceptedOnce.Do(func() { close(candidateAccepted) })
 				}
-				if strings.Contains(line, `"reason":"welcome_failed"`) && strings.Contains(line, `"route_id":"`+candidateRouteID+`"`) {
+				if strings.Contains(line, `"reason":"welcome_failed"`) &&
+					strings.Contains(line, `"request_id":"`+helloRequestID+`"`) &&
+					strings.Contains(line, `"route_id":"`+candidateRouteID+`"`) {
 					candidateRejectedOnce.Do(func() { close(candidateRejected) })
 				}
 				return len(data), nil
