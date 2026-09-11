@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -94,16 +95,185 @@ func noOperationDispatcher(
 	return operationResponse{}, false, nil
 }
 
+type authenticatedRead struct {
+	operation clientOperation
+	failure   *protocolFailure
+}
+
+type authenticatedOperationAdmission struct {
+	mu        sync.Mutex
+	available bool
+	terminal  bool
+}
+
+func newAuthenticatedOperationAdmission() *authenticatedOperationAdmission {
+	return &authenticatedOperationAdmission{available: true}
+}
+
+func (admission *authenticatedOperationAdmission) claim(shutdown <-chan struct{}) bool {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	select {
+	case <-shutdown:
+		admission.terminal = true
+	default:
+	}
+	if admission.terminal || !admission.available {
+		admission.terminal = true
+		admission.available = false
+		return false
+	}
+	admission.available = false
+	return true
+}
+
+func (admission *authenticatedOperationAdmission) publish(shutdown <-chan struct{}) bool {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	select {
+	case <-shutdown:
+		admission.terminal = true
+	default:
+	}
+	if admission.terminal || admission.available {
+		admission.terminal = true
+		admission.available = false
+		return false
+	}
+	admission.available = true
+	return true
+}
+
+func (admission *authenticatedOperationAdmission) terminate() {
+	admission.mu.Lock()
+	admission.terminal = true
+	admission.available = false
+	admission.mu.Unlock()
+}
+
 func (service *sessionAuthService) serveAuthenticated(
 	connection *websocket.Conn,
 	session *authenticatedSession,
+	markUnavailable func(),
 ) {
-	for {
-		operation, failure, err := readClientOperation(context.Background(), connection)
-		if err != nil {
-			return
+	serveContext, cancelServe := context.WithCancel(context.Background())
+	reads := make(chan authenticatedRead)
+	readDone := make(chan struct{})
+	admission := newAuthenticatedOperationAdmission()
+
+	var activeSettlement <-chan bool
+	var terminateOnce sync.Once
+	terminate := func() {
+		terminateOnce.Do(func() {
+			admission.terminate()
+			markUnavailable()
+			cancelServe()
+			_ = connection.CloseNow()
+		})
+	}
+	defer func() {
+		terminate()
+		<-readDone
+		if activeSettlement != nil {
+			<-activeSettlement
 		}
+	}()
+
+	go func() {
+		defer close(readDone)
+		defer close(reads)
+		for {
+			operation, failure, err := readClientOperation(serveContext, connection)
+			if err != nil {
+				terminate()
+				return
+			}
+
+			// ACKs have no response by contract. Dispatch them synchronously in the
+			// sole reader so a recipient role can overlap its own outgoing operation.
+			if failure == nil && operation.Type == "received" {
+				_, respond, dispatchErr := service.dispatchOperation(serveContext, session, operation)
+				if dispatchErr != nil {
+					service.reportFatal(fmt.Errorf("dispatch received operation: %w", dispatchErr))
+					terminate()
+					return
+				}
+				if respond {
+					service.reportFatal(errors.New("received operation unexpectedly produced a response"))
+					terminate()
+					return
+				}
+				continue
+			}
+
+			if service.beforeOperationAdmissionDecision != nil {
+				service.beforeOperationAdmissionDecision(operation)
+			}
+			admitted := admission.claim(service.connections.closingSignal())
+			if service.afterOperationAdmissionDecision != nil {
+				service.afterOperationAdmissionDecision(operation, admitted)
+			}
+			if !admitted {
+				operation = clientOperation{}
+				failure = nil
+				terminate()
+				return
+			}
+			select {
+			case reads <- authenticatedRead{operation: operation, failure: failure}:
+			case <-serveContext.Done():
+				return
+			}
+			if failure != nil {
+				return
+			}
+		}
+	}()
+
+	waitSettlement := func() bool {
+		if activeSettlement == nil {
+			return true
+		}
+		settled := <-activeSettlement
+		activeSettlement = nil
+		return settled
+	}
+	startSettlement := func(encodedResponse []byte, log logEvent, operationStarted time.Time) func() {
+		start := make(chan struct{})
+		done := make(chan bool, 1)
+		activeSettlement = done
+		go func() {
+			select {
+			case <-start:
+			case <-serveContext.Done():
+				done <- false
+				return
+			}
+			writeContext, cancelWrite := context.WithTimeout(serveContext, protocolResponseWriteTimeout)
+			err := service.connections.writeToSession(writeContext, session, encodedResponse)
+			cancelWrite()
+			if err != nil {
+				terminate()
+				done <- false
+				return
+			}
+			log.LatencyMS = latencySince(operationStarted)
+			if !service.writeAudit(log) {
+				terminate()
+				done <- false
+				return
+			}
+			done <- true
+		}()
+		return func() { close(start) }
+	}
+
+	for read := range reads {
+		operation, failure := read.operation, read.failure
 		if failure != nil {
+			if !waitSettlement() {
+				return
+			}
 			if !service.writeAudit(logEvent{
 				Level:     "warn",
 				Event:     "protocol_rejected",
@@ -113,76 +283,74 @@ func (service *sessionAuthService) serveAuthenticated(
 				Type:      failure.Type,
 				RequestID: failure.RequestID,
 			}) {
-				_ = connection.CloseNow()
 				return
 			}
 			if encoded, encodeErr := encodeProtocolError(*failure); encodeErr == nil {
-				writeContext, cancelWrite := context.WithTimeout(context.Background(), protocolResponseWriteTimeout)
+				writeContext, cancelWrite := context.WithTimeout(serveContext, protocolResponseWriteTimeout)
 				_ = service.connections.writeToConnection(writeContext, connection, encoded)
 				cancelWrite()
 			}
-			_ = connection.CloseNow()
 			return
 		}
 
 		operationStarted := time.Now()
-		response, respond, err := service.dispatchOperation(context.Background(), session, operation)
+		response, respond, err := service.dispatchOperation(serveContext, session, operation)
 		if err != nil {
 			service.reportFatal(fmt.Errorf("dispatch %s operation: %w", operation.Type, err))
-			_ = connection.CloseNow()
 			return
 		}
-		if !respond {
-			continue
+		var beginSettlement func()
+		if respond {
+			encodedResponse, encodeErr := encodeOperationResponse(operation, response)
+			if encodeErr != nil {
+				service.reportFatal(fmt.Errorf(
+					"prepare %s operation response for request %s: %w",
+					operation.Type,
+					operation.RequestID,
+					encodeErr,
+				))
+				return
+			}
+			event := "operation_settled"
+			level := "info"
+			if operation.Type == "send" && response.Outcome == "settled" {
+				event = "send_settled"
+			}
+			if response.Outcome == "denied" {
+				event = "operation_denied"
+				level = "warn"
+			}
+			log := logEvent{
+				Level:          level,
+				Event:          event,
+				Result:         response.Outcome,
+				Reason:         response.Code,
+				Code:           response.Code,
+				Type:           operation.Type,
+				RequestID:      operation.RequestID,
+				Count:          response.PeerCount,
+				MessageID:      response.MessageID,
+				DeliveryID:     response.DeliveryID,
+				SenderRoute:    response.SenderRoute,
+				RecipientRoute: response.RecipientRoute,
+				Status:         response.Status,
+			}
+			if operation.Type == "send" {
+				log.Body = redacted
+			}
+			if !waitSettlement() {
+				return
+			}
+			beginSettlement = startSettlement(encodedResponse, log, operationStarted)
 		}
-		encodedResponse, err := encodeOperationResponse(operation, response)
-		if err != nil {
-			service.reportFatal(fmt.Errorf(
-				"prepare %s operation response for request %s: %w",
-				operation.Type,
-				operation.RequestID,
-				err,
-			))
-			_ = connection.CloseNow()
+		if !admission.publish(service.connections.closingSignal()) {
 			return
 		}
-		writeContext, cancelWrite := context.WithTimeout(context.Background(), protocolResponseWriteTimeout)
-		err = service.connections.writeToSession(writeContext, session, encodedResponse)
-		cancelWrite()
-		if err != nil {
-			return
+		if beginSettlement != nil {
+			beginSettlement()
 		}
-		event := "operation_settled"
-		level := "info"
-		if operation.Type == "send" && response.Outcome == "settled" {
-			event = "send_settled"
-		}
-		if response.Outcome == "denied" {
-			event = "operation_denied"
-			level = "warn"
-		}
-		log := logEvent{
-			Level:          level,
-			Event:          event,
-			Result:         response.Outcome,
-			Reason:         response.Code,
-			Code:           response.Code,
-			Type:           operation.Type,
-			RequestID:      operation.RequestID,
-			Count:          response.PeerCount,
-			MessageID:      response.MessageID,
-			DeliveryID:     response.DeliveryID,
-			SenderRoute:    response.SenderRoute,
-			RecipientRoute: response.RecipientRoute,
-			Status:         response.Status,
-			LatencyMS:      latencySince(operationStarted),
-		}
-		if operation.Type == "send" {
-			log.Body = redacted
-		}
-		if !service.writeAudit(log) {
-			_ = connection.CloseNow()
-			return
+		if service.afterOperationAdmissionPublication != nil {
+			service.afterOperationAdmissionPublication(operation)
 		}
 	}
 }

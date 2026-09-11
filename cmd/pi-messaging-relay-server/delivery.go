@@ -33,6 +33,7 @@ type pendingDelivery struct {
 	messageID    string
 	deliveryID   string
 	acknowledged chan struct{}
+	abandoned    chan struct{}
 	cancelled    chan struct{}
 	shutdown     chan struct{}
 }
@@ -62,7 +63,7 @@ func newDeliveryDispatcher(registry *sessionConnectionRegistry) *deliveryDispatc
 		},
 		pending: make(map[string]*pendingDelivery),
 	}
-	registry.onSessionUnavailable = dispatcher.cancelRecipient
+	registry.onSessionUnavailable = dispatcher.handleSessionUnavailable
 	registry.onShutdown = dispatcher.shutdown
 	return dispatcher
 }
@@ -111,23 +112,24 @@ func (dispatcher *deliveryDispatcher) send(
 	if err != nil {
 		return operationResponse{}, false, fmt.Errorf("generate delivery ID: %w", err)
 	}
-	pending := &pendingDelivery{
-		sender:       sender,
-		recipient:    recipient,
-		messageID:    operation.Send.MessageID,
-		deliveryID:   deliveryID,
-		acknowledged: make(chan struct{}),
-		cancelled:    make(chan struct{}),
-		shutdown:     make(chan struct{}),
-	}
 	dispatcher.lock()
-	if dispatcher.shuttingDown {
+	if dispatcher.shuttingDown || !dispatcher.registry.isPublishedSession(sender) {
 		dispatcher.unlock()
 		return operationResponse{}, false, nil
 	}
 	if _, collision := dispatcher.pending[deliveryID]; collision {
 		dispatcher.unlock()
 		return operationResponse{}, false, errors.New("generated duplicate delivery ID")
+	}
+	pending := &pendingDelivery{
+		sender:       sender,
+		recipient:    recipient,
+		messageID:    operation.Send.MessageID,
+		deliveryID:   deliveryID,
+		acknowledged: make(chan struct{}),
+		abandoned:    make(chan struct{}),
+		cancelled:    make(chan struct{}),
+		shutdown:     make(chan struct{}),
 	}
 	dispatcher.pending[deliveryID] = pending
 	dispatcher.unlock()
@@ -142,6 +144,8 @@ func (dispatcher *deliveryDispatcher) send(
 		select {
 		case <-pending.acknowledged:
 			return received()
+		case <-pending.abandoned:
+			return operationResponse{}, false, nil
 		case <-pending.cancelled:
 			return recipientDisconnected()
 		case <-pending.shutdown:
@@ -200,6 +204,8 @@ func (dispatcher *deliveryDispatcher) send(
 	select {
 	case <-pending.acknowledged:
 		return received()
+	case <-pending.abandoned:
+		return operationResponse{}, false, nil
 	case <-pending.cancelled:
 		return recipientDisconnected()
 	case <-pending.shutdown:
@@ -278,17 +284,21 @@ func (dispatcher *deliveryDispatcher) receive(
 	dispatcher.unlock()
 }
 
-func (dispatcher *deliveryDispatcher) cancelRecipient(recipient *authenticatedSession) {
-	if recipient == nil {
+func (dispatcher *deliveryDispatcher) handleSessionUnavailable(session *authenticatedSession) {
+	if session == nil {
 		return
 	}
 	dispatcher.lock()
 	for deliveryID, pending := range dispatcher.pending {
-		if pending.recipient != recipient {
+		if pending.sender == session {
+			delete(dispatcher.pending, deliveryID)
+			close(pending.abandoned)
 			continue
 		}
-		delete(dispatcher.pending, deliveryID)
-		close(pending.cancelled)
+		if pending.recipient == session {
+			delete(dispatcher.pending, deliveryID)
+			close(pending.cancelled)
+		}
 	}
 	dispatcher.unlock()
 }

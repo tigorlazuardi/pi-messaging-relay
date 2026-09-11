@@ -298,6 +298,20 @@ func (registry *sessionConnectionRegistry) publishedSession(address string) (*au
 	return nil, false
 }
 
+func (registry *sessionConnectionRegistry) isPublishedSession(session *authenticatedSession) bool {
+	if session == nil {
+		return false
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for entry := range registry.entries {
+		if entry.visible && entry.session == session {
+			return true
+		}
+	}
+	return false
+}
+
 func (registry *sessionConnectionRegistry) writeToSession(
 	ctx context.Context,
 	session *authenticatedSession,
@@ -342,13 +356,16 @@ func writeTrackedConnection(ctx context.Context, destination *trackedSessionConn
 }
 
 type sessionAuthService struct {
-	pairing           *pairingService
-	connections       *sessionConnectionRegistry
-	logger            *eventLogger
-	reportFatal       func(error)
-	dispatchOperation operationDispatcher
-	writeWelcome      func(context.Context, *websocket.Conn, welcomeEnvelope) error
-	authTimeout       time.Duration
+	pairing                            *pairingService
+	connections                        *sessionConnectionRegistry
+	logger                             *eventLogger
+	reportFatal                        func(error)
+	dispatchOperation                  operationDispatcher
+	writeWelcome                       func(context.Context, *websocket.Conn, welcomeEnvelope) error
+	beforeOperationAdmissionDecision   func(clientOperation)
+	afterOperationAdmissionDecision    func(clientOperation, bool)
+	afterOperationAdmissionPublication func(clientOperation)
+	authTimeout                        time.Duration
 }
 
 func newSessionAuthService(
@@ -484,8 +501,12 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	})
 	cancelAuth()
 
-	service.serveAuthenticated(connection, session)
-	service.connections.clearAuthentication(entry)
+	var unavailableOnce sync.Once
+	markUnavailable := func() {
+		unavailableOnce.Do(func() { service.connections.clearAuthentication(entry) })
+	}
+	service.serveAuthenticated(connection, session, markUnavailable)
+	markUnavailable()
 	service.writeAudit(logEvent{
 		Level:           "info",
 		Event:           "session_disconnected",

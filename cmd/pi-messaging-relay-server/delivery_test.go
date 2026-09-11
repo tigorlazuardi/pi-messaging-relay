@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -222,7 +223,6 @@ func TestDeliveryShutdownPreservesFirstPendingOwner(t *testing.T) {
 				messageID        = "01993c87-5555-7aaa-8aaa-555555555555"
 				recipientRouteID = "01993c87-6666-7aaa-8aaa-666666666666"
 				recipientAddress = "/recipient@host#" + recipientRouteID
-				listRequestID    = "01993c87-7777-7aaa-8aaa-777777777777"
 				bodyMarker       = "shutdown-owner-body-must-stay-redacted"
 			)
 			logs := lockedBuffer{changed: make(chan struct{}, 1)}
@@ -320,32 +320,23 @@ func TestDeliveryShutdownPreservesFirstPendingOwner(t *testing.T) {
 			}
 			if test.cancelFirst {
 				closeRecipient()
-				beginShutdown()
-			} else {
-				beginShutdown()
-				closeRecipient()
-			}
-
-			listFrame := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, listRequestID)
-			if err := sender.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
-				t.Fatalf("write list shutdown barrier: %v", err)
-			}
-			if test.cancelFirst {
 				messageType, data, readErr := sender.Read(ctx)
 				expected := `{"v":1,"type":"send_result","request_id":"` + requestID +
 					`","payload":{"message_id":"` + messageID + `","status":"timeout","reason":"recipient_disconnected"}}`
 				if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
 					t.Fatalf("recipient-owned result = type %d %s error=%v, want %s", messageType, data, readErr, expected)
 				}
+				awaitEvent("send_settled", func(event map[string]any) bool {
+					return event["message_id"] == messageID
+				})
+				beginShutdown()
+			} else {
+				beginShutdown()
+				closeRecipient()
 			}
-			var roster operationResponseEnvelope
-			if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Version != 1 ||
-				roster.Type != "roster" || roster.RequestID != listRequestID {
-				t.Fatalf("shutdown list barrier = %+v error=%v", roster, err)
+			if err := registry.closeAndWait(ctx); err != nil {
+				t.Fatalf("settle pending owner shutdown: %v", err)
 			}
-			awaitEvent("operation_settled", func(event map[string]any) bool {
-				return event["request_id"] == listRequestID
-			})
 
 			var settlements []map[string]any
 			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
@@ -529,10 +520,6 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 			}
 			release()
 
-			listFrame := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, listRequestID)
-			if err := sender.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
-				t.Fatalf("write post-owner list barrier: %v", err)
-			}
 			if test.cancelFirst {
 				messageType, data, readErr := sender.Read(ctx)
 				expected := `{"v":1,"type":"send_result","request_id":"` + requestID +
@@ -540,15 +527,23 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 				if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
 					t.Fatalf("recipient-owned oversized result = type %d %s error=%v, want %s", messageType, data, readErr, expected)
 				}
+				listFrame := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, listRequestID)
+				if err := sender.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
+					t.Fatalf("write post-owner list after result: %v", err)
+				}
+				var roster operationResponseEnvelope
+				if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Version != 1 ||
+					roster.Type != "roster" || roster.RequestID != listRequestID {
+					t.Fatalf("post-owner list after result = %+v error=%v", roster, err)
+				}
+				awaitEvent("operation_settled", func(event map[string]any) bool {
+					return event["request_id"] == listRequestID
+				})
+			} else {
+				if err := registry.closeAndWait(ctx); err != nil {
+					t.Fatalf("settle shutdown-owned oversized send: %v", err)
+				}
 			}
-			var roster operationResponseEnvelope
-			if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Version != 1 ||
-				roster.Type != "roster" || roster.RequestID != listRequestID {
-				t.Fatalf("post-owner list barrier = %+v error=%v", roster, err)
-			}
-			awaitEvent("operation_settled", func(event map[string]any) bool {
-				return event["request_id"] == listRequestID
-			})
 
 			var settlements []map[string]any
 			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
@@ -1487,6 +1482,768 @@ func TestRecipientDisconnectSettlesEverySenderWithoutReplayAndKeepsSocketsUsable
 	case <-reporter.reported:
 		t.Fatalf("recipient lifecycle caused fatal runtime failure: %v", reporter.err())
 	default:
+	}
+}
+
+func TestSenderDisconnectAbandonsOnlyItsPendingOfferAndPreservesRecipientAndOtherSenders(t *testing.T) {
+	const (
+		recipientRouteID    = "01993ca5-1111-7aaa-8aaa-111111111111"
+		recipientAddress    = "/recipient@host#" + recipientRouteID
+		senderAAddress      = "/sender-a@host#01993ca5-2222-7aaa-8aaa-222222222222"
+		pipelinedRequestID  = "01993ca5-2aaa-7aaa-8aaa-222222222222"
+		pipelinedMessageID  = "01993ca5-2bbb-7aaa-8aaa-222222222222"
+		pipelinedBodyMarker = "sender-a-pipelined-body-must-be-discarded"
+	)
+	requestIDs := []string{
+		"01993ca5-3333-7aaa-8aaa-333333333333",
+		"01993ca5-4444-7aaa-8aaa-444444444444",
+		"01993ca5-5555-7aaa-8aaa-555555555555",
+	}
+	messageIDs := []string{
+		"01993ca5-6666-7aaa-8aaa-666666666666",
+		"01993ca5-7777-7aaa-8aaa-777777777777",
+		"01993ca5-8888-7aaa-8aaa-888888888888",
+	}
+	bodyMarkers := []string{
+		"sender-a-disconnect-body-must-stay-redacted",
+		"sender-b-body-must-stay-redacted",
+		"sender-c-body-must-stay-redacted",
+	}
+
+	logs := lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_sender_disconnect", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	type controlledDeadline struct {
+		expired chan time.Time
+		stopped chan struct{}
+	}
+	deadlines := make(chan controlledDeadline, 3)
+	registry := newSessionConnectionRegistryWithLimit(3)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	dispatcher := newDeliveryDispatcher(registry)
+	dispatcher.deadlineFactory = func(duration time.Duration) deliveryDeadline {
+		if duration != deliveryACKCeiling {
+			t.Errorf("ACK deadline = %s, want %s", duration, deliveryACKCeiling)
+		}
+		controlled := controlledDeadline{expired: make(chan time.Time), stopped: make(chan struct{})}
+		deadlines <- controlled
+		return deliveryDeadline{
+			expired: controlled.expired,
+			stop: func() bool {
+				close(controlled.stopped)
+				return true
+			},
+		}
+	}
+	service.dispatchOperation = dispatcher.dispatch
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	open := func(routeID, cwd string) *websocket.Conn {
+		t.Helper()
+		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		if openErr != nil {
+			t.Fatalf("authenticate %s: %v", cwd, openErr)
+		}
+		return connection
+	}
+
+	recipient := open(recipientRouteID, "/recipient")
+	senderA := open("01993ca5-2222-7aaa-8aaa-222222222222", "/sender-a")
+	senderB := open("01993ca5-9999-7aaa-8aaa-999999999999", "/sender-b")
+	t.Cleanup(func() { _ = recipient.CloseNow() })
+	t.Cleanup(func() { _ = senderA.CloseNow() })
+	t.Cleanup(func() { _ = senderB.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	awaitEvent := func(name string, matches func(map[string]any) bool) map[string]any {
+		t.Helper()
+		for {
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var event map[string]any
+				if json.Unmarshal([]byte(line), &event) == nil && event["event"] == name && matches(event) {
+					return event
+				}
+			}
+			select {
+			case <-logs.changed:
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for %s: %s", name, logs.String())
+			}
+		}
+	}
+	awaitEvent("auth_accepted", func(event map[string]any) bool {
+		return event["address"] == "/sender-b@host#01993ca5-9999-7aaa-8aaa-999999999999"
+	})
+
+	writeSend := func(sender *websocket.Conn, index int) {
+		t.Helper()
+		frame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+			requestIDs[index], messageIDs[index], recipientAddress, bodyMarkers[index])
+		if writeErr := sender.Write(ctx, websocket.MessageText, []byte(frame)); writeErr != nil {
+			t.Fatalf("write send %d: %v", index, writeErr)
+		}
+	}
+	writeACK := func(offer messageEnvelope, requestID string) {
+		t.Helper()
+		frame := fmt.Sprintf(`{"v":1,"type":"received","request_id":%q,"payload":{"delivery_id":%q,"message_id":%q}}`,
+			requestID, offer.Payload.DeliveryID, offer.Payload.MessageID)
+		if writeErr := recipient.Write(ctx, websocket.MessageText, []byte(frame)); writeErr != nil {
+			t.Fatalf("write ACK for %s: %v", offer.Payload.MessageID, writeErr)
+		}
+	}
+	readOffer := func() messageEnvelope {
+		t.Helper()
+		var offer messageEnvelope
+		if readErr := wsjson.Read(ctx, recipient, &offer); readErr != nil {
+			t.Fatalf("read recipient offer: %v", readErr)
+		}
+		return offer
+	}
+	awaitDeadline := func() controlledDeadline {
+		t.Helper()
+		select {
+		case deadline := <-deadlines:
+			return deadline
+		case <-ctx.Done():
+			t.Fatal("delivery deadline was not installed")
+			return controlledDeadline{}
+		}
+	}
+
+	writeSend(senderA, 0)
+	offerA := readOffer()
+	deadlineA := awaitDeadline()
+	pipelinedFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+		pipelinedRequestID, pipelinedMessageID, recipientAddress, pipelinedBodyMarker)
+	if err := senderA.Write(ctx, websocket.MessageText, []byte(pipelinedFrame)); err != nil {
+		t.Fatalf("pipeline second sender A operation: %v", err)
+	}
+	awaitEvent("session_disconnected", func(event map[string]any) bool { return event["address"] == senderAAddress })
+	select {
+	case <-deadlineA.stopped:
+	case <-ctx.Done():
+		t.Fatal("concurrent-frame sender abandonment did not stop ACK deadline")
+	}
+	_, closedData, closeErr := senderA.Read(ctx)
+	if closeErr == nil || len(closedData) != 0 {
+		t.Fatalf("concurrent sender A frame did not cause generic close: data=%q error=%v", closedData, closeErr)
+	}
+
+	writeSend(senderB, 1)
+	offerB := readOffer()
+	deadlineB := awaitDeadline()
+	if offerA.Payload.MessageID != messageIDs[0] || offerB.Payload.MessageID != messageIDs[1] ||
+		offerA.Payload.DeliveryID == offerB.Payload.DeliveryID {
+		t.Fatalf("pending offers after concurrent-frame close = A:%+v B:%+v", offerA, offerB)
+	}
+
+	writeACK(offerA, "01993ca5-aaaa-7aaa-8aaa-aaaaaaaaaaaa")
+	const recipientListRequestID = "01993ca5-bbbb-7aaa-8aaa-bbbbbbbbbbbb"
+	if err := recipient.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"list","request_id":"`+recipientListRequestID+`","payload":{}}`)); err != nil {
+		t.Fatalf("write recipient list after stale ACK: %v", err)
+	}
+	var recipientRoster operationResponseEnvelope
+	if err := wsjson.Read(ctx, recipient, &recipientRoster); err != nil || recipientRoster.Type != "roster" ||
+		recipientRoster.RequestID != recipientListRequestID {
+		t.Fatalf("stale ACK damaged recipient: response=%+v error=%v", recipientRoster, err)
+	}
+
+	writeACK(offerB, "01993ca5-cccc-7aaa-8aaa-cccccccccccc")
+	messageType, data, err := senderB.Read(ctx)
+	expectedB := `{"v":1,"type":"send_result","request_id":"` + requestIDs[1] +
+		`","payload":{"message_id":"` + messageIDs[1] + `","status":"received"}}`
+	if err != nil || messageType != websocket.MessageText || string(data) != expectedB {
+		t.Fatalf("sender B result = type %d %s error=%v, want %s", messageType, data, err, expectedB)
+	}
+	select {
+	case <-deadlineB.stopped:
+	case <-ctx.Done():
+		t.Fatal("sender B ACK deadline was not stopped")
+	}
+
+	senderC := open("01993ca5-dddd-7aaa-8aaa-dddddddddddd", "/sender-c")
+	t.Cleanup(func() { _ = senderC.CloseNow() })
+	writeSend(senderC, 2)
+	offerC := readOffer()
+	deadlineC := awaitDeadline()
+	if offerC.Payload.MessageID != messageIDs[2] || offerC.Payload.DeliveryID == offerA.Payload.DeliveryID ||
+		offerC.Payload.DeliveryID == offerB.Payload.DeliveryID {
+		t.Fatalf("fresh sender C offer = %+v", offerC)
+	}
+	writeACK(offerC, "01993ca5-eeee-7aaa-8aaa-eeeeeeeeeeee")
+	messageType, data, err = senderC.Read(ctx)
+	expectedC := `{"v":1,"type":"send_result","request_id":"` + requestIDs[2] +
+		`","payload":{"message_id":"` + messageIDs[2] + `","status":"received"}}`
+	if err != nil || messageType != websocket.MessageText || string(data) != expectedC {
+		t.Fatalf("sender C result = type %d %s error=%v, want %s", messageType, data, err, expectedC)
+	}
+	select {
+	case <-deadlineC.stopped:
+	case <-ctx.Done():
+		t.Fatal("sender C ACK deadline was not stopped")
+	}
+
+	for _, messageID := range messageIDs[1:] {
+		awaitEvent("send_settled", func(event map[string]any) bool { return event["message_id"] == messageID })
+	}
+	settlements := make(map[string][]map[string]any, len(messageIDs))
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) != nil || event["event"] != "send_settled" {
+			continue
+		}
+		for _, messageID := range messageIDs {
+			if event["message_id"] == messageID {
+				settlements[messageID] = append(settlements[messageID], event)
+			}
+		}
+	}
+	if len(settlements[messageIDs[0]]) != 0 {
+		t.Fatalf("abandoned sender A emitted settlement: %#v", settlements[messageIDs[0]])
+	}
+	healthyOffers := []messageEnvelope{offerB, offerC}
+	healthySenders := []string{
+		"/sender-b@host#01993ca5-9999-7aaa-8aaa-999999999999",
+		"/sender-c@host#01993ca5-dddd-7aaa-8aaa-dddddddddddd",
+	}
+	for index, messageID := range messageIDs[1:] {
+		if len(settlements[messageID]) != 1 {
+			t.Fatalf("healthy sender settlement count for %s = %d: %s", messageID, len(settlements[messageID]), logs.String())
+		}
+		settlement := settlements[messageID][0]
+		if settlement["status"] != "received" || settlement["result"] != "settled" ||
+			settlement["reason"] != "received" || settlement["code"] != "received" ||
+			settlement["body"] != redacted || settlement["request_id"] != requestIDs[index+1] ||
+			settlement["message_id"] != messageID || settlement["delivery_id"] != healthyOffers[index].Payload.DeliveryID ||
+			settlement["sender_route"] != healthySenders[index] || settlement["recipient_route"] != recipientAddress {
+			t.Fatalf("healthy sender settlement for %s = %#v", messageID, settlement)
+		}
+	}
+	if strings.Contains(logs.String(), pipelinedRequestID) || strings.Contains(logs.String(), pipelinedMessageID) ||
+		strings.Contains(logs.String(), pipelinedBodyMarker) {
+		t.Fatalf("pipelined operation was dispatched or logged: %s", logs.String())
+	}
+	for _, marker := range bodyMarkers {
+		if strings.Contains(logs.String(), marker) {
+			t.Fatalf("sender lifecycle telemetry leaked body marker %q: %s", marker, logs.String())
+		}
+	}
+	select {
+	case <-reporter.reported:
+		t.Fatalf("sender lifecycle caused fatal runtime failure: %v", reporter.err())
+	default:
+	}
+}
+
+func TestSelfSendDisconnectAbandonsSenderOwnedOfferWithoutRecipientResult(t *testing.T) {
+	const (
+		routeID    = "01993ca6-4111-7aaa-8aaa-411111111111"
+		address    = "/self@host#" + routeID
+		requestID  = "01993ca6-4222-7aaa-8aaa-422222222222"
+		messageID  = "01993ca6-4333-7aaa-8aaa-433333333333"
+		bodyMarker = "self-send-disconnect-body-must-stay-redacted"
+	)
+	logs := lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_self_disconnect", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	registry := newSessionConnectionRegistryWithLimit(1)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	dispatcher := newDeliveryDispatcher(registry)
+	deadlineStopped := make(chan struct{})
+	dispatcher.deadlineFactory = func(time.Duration) deliveryDeadline {
+		return deliveryDeadline{
+			expired: make(chan time.Time),
+			stop: func() bool {
+				close(deadlineStopped)
+				return true
+			},
+		}
+	}
+	service.dispatchOperation = dispatcher.dispatch
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", "/self")
+	if err != nil {
+		t.Fatalf("authenticate self-send session: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	frame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+		requestID, messageID, address, bodyMarker)
+	if err := connection.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+		t.Fatalf("write self-send: %v", err)
+	}
+	var offer messageEnvelope
+	if err := wsjson.Read(ctx, connection, &offer); err != nil || offer.Payload.MessageID != messageID {
+		t.Fatalf("read self-send offer: offer=%+v error=%v", offer, err)
+	}
+	if err := connection.CloseNow(); err != nil {
+		t.Fatalf("close self-send session: %v", err)
+	}
+	for {
+		if strings.Contains(logs.String(), `"event":"session_disconnected"`) &&
+			strings.Contains(logs.String(), `"address":"`+address+`"`) {
+			break
+		}
+		select {
+		case <-logs.changed:
+		case <-ctx.Done():
+			t.Fatalf("self-send disconnect was not observed: %s", logs.String())
+		}
+	}
+	select {
+	case <-deadlineStopped:
+	case <-ctx.Done():
+		t.Fatal("self-send abandoned deadline was not stopped")
+	}
+	if strings.Contains(logs.String(), `"event":"send_settled"`) && strings.Contains(logs.String(), messageID) {
+		t.Fatalf("self-send disconnect emitted unreachable recipient result: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), bodyMarker) {
+		t.Fatalf("self-send disconnect leaked body: %s", logs.String())
+	}
+	select {
+	case <-reporter.reported:
+		t.Fatalf("self-send disconnect caused fatal runtime failure: %v", reporter.err())
+	default:
+	}
+}
+
+func TestSelfSendAcknowledgementOverlapsSenderOperationWithoutClosing(t *testing.T) {
+	const (
+		routeID       = "01993ca6-5111-7aaa-8aaa-511111111111"
+		address       = "/self-ack@host#" + routeID
+		requestID     = "01993ca6-5222-7aaa-8aaa-522222222222"
+		messageID     = "01993ca6-5333-7aaa-8aaa-533333333333"
+		ackRequestID  = "01993ca6-5444-7aaa-8aaa-544444444444"
+		listRequestID = "01993ca6-5555-7aaa-8aaa-555555555555"
+		bodyMarker    = "self-send-ack-body-must-stay-redacted"
+	)
+	logs := lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_self_ack", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	registry := newSessionConnectionRegistryWithLimit(1)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	dispatcher := newDeliveryDispatcher(registry)
+	deadlineStopped := make(chan struct{})
+	dispatcher.deadlineFactory = func(duration time.Duration) deliveryDeadline {
+		if duration != deliveryACKCeiling {
+			t.Errorf("ACK deadline = %s, want %s", duration, deliveryACKCeiling)
+		}
+		return deliveryDeadline{
+			expired: make(chan time.Time),
+			stop: func() bool {
+				close(deadlineStopped)
+				return true
+			},
+		}
+	}
+	service.dispatchOperation = dispatcher.dispatch
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", "/self-ack")
+	if err != nil {
+		t.Fatalf("authenticate self-ACK session: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sendFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+		requestID, messageID, address, bodyMarker)
+	if err := connection.Write(ctx, websocket.MessageText, []byte(sendFrame)); err != nil {
+		t.Fatalf("write self-send for ACK overlap: %v", err)
+	}
+	var offer messageEnvelope
+	if err := wsjson.Read(ctx, connection, &offer); err != nil || offer.Payload.MessageID != messageID {
+		t.Fatalf("read self-send offer: offer=%+v error=%v", offer, err)
+	}
+	ackFrame := fmt.Sprintf(`{"v":1,"type":"received","request_id":%q,"payload":{"delivery_id":%q,"message_id":%q}}`,
+		ackRequestID, offer.Payload.DeliveryID, messageID)
+	if err := connection.Write(ctx, websocket.MessageText, []byte(ackFrame)); err != nil {
+		t.Fatalf("write overlapping self ACK: %v", err)
+	}
+	messageType, data, err := connection.Read(ctx)
+	expected := `{"v":1,"type":"send_result","request_id":"` + requestID +
+		`","payload":{"message_id":"` + messageID + `","status":"received"}}`
+	if err != nil || messageType != websocket.MessageText || string(data) != expected {
+		t.Fatalf("self-ACK result = type %d %s error=%v, want %s", messageType, data, err, expected)
+	}
+	select {
+	case <-deadlineStopped:
+	case <-ctx.Done():
+		t.Fatal("self-ACK did not stop delivery deadline")
+	}
+	listFrame := `{"v":1,"type":"list","request_id":"` + listRequestID + `","payload":{}}`
+	if err := connection.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
+		t.Fatalf("write list after overlapping self ACK: %v", err)
+	}
+	var roster operationResponseEnvelope
+	if err := wsjson.Read(ctx, connection, &roster); err != nil || roster.Type != "roster" ||
+		roster.RequestID != listRequestID {
+		t.Fatalf("self-ACK damaged connection: response=%+v error=%v", roster, err)
+	}
+	if strings.Contains(logs.String(), bodyMarker) || !strings.Contains(logs.String(), `"message_id":"`+messageID+`"`) ||
+		!strings.Contains(logs.String(), `"body":"<redacted>"`) {
+		t.Fatalf("self-ACK telemetry was not safely settled: %s", logs.String())
+	}
+	select {
+	case <-reporter.reported:
+		t.Fatalf("self-ACK overlap caused fatal runtime failure: %v", reporter.err())
+	default:
+	}
+}
+
+func TestTerminalDispatchFailureJoinsPumpBlockedInReader(t *testing.T) {
+	var logs lockedBuffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_joined_pump", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	registry := newSessionConnectionRegistryWithLimit(1)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	dispatchStarted := make(chan struct{})
+	releaseDispatch := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseDispatch) }) }
+	t.Cleanup(release)
+	service.dispatchOperation = func(context.Context, *authenticatedSession, clientOperation) (operationResponse, bool, error) {
+		close(dispatchStarted)
+		<-releaseDispatch
+		return operationResponse{}, false, errors.New("injected terminal dispatch failure")
+	}
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		defer close(handlerDone)
+		service.handleConnect(response, request)
+	}))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	connection, err := openAuthenticatedTestSession(
+		endpoint,
+		privateKey,
+		encodedKey,
+		"01993ca6-6111-7aaa-8aaa-611111111111",
+		"host",
+		"/joined-pump",
+	)
+	if err != nil {
+		t.Fatalf("authenticate joined-pump session: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	listFrame := []byte(`{"v":1,"type":"list","request_id":"01993ca6-6222-7aaa-8aaa-622222222222","payload":{}}`)
+	if err := connection.Write(ctx, websocket.MessageText, listFrame); err != nil {
+		t.Fatalf("write operation before terminal dispatch failure: %v", err)
+	}
+	select {
+	case <-dispatchStarted:
+	case <-ctx.Done():
+		t.Fatal("terminal dispatcher did not start")
+	}
+
+	// Leave the next fragmented message unfinished so the pump is inside Reader
+	// when the operation owner returns terminally.
+	fragmentWriter, err := connection.Writer(ctx, websocket.MessageText)
+	if err != nil {
+		t.Fatalf("open unfinished client frame: %v", err)
+	}
+	partialFrame := append([]byte(`{"v":1,"type":"list","request_id":"01993ca6-6333-7aaa-8aaa-633333333333","payload":{"partial":"`),
+		[]byte(strings.Repeat("x", 64*1024))...)
+	if _, err := fragmentWriter.Write(partialFrame); err != nil {
+		t.Fatalf("write unfinished client frame: %v", err)
+	}
+	release()
+
+	select {
+	case <-reporter.reported:
+		if !strings.Contains(reporter.err().Error(), "injected terminal dispatch failure") {
+			t.Fatalf("terminal dispatch report = %v", reporter.err())
+		}
+	case <-ctx.Done():
+		t.Fatal("terminal dispatch failure was not reported")
+	}
+	select {
+	case <-handlerDone:
+	case <-ctx.Done():
+		t.Fatal("authenticated handler returned without joining blocked read pump")
+	}
+	_, _, readErr := connection.Read(ctx)
+	if readErr == nil {
+		t.Fatal("terminal dispatch failure left client connection open")
+	}
+	settleContext, cancelSettle := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSettle()
+	if err := registry.closeAndWait(settleContext); err != nil {
+		t.Fatalf("joined-pump registry did not settle: %v", err)
+	}
+}
+
+func TestOperationAdmissionLinearizesCompletedFrameAgainstDispatchSettlement(t *testing.T) {
+	const (
+		firstRequestID  = "01993ca6-7111-7aaa-8aaa-711111111111"
+		secondRequestID = "01993ca6-7222-7aaa-8aaa-722222222222"
+	)
+	listFrame := func(requestID string) []byte {
+		return []byte(`{"v":1,"type":"list","request_id":"` + requestID + `","payload":{}}`)
+	}
+	run := func(t *testing.T, publicationWins bool) {
+		t.Helper()
+		var logs lockedBuffer
+		logger := newEventLogger(&logs)
+		t.Cleanup(func() { _ = logger.close() })
+		reporter := newFatalRuntimeReporter()
+		pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+		if err != nil {
+			t.Fatalf("create pairing service: %v", err)
+		}
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("generate installation key: %v", err)
+		}
+		encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+		pairing.mu.Lock()
+		pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_admission_order", PublicKey: encodedKey}}
+		pairing.mu.Unlock()
+
+		registry := newSessionConnectionRegistryWithLimit(1)
+		service := newSessionAuthService(pairing, registry, logger, reporter.report)
+		delegate := service.dispatchOperation
+		firstDispatchStarted := make(chan struct{})
+		releaseFirstDispatch := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseFirst := func() { releaseOnce.Do(func() { close(releaseFirstDispatch) }) }
+		t.Cleanup(releaseFirst)
+		dispatched := make(chan string, 2)
+		service.dispatchOperation = func(ctx context.Context, session *authenticatedSession, operation clientOperation) (operationResponse, bool, error) {
+			dispatched <- operation.RequestID
+			if operation.RequestID == firstRequestID {
+				close(firstDispatchStarted)
+				<-releaseFirstDispatch
+			}
+			return delegate(ctx, session, operation)
+		}
+		secondAtDecision := make(chan struct{})
+		allowSecondDecision := make(chan struct{})
+		var decisionOnce sync.Once
+		if publicationWins {
+			service.beforeOperationAdmissionDecision = func(operation clientOperation) {
+				if operation.RequestID == secondRequestID {
+					decisionOnce.Do(func() { close(secondAtDecision) })
+					<-allowSecondDecision
+				}
+			}
+		}
+		firstPublished := make(chan struct{})
+		var publishedOnce sync.Once
+		service.afterOperationAdmissionPublication = func(operation clientOperation) {
+			if operation.RequestID == firstRequestID {
+				publishedOnce.Do(func() { close(firstPublished) })
+			}
+		}
+		secondDecision := make(chan bool, 1)
+		service.afterOperationAdmissionDecision = func(operation clientOperation, admitted bool) {
+			if operation.RequestID == secondRequestID {
+				secondDecision <- admitted
+			}
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+		t.Cleanup(server.Close)
+		endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+		connection, err := openAuthenticatedTestSession(
+			endpoint,
+			privateKey,
+			encodedKey,
+			"01993ca6-7333-7aaa-8aaa-733333333333",
+			"host",
+			"/admission-order",
+		)
+		if err != nil {
+			t.Fatalf("authenticate admission-order session: %v", err)
+		}
+		t.Cleanup(func() { _ = connection.CloseNow() })
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := connection.Write(ctx, websocket.MessageText, listFrame(firstRequestID)); err != nil {
+			t.Fatalf("write first list: %v", err)
+		}
+		select {
+		case <-firstDispatchStarted:
+		case <-ctx.Done():
+			t.Fatal("first dispatch did not start")
+		}
+		if err := connection.Write(ctx, websocket.MessageText, listFrame(secondRequestID)); err != nil {
+			t.Fatalf("write second list: %v", err)
+		}
+
+		if publicationWins {
+			select {
+			case <-secondAtDecision:
+			case <-ctx.Done():
+				t.Fatal("second frame did not reach controlled admission decision")
+			}
+			releaseFirst()
+			select {
+			case <-firstPublished:
+			case <-ctx.Done():
+				t.Fatal("first dispatch did not publish next admission")
+			}
+			close(allowSecondDecision)
+			select {
+			case admitted := <-secondDecision:
+				if !admitted {
+					t.Fatal("publication-before-claim ordering rejected second operation")
+				}
+			case <-ctx.Done():
+				t.Fatal("second admission decision did not complete")
+			}
+			for _, requestID := range []string{firstRequestID, secondRequestID} {
+				var response operationResponseEnvelope
+				if err := wsjson.Read(ctx, connection, &response); err != nil || response.Type != "roster" ||
+					response.RequestID != requestID {
+					t.Fatalf("ordered roster response = %+v error=%v, want request %s", response, err, requestID)
+				}
+			}
+			for _, requestID := range []string{firstRequestID, secondRequestID} {
+				select {
+				case actual := <-dispatched:
+					if actual != requestID {
+						t.Fatalf("dispatch order = %s, want %s", actual, requestID)
+					}
+				case <-ctx.Done():
+					t.Fatalf("request %s was not dispatched", requestID)
+				}
+			}
+		} else {
+			select {
+			case admitted := <-secondDecision:
+				if admitted {
+					t.Fatal("claim-before-publication ordering admitted second operation")
+				}
+			case <-ctx.Done():
+				t.Fatal("second admission decision did not complete")
+			}
+			releaseFirst()
+			_, data, readErr := connection.Read(ctx)
+			if readErr == nil || len(data) != 0 {
+				t.Fatalf("unsupported overlap did not generically close: data=%q error=%v", data, readErr)
+			}
+			select {
+			case actual := <-dispatched:
+				if actual != firstRequestID {
+					t.Fatalf("first dispatch = %s, want %s", actual, firstRequestID)
+				}
+			case <-ctx.Done():
+				t.Fatal("first operation was not dispatched")
+			}
+			select {
+			case actual := <-dispatched:
+				t.Fatalf("unsupported second operation dispatched as %s", actual)
+			default:
+			}
+		}
+		select {
+		case <-reporter.reported:
+			t.Fatalf("admission ordering caused fatal runtime failure: %v", reporter.err())
+		default:
+		}
+	}
+	t.Run("frame claim before publication closes", func(t *testing.T) { run(t, false) })
+	t.Run("publication before frame claim dispatches next", func(t *testing.T) { run(t, true) })
+}
+
+func TestSendDoesNotInstallOfferForUnpublishedExactSenderIdentity(t *testing.T) {
+	registry := newSessionConnectionRegistryWithLimit(2)
+	vanishedSender := &authenticatedSession{Address: "/sender@host#01993ca6-1111-7aaa-8aaa-111111111111"}
+	replacement := &authenticatedSession{Address: vanishedSender.Address}
+	recipient := &authenticatedSession{Address: "/recipient@host#01993ca6-2222-7aaa-8aaa-222222222222"}
+	registry.entries[&trackedSessionConnection{session: replacement, visible: true}] = struct{}{}
+	registry.entries[&trackedSessionConnection{session: recipient, visible: true}] = struct{}{}
+
+	dispatcher := newDeliveryDispatcher(registry)
+	offerAttempted := false
+	dispatcher.beforeRecipientOffer = func() { offerAttempted = true }
+	deadlineAttempted := false
+	dispatcher.deadlineFactory = func(time.Duration) deliveryDeadline {
+		deadlineAttempted = true
+		return deliveryDeadline{expired: make(chan time.Time), stop: func() bool { return true }}
+	}
+	response, respond, err := dispatcher.send(context.Background(), vanishedSender, clientOperation{
+		Type: "send",
+		Send: &sendOperationPayload{
+			MessageID: "01993ca6-3333-7aaa-8aaa-333333333333",
+			To:        recipient.Address,
+			Body:      json.RawMessage(`"private"`),
+		},
+	})
+	if err != nil || respond || response.Type != "" || response.Payload != nil || response.Outcome != "" {
+		t.Fatalf("unpublished exact sender result = response=%+v respond=%t error=%v", response, respond, err)
+	}
+	if offerAttempted || deadlineAttempted {
+		t.Fatalf("unpublished exact sender retained work: offer=%t deadline=%t", offerAttempted, deadlineAttempted)
 	}
 }
 
