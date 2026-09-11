@@ -205,24 +205,387 @@ func TestDeliverySettlesOnlyAfterExactRecipientAcknowledgement(t *testing.T) {
 	default:
 	}
 
-	const pendingRequestID = "01993c87-4444-7aaa-8aaa-444444444444"
-	pendingFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":"01993c87-5555-7aaa-8aaa-555555555555","to":%q,"body":"pending"}}`,
-		pendingRequestID, offer.Payload.To)
-	if err := sender.Write(ctx, websocket.MessageText, []byte(pendingFrame)); err != nil {
-		t.Fatalf("write pending send before shutdown: %v", err)
+}
+
+func TestDeliveryShutdownPreservesFirstPendingOwner(t *testing.T) {
+	tests := []struct {
+		name        string
+		cancelFirst bool
+	}{
+		{name: "shutdown first emits no send result"},
+		{name: "recipient cancellation first remains settled", cancelFirst: true},
 	}
-	var pendingOffer messageEnvelope
-	if err := wsjson.Read(ctx, recipient, &pendingOffer); err != nil {
-		t.Fatalf("read pending offer before shutdown: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const (
+				requestID        = "01993c87-4444-7aaa-8aaa-444444444444"
+				messageID        = "01993c87-5555-7aaa-8aaa-555555555555"
+				recipientRouteID = "01993c87-6666-7aaa-8aaa-666666666666"
+				recipientAddress = "/recipient@host#" + recipientRouteID
+				listRequestID    = "01993c87-7777-7aaa-8aaa-777777777777"
+				bodyMarker       = "shutdown-owner-body-must-stay-redacted"
+			)
+			logs := lockedBuffer{changed: make(chan struct{}, 1)}
+			logger := newEventLogger(&logs)
+			t.Cleanup(func() { _ = logger.close() })
+			reporter := newFatalRuntimeReporter()
+			pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+			if err != nil {
+				t.Fatalf("create pairing service: %v", err)
+			}
+			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("generate installation key: %v", err)
+			}
+			encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+			pairing.mu.Lock()
+			pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_shutdown_owner", PublicKey: encodedKey}}
+			pairing.mu.Unlock()
+
+			registry := newSessionConnectionRegistryWithLimit(2)
+			service := newSessionAuthService(pairing, registry, logger, reporter.report)
+			server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+			t.Cleanup(server.Close)
+			endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+			open := func(routeID, cwd string) *websocket.Conn {
+				t.Helper()
+				connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+				if openErr != nil {
+					t.Fatalf("authenticate %s: %v", cwd, openErr)
+				}
+				return connection
+			}
+			sender := open("01993c87-8888-7aaa-8aaa-888888888888", "/sender")
+			recipient := open(recipientRouteID, "/recipient")
+			t.Cleanup(func() { _ = sender.CloseNow() })
+			t.Cleanup(func() { _ = recipient.CloseNow() })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			awaitEvent := func(name string, matches func(map[string]any) bool) map[string]any {
+				t.Helper()
+				for {
+					for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+						var event map[string]any
+						if json.Unmarshal([]byte(line), &event) == nil && event["event"] == name && matches(event) {
+							return event
+						}
+					}
+					select {
+					case <-logs.changed:
+					case <-ctx.Done():
+						t.Fatalf("timed out waiting for %s: %s", name, logs.String())
+					}
+				}
+			}
+			awaitEvent("auth_accepted", func(event map[string]any) bool { return event["address"] == recipientAddress })
+
+			sendFrame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+				requestID, messageID, recipientAddress, bodyMarker)
+			if err := sender.Write(ctx, websocket.MessageText, []byte(sendFrame)); err != nil {
+				t.Fatalf("write pending send: %v", err)
+			}
+			var offer messageEnvelope
+			if err := wsjson.Read(ctx, recipient, &offer); err != nil {
+				t.Fatalf("read pending offer: %v", err)
+			}
+			if offer.Payload.MessageID != messageID || !isUUIDv7(offer.Payload.DeliveryID) {
+				t.Fatalf("pending offer = %+v", offer)
+			}
+
+			beginShutdown := func() {
+				t.Helper()
+				const callers = 8
+				start := make(chan struct{})
+				var wait sync.WaitGroup
+				wait.Add(callers)
+				for range callers {
+					go func() {
+						defer wait.Done()
+						<-start
+						registry.beginShutdown()
+					}()
+				}
+				close(start)
+				wait.Wait()
+			}
+			closeRecipient := func() {
+				t.Helper()
+				if err := recipient.Close(websocket.StatusNormalClosure, "pending owner boundary"); err != nil {
+					t.Fatalf("close recipient: %v", err)
+				}
+				awaitEvent("session_disconnected", func(event map[string]any) bool {
+					return event["address"] == recipientAddress
+				})
+			}
+			if test.cancelFirst {
+				closeRecipient()
+				beginShutdown()
+			} else {
+				beginShutdown()
+				closeRecipient()
+			}
+
+			listFrame := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, listRequestID)
+			if err := sender.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
+				t.Fatalf("write list shutdown barrier: %v", err)
+			}
+			if test.cancelFirst {
+				messageType, data, readErr := sender.Read(ctx)
+				expected := `{"v":1,"type":"send_result","request_id":"` + requestID +
+					`","payload":{"message_id":"` + messageID + `","status":"timeout","reason":"recipient_disconnected"}}`
+				if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
+					t.Fatalf("recipient-owned result = type %d %s error=%v, want %s", messageType, data, readErr, expected)
+				}
+			}
+			var roster operationResponseEnvelope
+			if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Version != 1 ||
+				roster.Type != "roster" || roster.RequestID != listRequestID {
+				t.Fatalf("shutdown list barrier = %+v error=%v", roster, err)
+			}
+			awaitEvent("operation_settled", func(event map[string]any) bool {
+				return event["request_id"] == listRequestID
+			})
+
+			var settlements []map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var event map[string]any
+				if json.Unmarshal([]byte(line), &event) == nil && event["event"] == "send_settled" &&
+					event["message_id"] == messageID {
+					settlements = append(settlements, event)
+				}
+			}
+			if !test.cancelFirst && len(settlements) != 0 {
+				t.Fatalf("shutdown-owned send settlements = %#v", settlements)
+			}
+			if test.cancelFirst {
+				if len(settlements) != 1 {
+					t.Fatalf("recipient-owned settlement count = %d, want 1: %s", len(settlements), logs.String())
+				}
+				settlement := settlements[0]
+				if settlement["request_id"] != requestID || settlement["delivery_id"] != offer.Payload.DeliveryID ||
+					settlement["reason"] != "recipient_disconnected" || settlement["code"] != "recipient_disconnected" ||
+					settlement["status"] != "timeout" || settlement["body"] != redacted {
+					t.Fatalf("recipient-owned settlement = %#v", settlement)
+				}
+			}
+			if strings.Contains(logs.String(), bodyMarker) {
+				t.Fatalf("pending owner telemetry leaked body: %s", logs.String())
+			}
+			select {
+			case <-reporter.reported:
+				t.Fatalf("pending owner boundary caused fatal runtime failure: %v", reporter.err())
+			default:
+			}
+		})
 	}
-	shutdownStarted := time.Now()
-	shutdown, stop := context.WithTimeout(context.Background(), 2*time.Second)
-	defer stop()
-	if err := registry.closeAndWait(shutdown); err != nil {
-		t.Fatalf("bounded registry shutdown: %v", err)
+}
+
+func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
+	tests := []struct {
+		name        string
+		cancelFirst bool
+	}{
+		{name: "shutdown owner emits no send result"},
+		{name: "recipient cancellation owner remains settled", cancelFirst: true},
 	}
-	if elapsed := time.Since(shutdownStarted); elapsed >= time.Second {
-		t.Fatalf("pending delivery delayed shutdown by %s", elapsed)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const (
+				senderRouteID    = "01993ca4-1111-7aaa-8aaa-111111111111"
+				recipientRouteID = "01993ca4-2222-7aaa-8aaa-222222222222"
+				requestID        = "01993ca4-3333-7aaa-8aaa-333333333333"
+				messageID        = "01993ca4-4444-7aaa-8aaa-444444444444"
+				listRequestID    = "01993ca4-5555-7aaa-8aaa-555555555555"
+				bodyMarker       = "oversized-offer-owner-body-must-stay-redacted"
+				inboundBytes     = 524288
+				outboundBytes    = 528691
+			)
+			senderCWD := strings.Repeat("c", maxCWDBytes)
+			senderHostname := strings.Repeat("h", maxHostnameBytes)
+			senderAddress := senderCWD + "@" + senderHostname + "#" + senderRouteID
+			recipientAddress := "/recipient@host#" + recipientRouteID
+
+			logs := lockedBuffer{changed: make(chan struct{}, 1)}
+			logger := newEventLogger(&logs)
+			t.Cleanup(func() { _ = logger.close() })
+			reporter := newFatalRuntimeReporter()
+			pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+			if err != nil {
+				t.Fatalf("create pairing service: %v", err)
+			}
+			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("generate installation key: %v", err)
+			}
+			encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+			pairing.mu.Lock()
+			pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_oversized_offer_owner", PublicKey: encodedKey}}
+			pairing.mu.Unlock()
+
+			registry := newSessionConnectionRegistryWithLimit(2)
+			service := newSessionAuthService(pairing, registry, logger, reporter.report)
+			dispatcher := newDeliveryDispatcher(registry)
+			offerInstalled := make(chan struct{})
+			releaseOffer := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseOffer) }) }
+			defer release()
+			dispatcher.beforeRecipientOffer = func() {
+				close(offerInstalled)
+				<-releaseOffer
+			}
+			service.dispatchOperation = dispatcher.dispatch
+			server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+			t.Cleanup(server.Close)
+			endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+			open := func(routeID, hostname, cwd string) *websocket.Conn {
+				t.Helper()
+				connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, hostname, cwd)
+				if openErr != nil {
+					t.Fatalf("authenticate route %s: %v", routeID, openErr)
+				}
+				return connection
+			}
+			sender := open(senderRouteID, senderHostname, senderCWD)
+			recipient := open(recipientRouteID, "host", "/recipient")
+			t.Cleanup(func() { _ = sender.CloseNow() })
+			t.Cleanup(func() { _ = recipient.CloseNow() })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			awaitEvent := func(name string, matches func(map[string]any) bool) map[string]any {
+				t.Helper()
+				for {
+					for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+						var event map[string]any
+						if json.Unmarshal([]byte(line), &event) == nil && event["event"] == name && matches(event) {
+							return event
+						}
+					}
+					select {
+					case <-logs.changed:
+					case <-ctx.Done():
+						t.Fatalf("timed out waiting for %s: %s", name, logs.String())
+					}
+				}
+			}
+			awaitEvent("auth_accepted", func(event map[string]any) bool { return event["address"] == recipientAddress })
+
+			buildSendFrame := func(body string) []byte {
+				t.Helper()
+				encodedBody, encodeErr := json.Marshal(body)
+				if encodeErr != nil {
+					t.Fatalf("encode boundary body: %v", encodeErr)
+				}
+				return []byte(fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%s}}`,
+					requestID, messageID, recipientAddress, encodedBody))
+			}
+			body := bodyMarker
+			body += strings.Repeat("x", maxFrameBytes-len(buildSendFrame(body)))
+			frame := buildSendFrame(body)
+			if len(frame) != inboundBytes || len(frame) > maxFrameBytes {
+				t.Fatalf("legal inbound send size = %d, want exactly %d and <= %d", len(frame), inboundBytes, maxFrameBytes)
+			}
+			encodedBody, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("encode expected offer body: %v", err)
+			}
+			expectedOffer, err := json.Marshal(messageEnvelope{
+				Version: 1,
+				Type:    "message",
+				Payload: messagePayload{
+					DeliveryID: "01993ca4-6666-7aaa-8aaa-666666666666",
+					MessageID:  messageID,
+					From:       senderAddress,
+					To:         recipientAddress,
+					Body:       json.RawMessage(encodedBody),
+				},
+			})
+			if err != nil {
+				t.Fatalf("encode expected outbound offer: %v", err)
+			}
+			if len(expectedOffer) != outboundBytes || len(expectedOffer) <= maxFrameBytes {
+				t.Fatalf("relay-created outbound offer size = %d, want exactly %d and > %d", len(expectedOffer), outboundBytes, maxFrameBytes)
+			}
+
+			if err := sender.Write(ctx, websocket.MessageText, frame); err != nil {
+				t.Fatalf("write legal boundary send: %v", err)
+			}
+			select {
+			case <-offerInstalled:
+			case <-ctx.Done():
+				t.Fatal("post-install offer boundary was not reached")
+			}
+			if test.cancelFirst {
+				if err := recipient.Close(websocket.StatusNormalClosure, "claim oversized offer"); err != nil {
+					t.Fatalf("close recipient at post-install boundary: %v", err)
+				}
+				awaitEvent("session_disconnected", func(event map[string]any) bool {
+					return event["address"] == recipientAddress
+				})
+			} else {
+				registry.beginShutdown()
+			}
+			release()
+
+			listFrame := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, listRequestID)
+			if err := sender.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
+				t.Fatalf("write post-owner list barrier: %v", err)
+			}
+			if test.cancelFirst {
+				messageType, data, readErr := sender.Read(ctx)
+				expected := `{"v":1,"type":"send_result","request_id":"` + requestID +
+					`","payload":{"message_id":"` + messageID + `","status":"timeout","reason":"recipient_disconnected"}}`
+				if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
+					t.Fatalf("recipient-owned oversized result = type %d %s error=%v, want %s", messageType, data, readErr, expected)
+				}
+			}
+			var roster operationResponseEnvelope
+			if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Version != 1 ||
+				roster.Type != "roster" || roster.RequestID != listRequestID {
+				t.Fatalf("post-owner list barrier = %+v error=%v", roster, err)
+			}
+			awaitEvent("operation_settled", func(event map[string]any) bool {
+				return event["request_id"] == listRequestID
+			})
+
+			var settlements []map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var event map[string]any
+				if json.Unmarshal([]byte(line), &event) == nil && event["event"] == "send_settled" &&
+					event["message_id"] == messageID {
+					settlements = append(settlements, event)
+				}
+			}
+			if test.cancelFirst {
+				if len(settlements) != 1 {
+					t.Fatalf("recipient-owned oversized settlement count = %d, want 1: %s", len(settlements), logs.String())
+				}
+				settlement := settlements[0]
+				if settlement["level"] != "info" || settlement["result"] != "settled" || settlement["type"] != "send" ||
+					settlement["request_id"] != requestID || settlement["message_id"] != messageID ||
+					settlement["sender_route"] != senderAddress || settlement["recipient_route"] != recipientAddress ||
+					settlement["reason"] != "recipient_disconnected" || settlement["code"] != "recipient_disconnected" ||
+					settlement["status"] != "timeout" || settlement["body"] != redacted ||
+					!isUUIDv7(fmt.Sprint(settlement["delivery_id"])) {
+					t.Fatalf("recipient-owned oversized settlement = %#v", settlement)
+				}
+				if _, ok := settlement["latency_ms"].(float64); !ok {
+					t.Fatalf("recipient-owned oversized settlement latency = %#v", settlement["latency_ms"])
+				}
+			} else if len(settlements) != 0 {
+				t.Fatalf("shutdown-owned oversized settlements = %#v", settlements)
+			}
+			if strings.Contains(logs.String(), bodyMarker) {
+				t.Fatalf("oversized owner telemetry leaked body fixture: %s", logs.String())
+			}
+			select {
+			case <-reporter.reported:
+				t.Fatalf("oversized owner boundary caused fatal runtime failure: %v", reporter.err())
+			default:
+			}
+		})
 	}
 }
 
@@ -751,14 +1114,31 @@ func TestReadyDeadlineCannotRelabelAcknowledgementOrRecipientCancellation(t *tes
 		t.Fatalf("cancelled recipient remained publicly visible: %+v", response)
 	}
 	close(cancelDeadline.release)
+	messageType, data, err = sender.Read(ctx)
+	expectedDisconnected := `{"v":1,"type":"send_result","request_id":"` + cancelRequestID +
+		`","payload":{"message_id":"` + cancelMessageID + `","status":"timeout","reason":"recipient_disconnected"}}`
+	if err != nil || messageType != websocket.MessageText || string(data) != expectedDisconnected {
+		t.Fatalf("both-ready recipient disconnect result = type %d %s error=%v, want %s", messageType, data, err, expectedDisconnected)
+	}
 	list(sender, "01993ca1-6ccc-7aaa-8aaa-cccccccccccc")
 
+	var cancellationSettlements []map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
 		var event map[string]any
 		if json.Unmarshal([]byte(line), &event) == nil && event["event"] == "send_settled" &&
 			event["message_id"] == cancelMessageID {
-			t.Fatalf("recipient cancellation was relabelled as settled: %#v", event)
+			cancellationSettlements = append(cancellationSettlements, event)
 		}
+	}
+	if len(cancellationSettlements) != 1 {
+		t.Fatalf("recipient disconnect settlement count = %d, want 1: %s", len(cancellationSettlements), logs.String())
+	}
+	cancellationSettlement := cancellationSettlements[0]
+	if cancellationSettlement["result"] != "settled" || cancellationSettlement["reason"] != "recipient_disconnected" ||
+		cancellationSettlement["code"] != "recipient_disconnected" || cancellationSettlement["request_id"] != cancelRequestID ||
+		cancellationSettlement["message_id"] != cancelMessageID || cancellationSettlement["status"] != "timeout" ||
+		cancellationSettlement["body"] != redacted {
+		t.Fatalf("recipient disconnect telemetry = %#v", cancellationSettlement)
 	}
 	if strings.Contains(logs.String(), bodyMarker) {
 		t.Fatalf("boundary telemetry leaked body: %s", logs.String())
@@ -766,6 +1146,346 @@ func TestReadyDeadlineCannotRelabelAcknowledgementOrRecipientCancellation(t *tes
 	select {
 	case <-reporter.reported:
 		t.Fatalf("deadline boundary caused fatal runtime failure: %v", reporter.err())
+	default:
+	}
+}
+
+func TestOfferWriteFailureAfterRecipientUnpublishesReturnsRecipientDisconnected(t *testing.T) {
+	const (
+		requestID        = "01993ca3-1111-7aaa-8aaa-111111111111"
+		messageID        = "01993ca3-2222-7aaa-8aaa-222222222222"
+		recipientAddress = "/recipient@host#01993ca3-3333-7aaa-8aaa-333333333333"
+		bodyMarker       = "write-failure-body-must-stay-redacted"
+	)
+	logs := lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_write_failure", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	registry := newSessionConnectionRegistryWithLimit(2)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	dispatcher := newDeliveryDispatcher(registry)
+	writeReached := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	dispatcher.beforeRecipientOffer = func() {
+		close(writeReached)
+		<-releaseWrite
+	}
+	service.dispatchOperation = dispatcher.dispatch
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	open := func(routeID, cwd string) *websocket.Conn {
+		t.Helper()
+		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		if openErr != nil {
+			t.Fatalf("authenticate %s: %v", cwd, openErr)
+		}
+		return connection
+	}
+	sender := open("01993ca3-4444-7aaa-8aaa-444444444444", "/sender")
+	recipient := open("01993ca3-3333-7aaa-8aaa-333333333333", "/recipient")
+	t.Cleanup(func() { _ = sender.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	awaitEvent := func(name string, matches func(map[string]any) bool) map[string]any {
+		t.Helper()
+		for {
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var event map[string]any
+				if json.Unmarshal([]byte(line), &event) == nil && event["event"] == name && matches(event) {
+					return event
+				}
+			}
+			select {
+			case <-logs.changed:
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for %s: %s", name, logs.String())
+			}
+		}
+	}
+	awaitEvent("auth_accepted", func(event map[string]any) bool { return event["address"] == recipientAddress })
+	frame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+		requestID, messageID, recipientAddress, bodyMarker)
+	if err := sender.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+		t.Fatalf("write send before recipient unpublish: %v", err)
+	}
+	select {
+	case <-writeReached:
+	case <-ctx.Done():
+		t.Fatal("recipient write boundary was not reached")
+	}
+	if err := recipient.CloseNow(); err != nil {
+		t.Fatalf("force-close recipient before offer write: %v", err)
+	}
+	awaitEvent("session_disconnected", func(event map[string]any) bool { return event["address"] == recipientAddress })
+	close(releaseWrite)
+
+	messageType, data, readErr := sender.Read(ctx)
+	expected := `{"v":1,"type":"send_result","request_id":"` + requestID +
+		`","payload":{"message_id":"` + messageID + `","status":"timeout","reason":"recipient_disconnected"}}`
+	if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
+		t.Fatalf("write-failure result = type %d %s error=%v, want %s", messageType, data, readErr, expected)
+	}
+	settlement := awaitEvent("send_settled", func(event map[string]any) bool { return event["message_id"] == messageID })
+	if settlement["code"] != "recipient_disconnected" || settlement["status"] != "timeout" ||
+		settlement["body"] != redacted || !isUUIDv7(fmt.Sprint(settlement["delivery_id"])) ||
+		strings.Contains(logs.String(), bodyMarker) {
+		t.Fatalf("write-failure telemetry = %#v logs=%s", settlement, logs.String())
+	}
+	listFrame := `{"v":1,"type":"list","request_id":"01993ca3-5555-7aaa-8aaa-555555555555","payload":{}}`
+	if err := sender.Write(ctx, websocket.MessageText, []byte(listFrame)); err != nil {
+		t.Fatalf("write list after offer write failure: %v", err)
+	}
+	var roster operationResponseEnvelope
+	if err := wsjson.Read(ctx, sender, &roster); err != nil || roster.Type != "roster" {
+		t.Fatalf("sender unusable after offer write failure: response=%+v error=%v", roster, err)
+	}
+	select {
+	case <-reporter.reported:
+		t.Fatalf("offer write failure caused fatal runtime failure: %v", reporter.err())
+	default:
+	}
+}
+
+func TestRecipientDisconnectSettlesEverySenderWithoutReplayAndKeepsSocketsUsable(t *testing.T) {
+	const (
+		recipientRouteID = "01993ca2-1111-7aaa-8aaa-111111111111"
+		recipientAddress = "/recipient@host#" + recipientRouteID
+		senderOneAddress = "/sender-one@host#01993ca2-2222-7aaa-8aaa-222222222222"
+		senderTwoAddress = "/sender-two@host#01993ca2-3333-7aaa-8aaa-333333333333"
+	)
+	bodyMarkers := []string{"recipient-disconnect-private-one", "recipient-disconnect-private-two"}
+	requestIDs := []string{
+		"01993ca2-4444-7aaa-8aaa-444444444444",
+		"01993ca2-5555-7aaa-8aaa-555555555555",
+	}
+	messageIDs := []string{
+		"01993ca2-6666-7aaa-8aaa-666666666666",
+		"01993ca2-7777-7aaa-8aaa-777777777777",
+	}
+
+	logs := lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	pairing, err := newPairingService(t.TempDir(), "", logger, reporter.report)
+	if err != nil {
+		t.Fatalf("create pairing service: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate installation key: %v", err)
+	}
+	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
+	pairing.mu.Lock()
+	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_recipient_disconnect", PublicKey: encodedKey}}
+	pairing.mu.Unlock()
+
+	registry := newSessionConnectionRegistryWithLimit(4)
+	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	open := func(routeID, cwd string) *websocket.Conn {
+		t.Helper()
+		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		if openErr != nil {
+			t.Fatalf("authenticate %s: %v", cwd, openErr)
+		}
+		return connection
+	}
+
+	recipient := open(recipientRouteID, "/recipient")
+	senderOne := open("01993ca2-2222-7aaa-8aaa-222222222222", "/sender-one")
+	senderTwo := open("01993ca2-3333-7aaa-8aaa-333333333333", "/sender-two")
+	t.Cleanup(func() { _ = senderOne.CloseNow() })
+	t.Cleanup(func() { _ = senderTwo.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	awaitLog := func(name string, matches func(map[string]any) bool) map[string]any {
+		t.Helper()
+		for {
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var event map[string]any
+				if json.Unmarshal([]byte(line), &event) == nil && event["event"] == name && matches(event) {
+					return event
+				}
+			}
+			select {
+			case <-logs.changed:
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for %s: %s", name, logs.String())
+			}
+		}
+	}
+	awaitLog("auth_accepted", func(event map[string]any) bool { return event["address"] == senderTwoAddress })
+
+	senders := []*websocket.Conn{senderOne, senderTwo}
+	for index, sender := range senders {
+		frame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":%q}}`,
+			requestIDs[index], messageIDs[index], recipientAddress, bodyMarkers[index])
+		if err := sender.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+			t.Fatalf("write pending send %d: %v", index, err)
+		}
+	}
+	offers := make(map[string]messageEnvelope, len(senders))
+	for range senders {
+		var offer messageEnvelope
+		if err := wsjson.Read(ctx, recipient, &offer); err != nil {
+			t.Fatalf("read pending recipient offer: %v", err)
+		}
+		offers[offer.Payload.MessageID] = offer
+	}
+	if len(offers) != 2 || offers[messageIDs[0]].Payload.DeliveryID == offers[messageIDs[1]].Payload.DeliveryID {
+		t.Fatalf("distinct pending offers = %#v", offers)
+	}
+	if err := recipient.Close(websocket.StatusNormalClosure, "recipient unavailable before ACK"); err != nil {
+		t.Fatalf("close recipient before ACK: %v", err)
+	}
+	awaitLog("session_disconnected", func(event map[string]any) bool { return event["address"] == recipientAddress })
+
+	for index, sender := range senders {
+		messageType, data, readErr := sender.Read(ctx)
+		expected := `{"v":1,"type":"send_result","request_id":"` + requestIDs[index] +
+			`","payload":{"message_id":"` + messageIDs[index] + `","status":"timeout","reason":"recipient_disconnected"}}`
+		if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
+			t.Fatalf("recipient disconnect result %d = type %d %s error=%v, want %s", index, messageType, data, readErr, expected)
+		}
+	}
+
+	settlements := make(map[string][]map[string]any, len(messageIDs))
+	for _, messageID := range messageIDs {
+		awaitLog("send_settled", func(event map[string]any) bool { return event["message_id"] == messageID })
+	}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) == nil && event["event"] == "send_settled" {
+			for _, messageID := range messageIDs {
+				if event["message_id"] == messageID {
+					settlements[messageID] = append(settlements[messageID], event)
+				}
+			}
+		}
+	}
+	for index, messageID := range messageIDs {
+		if len(settlements[messageID]) != 1 {
+			t.Fatalf("settlement count for %s = %d, want 1: %s", messageID, len(settlements[messageID]), logs.String())
+		}
+		settlement := settlements[messageID][0]
+		if settlement["level"] != "info" || settlement["result"] != "settled" ||
+			settlement["reason"] != "recipient_disconnected" || settlement["code"] != "recipient_disconnected" ||
+			settlement["type"] != "send" || settlement["request_id"] != requestIDs[index] ||
+			settlement["delivery_id"] != offers[messageID].Payload.DeliveryID ||
+			settlement["recipient_route"] != recipientAddress || settlement["status"] != "timeout" ||
+			settlement["body"] != redacted {
+			t.Fatalf("recipient disconnect telemetry for %s = %#v", messageID, settlement)
+		}
+		wantSender := senderOneAddress
+		if index == 1 {
+			wantSender = senderTwoAddress
+		}
+		if settlement["sender_route"] != wantSender {
+			t.Fatalf("sender route for %s = %#v, want %s", messageID, settlement["sender_route"], wantSender)
+		}
+		if _, ok := settlement["latency_ms"].(float64); !ok {
+			t.Fatalf("latency for %s is not numeric: %#v", messageID, settlement["latency_ms"])
+		}
+	}
+	for _, marker := range bodyMarkers {
+		if strings.Contains(logs.String(), marker) {
+			t.Fatalf("recipient disconnect telemetry leaked body marker %q: %s", marker, logs.String())
+		}
+	}
+
+	list := func(connection *websocket.Conn, requestID string) {
+		t.Helper()
+		frame := fmt.Sprintf(`{"v":1,"type":"list","request_id":%q,"payload":{}}`, requestID)
+		if err := connection.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+			t.Fatalf("write list %s: %v", requestID, err)
+		}
+		var response operationResponseEnvelope
+		if err := wsjson.Read(ctx, connection, &response); err != nil || response.Type != "roster" || response.RequestID != requestID {
+			t.Fatalf("read list %s = %+v error=%v", requestID, response, err)
+		}
+	}
+	list(senderOne, "01993ca2-8888-7aaa-8aaa-888888888888")
+	list(senderTwo, "01993ca2-9999-7aaa-8aaa-999999999999")
+
+	reconnected := open(recipientRouteID, "/recipient")
+	t.Cleanup(func() { _ = reconnected.CloseNow() })
+	awaitLog("auth_accepted", func(event map[string]any) bool {
+		return event["address"] == recipientAddress && strings.Count(logs.String(), `"address":"`+recipientAddress+`"`) >= 3
+	})
+	list(reconnected, "01993ca2-aaaa-7aaa-8aaa-aaaaaaaaaaaa")
+	for index, messageID := range messageIDs {
+		staleACK := fmt.Sprintf(`{"v":1,"type":"received","request_id":"01993ca2-bbb%d-7aaa-8aaa-bbbbbbbbbbb%d","payload":{"delivery_id":%q,"message_id":%q}}`,
+			index, index, offers[messageID].Payload.DeliveryID, messageID)
+		if err := reconnected.Write(ctx, websocket.MessageText, []byte(staleACK)); err != nil {
+			t.Fatalf("write stale ACK %d: %v", index, err)
+		}
+	}
+	list(reconnected, "01993ca2-cccc-7aaa-8aaa-cccccccccccc")
+
+	freshRequestIDs := []string{
+		"01993ca2-dddd-7aaa-8aaa-dddddddddddd",
+		"01993ca2-eeee-7aaa-8aaa-eeeeeeeeeeee",
+	}
+	freshMessageIDs := []string{
+		"01993ca2-f111-7aaa-8aaa-fffffffffff1",
+		"01993ca2-f222-7aaa-8aaa-fffffffffff2",
+	}
+	for index, sender := range senders {
+		frame := fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":%q,"body":"fresh"}}`,
+			freshRequestIDs[index], freshMessageIDs[index], recipientAddress)
+		if err := sender.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+			t.Fatalf("write fresh send %d: %v", index, err)
+		}
+	}
+	freshOffers := make(map[string]messageEnvelope, len(senders))
+	for range senders {
+		var offer messageEnvelope
+		if err := wsjson.Read(ctx, reconnected, &offer); err != nil {
+			t.Fatalf("read fresh offer: %v", err)
+		}
+		freshOffers[offer.Payload.MessageID] = offer
+	}
+	for index, messageID := range freshMessageIDs {
+		offer := freshOffers[messageID]
+		if !isUUIDv7(offer.Payload.DeliveryID) || offer.Payload.DeliveryID == offers[messageIDs[index]].Payload.DeliveryID {
+			t.Fatalf("fresh offer %s = %+v", messageID, offer)
+		}
+		ack := fmt.Sprintf(`{"v":1,"type":"received","request_id":"01993ca3-000%d-7aaa-8aaa-00000000000%d","payload":{"delivery_id":%q,"message_id":%q}}`,
+			index, index, offer.Payload.DeliveryID, messageID)
+		if err := reconnected.Write(ctx, websocket.MessageText, []byte(ack)); err != nil {
+			t.Fatalf("ACK fresh offer %d: %v", index, err)
+		}
+	}
+	for index, sender := range senders {
+		messageType, data, readErr := sender.Read(ctx)
+		expected := `{"v":1,"type":"send_result","request_id":"` + freshRequestIDs[index] +
+			`","payload":{"message_id":"` + freshMessageIDs[index] + `","status":"received"}}`
+		if readErr != nil || messageType != websocket.MessageText || string(data) != expected {
+			t.Fatalf("fresh result %d = type %d %s error=%v, want %s", index, messageType, data, readErr, expected)
+		}
+	}
+	select {
+	case <-reporter.reported:
+		t.Fatalf("recipient lifecycle caused fatal runtime failure: %v", reporter.err())
 	default:
 	}
 }

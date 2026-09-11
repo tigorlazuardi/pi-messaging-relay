@@ -1,6 +1,6 @@
 ---
 title: Send an online message
-description: Send online messages, handle immediate offline results, and make independently settled correlated replies.
+description: Send online messages and interpret offline, recipient-disconnected, ACK-timeout, and received results.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -15,13 +15,14 @@ import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 3. Keep the returned `message_id` when you need to correlate relay logs.
 4. Treat `status: "received"` only as an attempted recipient-extension injection.
 5. Treat `status: "timeout", reason: "offline"` as immediate current absence; the same connection remains usable.
-6. Treat `status: "timeout", reason: "ack_timeout"` as an offer written to a connected recipient that did not return the exact ACK within five seconds; both connections remain usable.
+6. Treat `status: "timeout", reason: "recipient_disconnected"` as relay-observed loss of the selected recipient session or failure to write its offer before ACK; the sender connection remains usable.
+7. Treat `status: "timeout", reason: "ack_timeout"` as an offer written to a connected recipient that did not return the exact ACK within five seconds; both connections remain usable.
 </Steps>
 
 The extension creates the message ID. Do not add `message_id`, delivery options, or steering fields to tool input. Every recipient sees a provenance header containing the complete quoted sender address and generated message ID. The extension treats that address as opaque; copy it whole. Delivery mode comes only from the recipient's current local state: an idle recipient gets `pi.sendUserMessage(rendered)` with no options, while a busy recipient gets `pi.sendUserMessage(rendered, { deliverAs: "followUp" })`. A follow-up waits behind all active recipient work; it does not steer or change the current run.
 
 <Aside type="caution" title="Results are current and best effort">
-`received` does not mean Pi persisted or queued the text, a model read it, work completed, or a reply will arrive. `timeout/offline` means only that the exact opaque destination was not currently published when the relay looked it up; it does not reveal whether that route ever existed. `timeout/ack_timeout` means the relay wrote the offer but did not receive matching delivery and message IDs from that exact recipient extension within five seconds. It is not a model-read, completion, queue-durability, or message-durability status. Relay restart, extension reload, process termination, or crash can lose downstream work.
+`received` does not mean Pi persisted or queued the text, a model read it, work completed, or a reply will arrive. `timeout/offline` means only that the exact opaque destination was not currently published when the relay looked it up; it does not reveal whether that route ever existed. `timeout/recipient_disconnected` means lookup found a recipient but the relay observed that exact session or offer write become unavailable before ACK. `timeout/ack_timeout` means the relay wrote the offer but did not receive matching delivery and message IDs from that exact recipient extension within five seconds. None is a model-read, completion, queue-durability, or message-durability status. Relay restart, extension reload, process termination, or crash can lose downstream work.
 </Aside>
 
 ## Reply using the provenance header
@@ -43,9 +44,9 @@ The extension generates a new reply message ID; it never reuses the original ID.
 
 ## Current limits
 
-This release completes successful idle and busy string/object delivery with deterministic provenance, ordinary correlated replies with fresh IDs and independent results, immediate `timeout/offline` settlement when the exact destination is absent from the current registry, and `timeout/ack_timeout` settlement when a written offer receives no exact ACK within five seconds. String bodies are unchanged after the one LF that separates the header. Object keys are sorted recursively by JavaScript UTF-16 lexical order, including integer-like names; arrays retain their order and output is compact JSON. A registry miss creates no recipient offer, delivery ID, pending work, or history and does not close the sender connection. ACK timeout removes the pending offer before responding; a late ACK produces no response, cannot change the result, and does not damage the recipient connection. Recipient disconnect after lookup (#20) still lacks a final machine-readable result. Automatic reconnect is not available.
+This release completes successful idle and busy string/object delivery with deterministic provenance, ordinary correlated replies with fresh IDs and independent results, immediate `timeout/offline` settlement when the exact destination is absent from the current registry, `timeout/recipient_disconnected` settlement when the selected recipient session or offer write disappears before ACK, and `timeout/ack_timeout` settlement when a written offer receives no exact ACK within five seconds. String bodies are unchanged after the one LF that separates the header. Object keys are sorted recursively by JavaScript UTF-16 lexical order, including integer-like names; arrays retain their order and output is compact JSON. A registry miss creates no recipient offer, delivery ID, pending work, or history and does not close the sender connection. ACK timeout removes the pending offer before responding; a late ACK produces no response, cannot change the result, and does not damage the recipient connection. Disconnect cancellation releases every affected pending offer once. ACK, expiry, and disconnect compete for exact ownership, so a stale event cannot relabel the result. Reconnecting the same installation and address does not replay interrupted offers; stale ACKs are harmless, and only a fresh send creates a fresh offer. Automatic reconnect is not available.
 
-Only one `list_peers` or `agent_send` request may be active on one extension connection. A concurrent request fails locally without being queued. After an offline or ACK-timeout result, use the same connection for `list_peers` or another send. The extension allows five seconds for a list response and eight seconds for a send response. The eight-second send deadline starts before relay processing and leaves room for the relay's bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender response write, and scheduling. It does not reduce the recipient's five seconds. There is no transport retry, offline inbox, persistence, replay, broadcast, delivery history, or proof that an absent route existed before. The final 256 KiB body rejection behavior belongs to #24; every complete transport frame is currently bounded to 512 KiB.
+Only one `list_peers` or `agent_send` request may be active on one extension connection. A concurrent request fails locally without being queued. After an offline, recipient-disconnected, or ACK-timeout result, use the same sender connection for `list_peers` or another send. The extension allows five seconds for a list response and eight seconds for a send response. The eight-second send deadline starts before relay processing and leaves room for the relay's bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender response write, and scheduling. It does not reduce the recipient's five seconds. There is no transport retry, offline inbox, persistence, replay, broadcast, delivery history, or proof that an absent route existed before. The final 256 KiB body rejection behavior belongs to #24; every complete transport frame is currently bounded to 512 KiB.
 
 ### I/O examples
 
@@ -86,6 +87,11 @@ Only one `list_peers` or `agent_send` request may be active on one extension con
     {"message_id":"01993c88-2bc4-7432-87e8-16ca3c324a3f","status":"timeout","reason":"offline"}
     ```
   </TabItem>
+  <TabItem label="Recipient-disconnected output">
+    ```json
+    {"message_id":"01993c8a-4de6-7654-a9fa-38ec5d546c51","status":"timeout","reason":"recipient_disconnected"}
+    ```
+  </TabItem>
   <TabItem label="ACK-timeout output">
     ```json
     {"message_id":"01993c89-3cd5-7543-98f9-27db4c435b40","status":"timeout","reason":"ack_timeout"}
@@ -112,20 +118,20 @@ Only one `list_peers` or `agent_send` request may be active on one extension con
     Relay agent_send already has one request in flight.
     ```
   </TabItem>
-  <TabItem label="Deferred recipient-disconnect timeout error">
-    ```text
-    Relay agent_send response timed out.
+  <TabItem label="Recipient-disconnected wire result">
+    ```json
+    {"v":1,"type":"send_result","request_id":"01993c8a-3476-7012-b345-6789abcdef01","payload":{"message_id":"01993c8a-4de6-7654-a9fa-38ec5d546c51","status":"timeout","reason":"recipient_disconnected"}}
     ```
   </TabItem>
 </Tabs>
 
 ## Security and troubleshooting
 
-Message bodies are not persisted or logged. Server telemetry includes public route, request, and message identifiers while the `body` field contains only `<redacted>`. Successful delivery also includes a delivery ID. Offline settlement includes `status: "timeout"`, `reason`/`code: "offline"`, and the exact requested destination, but no delivery ID. ACK-timeout settlement includes the generated delivery ID, `status: "timeout"`, and `reason`/`code: "ack_timeout"`; a late ACK emits no second settlement.
+Message bodies are not persisted or logged. Server telemetry includes public route, request, and message identifiers while the `body` field contains only `<redacted>`. Successful delivery also includes a delivery ID. Offline settlement includes `status: "timeout"`, `reason`/`code: "offline"`, and the exact requested destination, but no delivery ID. Recipient-disconnect and ACK-timeout settlements include the generated delivery ID, `status: "timeout"`, and exact `reason`/`code: "recipient_disconnected"` or `"ack_timeout"`; stale competing events emit no second settlement.
 
 - **Offline result:** refresh `list_peers` or choose another destination. The retained connection is still usable; retrying the same absent address does not create an inbox or history.
-- **ACK-timeout result:** the recipient was connected when the relay wrote the offer but no exact extension ACK arrived within five seconds. The pending slot is released and both sockets remain usable; retry is not automatic or idempotent in this release.
-- **No result after a listed peer disappears during delivery:** current recipient-disconnect settlement is deferred. Wait for the bounded eight-second local send timeout, then start a newly authenticated Pi session.
+- **Recipient-disconnected result:** the relay found the listed recipient but observed its exact session disappear or could not write the offer before ACK. Every affected pending slot is released once. The sender socket stays usable; a later recipient connection receives no old offer.
+- **ACK-timeout result:** the recipient was connected when the relay wrote the offer but no exact extension ACK arrived within five seconds. The pending slot is released and both sockets remain usable.
 - **Disconnected error:** pair and authenticate the installation, or start a new Pi session if the retained socket closed. Reconnect is deferred.
 - **Unsafe JSON object error:** use only JSON values in plain objects and dense arrays. Cycles, accessors, nonfinite numbers, `undefined`, bigint, symbols, functions, custom object prototypes, and malformed Unicode are rejected before transport without logging content.
 - **Concurrent request error:** wait for the current list or send operation to settle; no request was queued.

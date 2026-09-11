@@ -37,7 +37,8 @@ export type RosterPage = {
 export type SendResult =
   | { message_id: string; status: "received" }
   | { message_id: string; status: "timeout"; reason: "offline" }
-  | { message_id: string; status: "timeout"; reason: "ack_timeout" };
+  | { message_id: string; status: "timeout"; reason: "ack_timeout" }
+  | { message_id: string; status: "timeout"; reason: "recipient_disconnected" };
 
 type ResponseDeadline = {
   cancel(): void;
@@ -415,7 +416,9 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
   }
   if (hasExactKeys(payload, ["message_id", "status", "reason"]) &&
       payload.status === "timeout" &&
-      (payload.reason === "offline" || payload.reason === "ack_timeout")) {
+      (payload.reason === "offline" ||
+       payload.reason === "ack_timeout" ||
+       payload.reason === "recipient_disconnected")) {
     return { message_id: messageID, status: "timeout", reason: payload.reason };
   }
   throw new Error("invalid send result payload");

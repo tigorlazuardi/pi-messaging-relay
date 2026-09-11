@@ -1,6 +1,6 @@
 ---
 title: Online relay API v1
-description: Accepted client/server contract for authenticated pairing, online presence, unicast delivery, correlated replies, and immediate offline results.
+description: Accepted client/server contract for authenticated pairing, online presence, unicast delivery, lifecycle settlement, and correlated replies.
 status: accepted
 date: 2026-09-08
 ---
@@ -58,7 +58,7 @@ A cursor is `cur_` followed by canonical unpadded Base64url of the raw UTF-8 byt
 
 A post-authentication parser starts at a message boundary and either dispatches one complete valid operation or enters a terminal protocol-error state. Binary messages, invalid UTF-8, malformed or trailing JSON, and over-limit messages use `invalid_frame`. A syntax-valid value that is not the closed operation envelope, including duplicate or unknown fields and wrong-direction types, uses `invalid_envelope`. An otherwise shaped envelope whose integer major is not `1` uses `unsupported_protocol`. These stable errors have `close: true`; the server makes one bounded best-effort error write and then hard-closes promptly. `request_id` is included only when the complete JSON has exactly one valid top-level request ID that can be recovered without ambiguity. Error messages and logs never include raw frame or body data; logs omit unrecognized submitted types.
 
-Operation-level outcomes are a different state transition: a structurally valid operation reaches the operation dispatcher, a canonical result may be returned, and the parser returns to the next message boundary without closing. Tickets #36 and #13 implement live `list`/`roster` discovery, which remains connected after authentication. Tickets #14–#17 implement successful idle and busy string/object paths plus correlated replies through deterministic provenance and exact recipient acknowledgment. Ticket #18 implements immediate offline results at an exact current-registry miss. Ticket #19 implements a bounded missing-ACK result after a recipient offer was written. Ticket #20 still owns recipient-disconnect settlement after lookup; that failure outcome remains incomplete.
+Operation-level outcomes are a different state transition: a structurally valid operation reaches the operation dispatcher, a canonical result may be returned, and the parser returns to the next message boundary without closing. Tickets #36 and #13 implement live `list`/`roster` discovery, which remains connected after authentication. Tickets #14–#17 implement successful idle and busy string/object paths plus correlated replies through deterministic provenance and exact recipient acknowledgment. Ticket #18 implements immediate offline results at an exact current-registry miss. Ticket #19 implements a bounded missing-ACK result after a recipient offer was written. Ticket #20 implements exact recipient-session-loss settlement after lookup and before ACK.
 
 <Decision title="Fail closed on protocol ambiguity but keep operation denials recoverable" status="accepted">
 Malformed framing or envelope state makes subsequent interpretation unsafe, so one stable error ends the connection. A valid operation with a business denial remains unambiguous and leaves the authenticated session usable.
@@ -388,12 +388,16 @@ When Pi is busy, the extension always uses `deliverAs: "followUp"`. A sender can
 At the one current published-session lookup, a miss immediately returns the correlated payload `{message_id,status:"timeout",reason:"offline"}`. A formerly published route and a syntactically valid opaque route never seen by this process are indistinguishable. The relay keeps no existence history, creates no delivery ID, offer, pending entry, ACK timer, recipient write, or retained message, and keeps the authenticated sender socket usable.
 </Decision>
 
+<Decision title="Settle selected recipient-session loss without replay" status="accepted">
+After lookup finds an exact authenticated recipient, failure to write the offer or loss of that exact session before its matching ACK returns `{message_id,status:"timeout",reason:"recipient_disconnected"}`. The result retains the generated delivery ID only in server telemetry, releases pending ownership once, leaves the sender socket reusable, and does not replay the interrupted offer when the route authenticates again. It reports only relay-observed session or offer failure—not model read, completion, Pi queue durability, message durability, or future availability.
+</Decision>
+
 <Aside type="note" title="Implementation boundary">
-Tickets #14–#19 implement successful string and object delivery, correlated replies, immediate current-registry-miss settlement, and bounded missing-ACK settlement through the same ordinary send path: extension-generated request and message IDs, exact opaque-address lookup, no history-derived routing, server-generated delivery IDs only after a recipient is found, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact one-argument idle injection, exact busy `{ deliverAs: "followUp" }` injection, exact recipient ACK authorization, independently correlated `received` results, exact `timeout/offline` miss results, and exact `timeout/ack_timeout` results after an offered delivery receives no exact ACK within five seconds. The reply destination and `re` value are copied from the original injected provenance; no sender field can select a generated ID, delivery mode, or steering.
+Tickets #14–#20 implement successful string and object delivery, correlated replies, immediate current-registry-miss settlement, bounded missing-ACK settlement, and recipient-session-loss settlement through the same ordinary send path: extension-generated request and message IDs, exact opaque-address lookup, no history-derived routing, server-generated delivery IDs only after a recipient is found, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact one-argument idle injection, exact busy `{ deliverAs: "followUp" }` injection, exact recipient ACK authorization, independently correlated `received` results, exact `timeout/offline` miss results, and exact `timeout/ack_timeout` results after an offered delivery receives no exact ACK within five seconds. The reply destination and `re` value are copied from the original injected provenance; no sender field can select a generated ID, delivery mode, or steering.
 
-A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each online reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. Recipient-disconnect results (#20), sender-disconnect assertions (#21), retry/dedupe (#22–#23), 256 KiB body denial (#24), and 128-send pipelining (#25) remain incomplete.
+A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each online reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. Sender-disconnect assertions (#21), retry/dedupe (#22–#23), 256 KiB body denial (#24), and 128-send pipelining (#25) remain incomplete.
 
-The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs and malformed `re` values fail content-free before IDs or socket work. The sender extension accepts exactly the closed correlated result payloads `{message_id,status:"received"}`, `{message_id,status:"timeout",reason:"offline"}`, and `{message_id,status:"timeout",reason:"ack_timeout"}`. Every other status/reason pair, including a missing or extra field or a future reason, is an invalid response that terminally closes the retained socket. If #20 or #24 later implements another sender outcome, that work must explicitly expand the result type and allowlist before acceptance; no additional outcome is claimed today. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
+The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs and malformed `re` values fail content-free before IDs or socket work. The sender extension accepts exactly the closed correlated result payloads `{message_id,status:"received"}`, `{message_id,status:"timeout",reason:"offline"}`, `{message_id,status:"timeout",reason:"recipient_disconnected"}`, and `{message_id,status:"timeout",reason:"ack_timeout"}`. Every other status/reason pair, including a missing or extra field or a future reason, is an invalid response that terminally closes the retained socket. If #24 or another explicitly scoped ticket implements an additional sender outcome, that work must explicitly expand the result type and parser allowlist before acceptance; no additional outcome is claimed today. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
 </Aside>
 
 ### I/O examples
@@ -422,6 +426,15 @@ The local extension accepts safe string or JSON-object bodies under its closed t
       "message_id": "01993c88-2bc4-7432-87e8-16ca3c324a3f",
       "status": "timeout",
       "reason": "offline"
+    }
+    ```
+  </TabItem>
+  <TabItem label="Recipient-disconnected tool output">
+    ```json
+    {
+      "message_id": "01993c8a-4de6-7654-a9fa-38ec5d546c51",
+      "status": "timeout",
+      "reason": "recipient_disconnected"
     }
     ```
   </TabItem>
@@ -508,6 +521,20 @@ The local extension accepts safe string or JSON-object bodies under its closed t
     }
     ```
   </TabItem>
+  <TabItem label="Recipient-disconnected sender result">
+    ```json
+    {
+      "v": 1,
+      "type": "send_result",
+      "request_id": "01993c8a-3476-7012-b345-6789abcdef01",
+      "payload": {
+        "message_id": "01993c8a-4de6-7654-a9fa-38ec5d546c51",
+        "status": "timeout",
+        "reason": "recipient_disconnected"
+      }
+    }
+    ```
+  </TabItem>
   <TabItem label="ACK-timeout sender result">
     ```json
     {
@@ -539,7 +566,7 @@ String bodies follow that LF unchanged, with no trim or normalization. Object bo
 
 ## Current delivery failure boundary
 
-Three sender outcomes are finalized. An exact recipient ACK returns the correlated `send_result` with `status: "received"`. An exact miss at the current published-session lookup immediately returns the same request and message correlation with `status: "timeout"` and `reason: "offline"`. That miss is a normal machine result, not a local exception or protocol denial, and the sender connection remains open for a later list or send. It reveals only current absence: known-offline and never-published valid opaque destinations have the same result, with no history or existence state.
+Four sender outcomes are finalized. An exact recipient ACK returns the correlated `send_result` with `status: "received"`. An exact miss at the current published-session lookup immediately returns the same request and message correlation with `status: "timeout"` and `reason: "offline"`. That miss is a normal machine result, not a local exception or protocol denial, and the sender connection remains open for a later list or send. It reveals only current absence: known-offline and never-published valid opaque destinations have the same result, with no history or existence state.
 
 After a recipient is found and its offer is successfully written, the relay starts exactly five seconds for the exact recipient session to return matching delivery and message IDs. Expiry atomically removes that pending offer before returning the correlated `send_result` with `status: "timeout"` and `reason: "ack_timeout"`. A valid ACK that wins before expiry still returns `received`; the deadline boundary chooses only one settlement. A later ACK finds no pending offer, emits no response, changes no result, and leaves the recipient connection healthy. The released slot is immediately available for another send. `ack_timeout` says only that an offer was written but no exact extension ACK arrived by the deadline; it is not a model-read, work-completion, queue-durability, or message-durability status.
 
@@ -547,7 +574,7 @@ After a recipient is found and its offer is successfully written, the relay star
 The extension keeps the five-second `list_peers` response deadline but uses a fixed eight-second `agent_send` response deadline. Send timing starts before the relay offer, so eight seconds covers the bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender-result write, and scheduling allowance without reducing the recipient's five seconds. An explicit test-only `responseTimeoutMS` override still replaces either default.
 </Decision>
 
-Recipient disconnect after a successful lookup (#20) does not yet produce a final machine-readable `send_result`; that path must not be converted into `offline` or `ack_timeout`.
+After lookup succeeds, recipient session loss before exact ACK returns `timeout/recipient_disconnected`. This differs from `offline`, which is only a pre-allocation lookup miss, and `ack_timeout`, which is only expiry after a written offer remained unacknowledged for five seconds. Recipient cancellation removes every matching pending offer once; ACK, expiry, and disconnect ownership cannot relabel one another. Reauthentication of the same installation/address receives no old offer, stale ACKs are harmless, and only a fresh send creates a fresh offer. The sender socket remains reusable after the result. Server/global shutdown that itself claims pending work emits no recipient-disconnect result.
 
 The currently enforced ceilings are:
 
@@ -559,7 +586,7 @@ The currently enforced ceilings are:
 - 1,024 tracked server connections; and
 - one use and exactly ten minutes for a pairing code, with the deadline itself expired.
 
-Sender-disconnect assertions (#21), retry and idempotence (#22), dedupe behavior (#23), the distinct 256 KiB body rule (#24), 128-send pipelining (#25), reconnect (#26), restart authentication (#27), replay behavior (#28), and additional diagnostics (#29) remain deferred. This version publishes no I/O shape or runtime guarantee for those seams.
+Sender-disconnect assertions (#21), retry and idempotence (#22), dedupe behavior (#23), the distinct 256 KiB body rule (#24), 128-send pipelining (#25), automatic reconnect (#26), restart authentication (#27), broader restart/reconnect replay assertions (#28), and additional diagnostics (#29) remain deferred. Ticket #20 adds no retry, automatic reconnect, persistence, or replay mechanism. This version publishes no I/O shape or runtime guarantee for those seams.
 
 ## Operational evidence
 
@@ -585,7 +612,28 @@ Example offline server log:
 }
 ```
 
-The offline event has no `delivery_id` because generation occurs only after a published recipient is found. An ACK-timeout event includes the generated delivery ID, `status: "timeout"`, and `reason`/`code: "ack_timeout"`; a late ACK produces no second settlement event. Authentication fields including pairing code, nonce, signature, and private key use `<redacted>` markers. Message body is user-supplied content and is fully redacted whether it is a string or object. Public keys, request/message/delivery IDs, and opaque route IDs remain visible for support correlation. Structured logs remain sufficient; ticket #19 adds no traces or metrics.
+The offline event has no `delivery_id` because generation occurs only after a published recipient is found. Recipient-disconnect and ACK-timeout events include the generated delivery ID, `status: "timeout"`, and exact `reason`/`code: "recipient_disconnected"` or `"ack_timeout"`; a stale ACK, deadline, or cancellation produces no second settlement event. Authentication fields including pairing code, nonce, signature, and private key use `<redacted>` markers. Message body is user-supplied content and is fully redacted whether it is a string or object. Public keys, request/message/delivery IDs, and opaque route IDs remain visible for support correlation. Structured logs remain sufficient; ticket #19 adds no traces or metrics.
+
+Example recipient-disconnected server log:
+
+```json
+{
+  "level": "info",
+  "event": "send_settled",
+  "result": "settled",
+  "reason": "recipient_disconnected",
+  "code": "recipient_disconnected",
+  "type": "send",
+  "request_id": "01993c8a-3476-7012-b345-6789abcdef01",
+  "message_id": "01993c8a-4de6-7654-a9fa-38ec5d546c51",
+  "delivery_id": "01993c8a-5ef7-7765-ba0b-49fd6e657d62",
+  "sender_route": "/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111",
+  "recipient_route": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
+  "status": "timeout",
+  "latency_ms": 14,
+  "body": "<redacted>"
+}
+```
 
 Example ACK-timeout server log:
 

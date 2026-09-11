@@ -108,13 +108,15 @@ const (
 
 type sessionConnectionRegistry struct {
 	mu                   sync.Mutex
+	lifecycleMu          sync.Mutex
 	closing              bool
 	limit                int
 	entries              map[*trackedSessionConnection]struct{}
 	changed              chan struct{}
 	closed               chan struct{}
-	closeOnce            sync.Once
+	shutdownOnce         sync.Once
 	onSessionUnavailable func(*authenticatedSession)
+	onShutdown           func()
 }
 
 func newSessionConnectionRegistry() *sessionConnectionRegistry {
@@ -205,9 +207,7 @@ func (registry *sessionConnectionRegistry) clearAuthentication(entry *trackedSes
 	}
 	onUnavailable := registry.onSessionUnavailable
 	registry.mu.Unlock()
-	if unavailable != nil && onUnavailable != nil {
-		onUnavailable(unavailable)
-	}
+	registry.notifySessionUnavailable(unavailable, onUnavailable)
 }
 
 func (registry *sessionConnectionRegistry) remove(entry *trackedSessionConnection) {
@@ -217,9 +217,7 @@ func (registry *sessionConnectionRegistry) remove(entry *trackedSessionConnectio
 	empty := len(registry.entries) == 0
 	onUnavailable := registry.onSessionUnavailable
 	registry.mu.Unlock()
-	if unavailable != nil && onUnavailable != nil {
-		onUnavailable(unavailable)
-	}
+	registry.notifySessionUnavailable(unavailable, onUnavailable)
 	if empty {
 		select {
 		case registry.changed <- struct{}{}:
@@ -228,11 +226,32 @@ func (registry *sessionConnectionRegistry) remove(entry *trackedSessionConnectio
 	}
 }
 
+func (registry *sessionConnectionRegistry) notifySessionUnavailable(
+	session *authenticatedSession,
+	notify func(*authenticatedSession),
+) {
+	if session == nil || notify == nil {
+		return
+	}
+	registry.lifecycleMu.Lock()
+	defer registry.lifecycleMu.Unlock()
+	notify(session)
+}
+
 func (registry *sessionConnectionRegistry) beginShutdown() {
-	registry.mu.Lock()
-	registry.closing = true
-	registry.closeOnce.Do(func() { close(registry.closed) })
-	registry.mu.Unlock()
+	registry.shutdownOnce.Do(func() {
+		registry.lifecycleMu.Lock()
+		defer registry.lifecycleMu.Unlock()
+
+		registry.mu.Lock()
+		registry.closing = true
+		onShutdown := registry.onShutdown
+		registry.mu.Unlock()
+		if onShutdown != nil {
+			onShutdown()
+		}
+		close(registry.closed)
+	})
 }
 
 func (registry *sessionConnectionRegistry) closeAndWait(ctx context.Context) error {

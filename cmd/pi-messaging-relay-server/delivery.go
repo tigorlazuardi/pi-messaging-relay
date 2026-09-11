@@ -30,11 +30,11 @@ type messagePayload struct {
 type pendingDelivery struct {
 	sender       *authenticatedSession
 	recipient    *authenticatedSession
-	requestID    string
 	messageID    string
 	deliveryID   string
 	acknowledged chan struct{}
 	cancelled    chan struct{}
+	shutdown     chan struct{}
 }
 
 type deliveryDeadline struct {
@@ -43,11 +43,13 @@ type deliveryDeadline struct {
 }
 
 type deliveryDispatcher struct {
-	registry        *sessionConnectionRegistry
-	roster          operationDispatcher
-	deadlineFactory func(time.Duration) deliveryDeadline
-	mu              sync.Mutex
-	pending         map[string]*pendingDelivery
+	registry             *sessionConnectionRegistry
+	roster               operationDispatcher
+	deadlineFactory      func(time.Duration) deliveryDeadline
+	beforeRecipientOffer func()
+	mu                   sync.Mutex
+	shuttingDown         bool
+	pending              map[string]*pendingDelivery
 }
 
 func newDeliveryDispatcher(registry *sessionConnectionRegistry) *deliveryDispatcher {
@@ -61,6 +63,7 @@ func newDeliveryDispatcher(registry *sessionConnectionRegistry) *deliveryDispatc
 		pending: make(map[string]*pendingDelivery),
 	}
 	registry.onSessionUnavailable = dispatcher.cancelRecipient
+	registry.onShutdown = dispatcher.shutdown
 	return dispatcher
 }
 
@@ -111,13 +114,17 @@ func (dispatcher *deliveryDispatcher) send(
 	pending := &pendingDelivery{
 		sender:       sender,
 		recipient:    recipient,
-		requestID:    operation.RequestID,
 		messageID:    operation.Send.MessageID,
 		deliveryID:   deliveryID,
 		acknowledged: make(chan struct{}),
 		cancelled:    make(chan struct{}),
+		shutdown:     make(chan struct{}),
 	}
 	dispatcher.lock()
+	if dispatcher.shuttingDown {
+		dispatcher.unlock()
+		return operationResponse{}, false, nil
+	}
 	if _, collision := dispatcher.pending[deliveryID]; collision {
 		dispatcher.unlock()
 		return operationResponse{}, false, errors.New("generated duplicate delivery ID")
@@ -125,6 +132,22 @@ func (dispatcher *deliveryDispatcher) send(
 	dispatcher.pending[deliveryID] = pending
 	dispatcher.unlock()
 
+	received := func() (operationResponse, bool, error) {
+		return deliveryReceivedResponse(pending), true, nil
+	}
+	recipientDisconnected := func() (operationResponse, bool, error) {
+		return deliveryRecipientDisconnectedResponse(pending), true, nil
+	}
+	claimedOutcome := func() (operationResponse, bool, error) {
+		select {
+		case <-pending.acknowledged:
+			return received()
+		case <-pending.cancelled:
+			return recipientDisconnected()
+		case <-pending.shutdown:
+			return operationResponse{}, false, nil
+		}
+	}
 	remove := func() bool {
 		dispatcher.lock()
 		defer dispatcher.unlock()
@@ -135,6 +158,9 @@ func (dispatcher *deliveryDispatcher) send(
 		return true
 	}
 
+	if dispatcher.beforeRecipientOffer != nil {
+		dispatcher.beforeRecipientOffer()
+	}
 	frame, err := json.Marshal(messageEnvelope{
 		Version: 1,
 		Type:    "message",
@@ -148,43 +174,25 @@ func (dispatcher *deliveryDispatcher) send(
 		},
 	})
 	if err != nil {
-		remove()
+		if !remove() {
+			return claimedOutcome()
+		}
 		return operationResponse{}, false, errors.New("encode delivery offer")
 	}
 	if len(frame) > maxFrameBytes {
-		remove()
+		if !remove() {
+			return claimedOutcome()
+		}
 		return operationResponse{}, false, nil
 	}
 	writeContext, cancelWrite := context.WithTimeout(ctx, protocolResponseWriteTimeout)
 	err = dispatcher.registry.writeToSession(writeContext, recipient, frame)
 	cancelWrite()
 	if err != nil {
-		remove()
-		// Ticket #20 owns the recipient-disconnected sender result. Socket loss is
-		// local and retained work is released now.
-		return operationResponse{}, false, nil
-	}
-
-	received := func() (operationResponse, bool, error) {
-		return operationResponse{
-			Type:           "send_result",
-			Payload:        sendResultPayload{MessageID: operation.Send.MessageID, Status: "received"},
-			Outcome:        "settled",
-			Code:           "received",
-			MessageID:      operation.Send.MessageID,
-			DeliveryID:     deliveryID,
-			SenderRoute:    sender.Address,
-			RecipientRoute: recipient.Address,
-			Status:         "received",
-		}, true, nil
-	}
-	claimedOutcome := func() (operationResponse, bool, error) {
-		select {
-		case <-pending.acknowledged:
-			return received()
-		case <-pending.cancelled:
-			return operationResponse{}, false, nil
+		if !remove() {
+			return claimedOutcome()
 		}
+		return recipientDisconnected()
 	}
 
 	deadline := dispatcher.deadlineFactory(deliveryACKCeiling)
@@ -193,12 +201,9 @@ func (dispatcher *deliveryDispatcher) send(
 	case <-pending.acknowledged:
 		return received()
 	case <-pending.cancelled:
+		return recipientDisconnected()
+	case <-pending.shutdown:
 		return operationResponse{}, false, nil
-	case <-dispatcher.registry.closingSignal():
-		if remove() {
-			return operationResponse{}, false, nil
-		}
-		return claimedOutcome()
 	case <-ctx.Done():
 		if remove() {
 			return operationResponse{}, false, nil
@@ -223,6 +228,38 @@ func (dispatcher *deliveryDispatcher) send(
 			RecipientRoute: recipient.Address,
 			Status:         "timeout",
 		}, true, nil
+	}
+}
+
+func deliveryReceivedResponse(pending *pendingDelivery) operationResponse {
+	return operationResponse{
+		Type:           "send_result",
+		Payload:        sendResultPayload{MessageID: pending.messageID, Status: "received"},
+		Outcome:        "settled",
+		Code:           "received",
+		MessageID:      pending.messageID,
+		DeliveryID:     pending.deliveryID,
+		SenderRoute:    pending.sender.Address,
+		RecipientRoute: pending.recipient.Address,
+		Status:         "received",
+	}
+}
+
+func deliveryRecipientDisconnectedResponse(pending *pendingDelivery) operationResponse {
+	return operationResponse{
+		Type: "send_result",
+		Payload: sendResultPayload{
+			MessageID: pending.messageID,
+			Status:    "timeout",
+			Reason:    "recipient_disconnected",
+		},
+		Outcome:        "settled",
+		Code:           "recipient_disconnected",
+		MessageID:      pending.messageID,
+		DeliveryID:     pending.deliveryID,
+		SenderRoute:    pending.sender.Address,
+		RecipientRoute: pending.recipient.Address,
+		Status:         "timeout",
 	}
 }
 
@@ -252,6 +289,16 @@ func (dispatcher *deliveryDispatcher) cancelRecipient(recipient *authenticatedSe
 		}
 		delete(dispatcher.pending, deliveryID)
 		close(pending.cancelled)
+	}
+	dispatcher.unlock()
+}
+
+func (dispatcher *deliveryDispatcher) shutdown() {
+	dispatcher.lock()
+	dispatcher.shuttingDown = true
+	for deliveryID, pending := range dispatcher.pending {
+		delete(dispatcher.pending, deliveryID)
+		close(pending.shutdown)
 	}
 	dispatcher.unlock()
 }

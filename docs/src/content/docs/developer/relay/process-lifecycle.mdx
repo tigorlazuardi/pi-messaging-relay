@@ -8,7 +8,7 @@ date: 2026-09-10
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and implements installation pairing, session authentication, connected live `list`/`roster` discovery, successful authenticated idle and busy string/object delivery, immediate offline settlement on a current registry miss, and five-second missing-ACK settlement after a recipient offer is written. Recipient-disconnect sender results remain deferred to ticket #20.
+The runnable server entry point is `cmd/pi-messaging-relay-server`. It owns the loopback process lifecycle and implements installation pairing, session authentication, connected live `list`/`roster` discovery, successful authenticated idle and busy string/object delivery, immediate offline settlement on a current registry miss, recipient-disconnected settlement after lookup and before ACK, and five-second missing-ACK settlement after a recipient offer is written.
 
 ## Startup boundary
 
@@ -58,7 +58,7 @@ flowchart TD
     E --> X[Exit zero]
 ```
 
-The shared five-second bound first marks the registry closing so in-memory delivery waits cancel immediately, then owns HTTP shutdown and serve settlement before force-closing and settling every reserved or authenticated registry-owned WebSocket. Recipient removal also releases its pending offers, and no pending body is persisted or replayed. It prevents graceful shutdown from waiting forever on either HTTP or registry-owned process resources. Every HTTP response has a two-second write deadline. Structured event delivery uses one worker per stdout or stderr sink, no queued buffer, and a one-second handoff/acknowledgement deadline. Logger close also waits at most one second. A stalled output therefore cannot retain request handlers or process exit indefinitely.
+The shared five-second bound first marks the registry closing so in-memory delivery waits cancel immediately, then owns HTTP shutdown and serve settlement before force-closing and settling every reserved or authenticated registry-owned WebSocket. Registry shutdown that claims pending delivery work emits no `recipient_disconnected` result; only recipient cancellation that already won keeps that exact outcome. Recipient removal releases every matching pending offer once, and no pending body is persisted or replayed. It prevents graceful shutdown from waiting forever on either HTTP or registry-owned process resources. Every HTTP response has a two-second write deadline. Structured event delivery uses one worker per stdout or stderr sink, no queued buffer, and a one-second handoff/acknowledgement deadline. Logger close also waits at most one second. A stalled output therefore cannot retain request handlers or process exit indefinitely.
 
 A relay audit failure is stored in a queryable first-error latch and enters the bounded HTTP drain. Main checks that latch again after drain and before any successful stop event, so concurrent SIGINT, SIGTERM, or injected cancellation cannot mask it. Main then attempts `server_failed` through the separately bounded stderr worker and exits non-zero. For a pairing audit failure, explicit durable state is retained and an accepted handler still returns its already-persisted identity.
 

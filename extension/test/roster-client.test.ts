@@ -291,6 +291,33 @@ test("send generates internal IDs and accepts only exact correlated send_result"
   assert.deepEqual(await resultPromise, { message_id: payload.message_id, status: "received" });
 });
 
+test("send accepts exact recipient_disconnected and keeps the socket usable for list", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  const request = await requestPromise;
+  const messageID = String((request.payload as Record<string, unknown>).message_id);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: request.request_id,
+    payload: { message_id: messageID, status: "timeout", reason: "recipient_disconnected" },
+  }));
+  assert.deepEqual(await resultPromise, {
+    message_id: messageID,
+    status: "timeout",
+    reason: "recipient_disconnected",
+  });
+
+  const listRequestPromise = nextClientRequest(pair.server);
+  const listResultPromise = client.list(undefined, new AbortController().signal);
+  const listRequest = await listRequestPromise;
+  pair.server.send(roster(String(listRequest.request_id), { peers: [] }));
+  assert.deepEqual(await listResultPromise, { peers: [] });
+});
+
 test("send accepts exact ack_timeout and keeps the socket usable for list", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);
@@ -728,6 +755,9 @@ test("wrong destination, duplicate message fields, and malformed or desynchroniz
     (requestID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: REQUEST_ID, status: "timeout", reason: "offline" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "" } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "future_timeout" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "received", reason: "recipient_disconnected" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "denied", reason: "recipient_disconnected" } }),
+    (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "recipient_disconnected", extra: true } }),
     (requestID, messageID) => JSON.stringify({ v: 1, type: "send_result", request_id: requestID, payload: { message_id: messageID, status: "timeout", reason: "offline", delivery_id: REQUEST_ID } }),
   ];
   for (const makeFrame of cases) {
