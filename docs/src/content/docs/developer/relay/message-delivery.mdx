@@ -193,9 +193,17 @@ A separate sender-current index owns at most one logical record per exact authen
 Do not reduce the recipient's exact five-second ACK interval. The sender's fixed eight-second send response deadline sits beyond the relay's worst-case bounded recipient-write, ACK-wait, and sender-write path, while list operations retain their existing five-second deadline.
 </Decision>
 
-<Aside type="caution" title="Remaining deferred failures">
-Bounded automatic reconnect (#26) restores authenticated live presence, including authorization from the allowlist after a normal server restart (#27). Broader restart/reconnect no-replay assertions (#28) and additional diagnostics (#29) remain deferred. Restart persistence adds no message persistence, offline inbox, replay mechanism, or new reconnect event vocabulary.
+<Aside type="caution" title="Diagnostics remain deferred">
+Bounded automatic reconnect restores authenticated live presence, including authorization from the allowlist after a normal server restart. The recipient delivery-stream acceptance now proves that reconnect and process replacement emit no pending, settled, or historical message frames. Additional diagnostics (#29) remain deferred; this no-replay seam adds no event vocabulary.
 </Aside>
+
+## Lifecycle no-replay acceptance
+
+One continuous real-public-boundary scenario pairs a sender and recipient extension behind fake Pi hosts, then follows the same recipient delivery stream through exact socket loss and replacement of the real Go relay child on the same address and durable allowlist state. It records every offered delivery ID, generated message ID, body marker, recipient socket generation, and Pi injection in order.
+
+The scenario first settles one message, then withholds the next recipient ACK and terminates that exact recipient socket. The sender receives `timeout/recipient_disconnected`; after automatic reauthentication, bounded roster and quiet-turn checkpoints prove neither message appears again before one fresh post-reconnect send delivers normally. It then withholds another ACK while the server shuts down gracefully. The sender operation is abandoned by connection loss, with no fabricated settlement. After the replacement child starts and both extensions reauthenticate, the same checkpoints prove that no settled, interrupted, startup, or history delivery appears before one fresh post-restart send delivers normally. Held ACK frames are intercepted rather than delayed, so they cannot leak into replacement sockets.
+
+The test also confirms every body remains absent from relay and extension logs, every existing settlement event keeps `body: "<redacted>"`, and the durable allowlist contains no body, message ID, delivery ID, pending, dedupe, inbox, or route state. Disk inspection is subordinate evidence only; recipient frames, tool outcomes, authentication, roster synchronization, and Pi calls are the public acceptance boundary.
 
 Busy follow-up routing is implemented by #15. Ticket #16 adds provenance and object rendering; #17 proves the existing ordinary send path carries a correlated reply with fresh IDs and independent settlement. A safe local object is encoded canonically before the send frame is created; the server forwards the accepted object body as the same JSON value without interpreting or rebuilding it; and the recipient canonicalizes it for Pi text injection. No string body, object content, or rendered provenance header enters an error or log.
 

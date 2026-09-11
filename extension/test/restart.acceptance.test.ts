@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import test from "node:test";
 
+import WebSocket from "ws";
+
 import {
   installReconnectDependenciesForTest,
   type ReconnectDeadline,
@@ -16,7 +18,7 @@ import {
 import { FakePiHost } from "./fake-pi-host.ts";
 
 const TEST_TIMEOUT_MS = 15_000;
-const SECRET_BODY = "restart-secret-body-must-never-reach-disk";
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 type ProcessOutput = {
   iterator: AsyncIterator<string>;
@@ -31,6 +33,22 @@ type RelayProcess = {
 };
 
 type RosterPage = { details: { peers: Array<{ address: string }> } };
+type ToolResult = {
+  details: {
+    message_id: string;
+    status: string;
+    reason?: string;
+  };
+};
+type RecipientFrame = {
+  attempt: number;
+  type: string;
+  messageID?: string;
+  deliveryID?: string;
+  body?: unknown;
+};
+type RecipientAttempt = { socket: WebSocket };
+type HeldACK = { messageID: string; deliveryID: string };
 
 type DurableAllowlist = {
   version: number;
@@ -227,12 +245,113 @@ async function listedAddresses(host: FakePiHost): Promise<string[]> {
   return result.details.peers.map((peer) => peer.address);
 }
 
-test("durable allowlist restores real extension authorization across one child-process restart", {
+function installRecipientSocketControl(recipientCWD: string): {
+  attempts: RecipientAttempt[];
+  frames: RecipientFrame[];
+  heldACKs: HeldACK[];
+  holdNextACK(): void;
+  restore(): void;
+} {
+  type SendCallback = (error?: Error) => void;
+  type SendMethod = (data: unknown, ...rest: unknown[]) => unknown;
+  const prototype = WebSocket.prototype as unknown as { send: SendMethod };
+  const originalSend = prototype.send;
+  const attempts: RecipientAttempt[] = [];
+  const frames: RecipientFrame[] = [];
+  const heldACKs: HeldACK[] = [];
+  let holdNextACK = false;
+
+  prototype.send = function controlledSend(this: WebSocket, data: unknown, ...rest: unknown[]): unknown {
+    if (typeof data === "string") {
+      try {
+        const frame = JSON.parse(data) as Record<string, unknown>;
+        const payload = frame.payload as Record<string, unknown> | undefined;
+        if (frame.type === "hello" && payload?.cwd === recipientCWD) {
+          const attempt = attempts.length + 1;
+          attempts.push({ socket: this });
+          this.on("message", (incoming: WebSocket.RawData, isBinary: boolean) => {
+            if (isBinary) return;
+            const decoded = JSON.parse(incoming.toString()) as Record<string, unknown>;
+            const incomingPayload = decoded.payload as Record<string, unknown> | undefined;
+            frames.push({
+              attempt,
+              type: String(decoded.type),
+              ...(typeof incomingPayload?.message_id === "string"
+                ? { messageID: incomingPayload.message_id }
+                : {}),
+              ...(typeof incomingPayload?.delivery_id === "string"
+                ? { deliveryID: incomingPayload.delivery_id }
+                : {}),
+              ...(incomingPayload && Object.hasOwn(incomingPayload, "body")
+                ? { body: incomingPayload.body }
+                : {}),
+            });
+          });
+        }
+        if (holdNextACK && frame.type === "received" && payload) {
+          holdNextACK = false;
+          heldACKs.push({
+            messageID: String(payload.message_id),
+            deliveryID: String(payload.delivery_id),
+          });
+          const callback = rest.find((value) => typeof value === "function") as SendCallback | undefined;
+          if (callback) setImmediate(() => callback());
+          return undefined;
+        }
+      } catch {
+        // Non-JSON writes remain owned by the real WebSocket implementation.
+      }
+    }
+    return Reflect.apply(originalSend, this, [data, ...rest]);
+  };
+
+  return {
+    attempts,
+    frames,
+    heldACKs,
+    holdNextACK: () => { holdNextACK = true; },
+    restore: () => { prototype.send = originalSend; },
+  };
+}
+
+async function boundedQuietCheckpoint(
+  sender: FakePiHost,
+  recipientAddress: string,
+  recipient: FakePiHost,
+  expectedInjectionCount: number,
+  action: string,
+): Promise<void> {
+  const started = Date.now();
+  while (true) {
+    try {
+      assert.deepEqual(await listedAddresses(sender), [recipientAddress]);
+      break;
+    } catch (error) {
+      if (Date.now() - started >= TEST_TIMEOUT_MS) throw error;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+  for (let turn = 0; turn < 3; turn += 1) {
+    await within(new Promise<void>((resolve) => setImmediate(resolve)), `${action} quiet turn ${turn + 1}`);
+  }
+  assert.equal(recipient.sendUserMessageAttempts.length, expectedInjectionCount, action);
+}
+
+function recipientMessages(frames: RecipientFrame[]): RecipientFrame[] {
+  return frames.filter((frame) => frame.type === "message");
+}
+
+function injectedText(host: FakePiHost): string[] {
+  return host.sendUserMessageAttempts.map((attempt) => String((attempt as unknown[])[0]));
+}
+
+test("recipient delivery stream never replays across reconnect and child-process restart", {
   timeout: 60_000,
   concurrency: false,
-}, async () => {
+}, async (context) => {
   const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
   const root = await mkdtemp(join(tmpdir(), "pi-relay-restart-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
   await chmod(root, 0o700);
   const binary = join(root, "relay-server");
   const serverState = join(root, "server-state");
@@ -247,12 +366,23 @@ test("durable allowlist restores real extension authorization across one child-p
   const listen = await reserveLoopbackAddress();
   const clock = new RestartClock();
   const restoreReconnect = installReconnectDependenciesForTest(clock.dependencies);
+  const recipientCWD = "/srv/lifecycle-recipient";
+  const socketControl = installRecipientSocketControl(recipientCWD);
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
   const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   const extensionLogs: string[] = [];
   const hosts: FakePiHost[] = [];
   const relays: RelayProcess[] = [];
+  const bodies = {
+    settledBeforeLoss: "settled-before-lifecycle-loss-private-body",
+    interruptedByDisconnect: "disconnect-pending-private-body",
+    freshAfterReconnect: "fresh-after-reconnect-private-body",
+    interruptedByRestart: "restart-pending-private-body",
+    freshAfterRestart: "fresh-after-restart-private-body",
+  };
+  const allBodies = Object.values(bodies);
+  const messageIDs: string[] = [];
   let primaryError: unknown;
 
   try {
@@ -264,32 +394,123 @@ test("durable allowlist restores real extension authorization across one child-p
     process.env.PI_MESSAGING_RELAY_URL = `http://${listen}`;
     process.env.PI_MESSAGING_RELAY_STATE_DIR = pairedExtensionState;
 
-    const relayExtension = (await import(`../index.ts?restart=${Date.now()}`)).default;
-    const subject = new FakePiHost();
-    subject.cwd = "/srv/restart-subject";
-    relayExtension(subject.api as never);
-    hosts.push(subject);
-    await subject.emit("session_start", { type: "session_start", reason: "startup" });
+    const relayExtension = (await import(`../index.ts?lifecycle-delivery=${Date.now()}`)).default;
+    const sender = new FakePiHost();
+    sender.cwd = "/srv/lifecycle-sender";
+    relayExtension(sender.api as never);
+    hosts.push(sender);
+    await sender.emit("session_start", { type: "session_start", reason: "startup" });
     const pairingCode = (await readFile(codeFile, "utf8")).trim();
-    await subject.executeCommand("relay-pair", pairingCode);
+    await sender.executeCommand("relay-pair", pairingCode);
     const acceptedPair = await nextEvent(first.relay.output, "pair_accepted");
-    const initialAuth = await nextEvent(
+    const senderAuth = await nextEvent(
       first.relay.output,
       "auth_accepted",
-      (event) => event.cwd === subject.cwd,
+      (event) => event.cwd === sender.cwd,
     );
-    assert.equal(acceptedPair.client_public_key, initialAuth.client_public_key);
-    const originalAddress = String(initialAuth.address);
-    const originalRouteID = String(initialAuth.route_id);
+    assert.equal(acceptedPair.client_public_key, senderAuth.client_public_key);
+    const senderAddress = String(senderAuth.address);
 
-    const offlineResult = await subject.executeTool("agent_send", {
-      to: "/offline@host#01993ca2-2222-7bbb-9bbb-222222222222",
-      body: SECRET_BODY,
-    }) as { details: { status: string; reason: string } };
-    assert.deepEqual(
-      { status: offlineResult.details.status, reason: offlineResult.details.reason },
-      { status: "timeout", reason: "offline" },
+    const recipient = new FakePiHost();
+    recipient.cwd = recipientCWD;
+    relayExtension(recipient.api as never);
+    hosts.push(recipient);
+    await recipient.emit("session_start", { type: "session_start", reason: "startup" });
+    const recipientAuth = await nextEvent(
+      first.relay.output,
+      "auth_accepted",
+      (event) => event.cwd === recipient.cwd,
     );
+    const recipientAddress = String(recipientAuth.address);
+    const recipientRouteID = String(recipientAuth.route_id);
+    assert.deepEqual(await listedAddresses(sender), [recipientAddress]);
+    assert.deepEqual(await listedAddresses(recipient), [senderAddress]);
+    assert.equal(socketControl.attempts.length, 1);
+
+    const settledBeforeLoss = await within(sender.executeTool("agent_send", {
+      to: recipientAddress,
+      body: bodies.settledBeforeLoss,
+    }), "settling message before lifecycle loss") as ToolResult;
+    assert.deepEqual(settledBeforeLoss.details, {
+      message_id: settledBeforeLoss.details.message_id,
+      status: "received",
+    });
+    assert.match(settledBeforeLoss.details.message_id, UUID_V7);
+    messageIDs.push(settledBeforeLoss.details.message_id);
+    await nextEvent(first.relay.output, "send_settled", (event) =>
+      event.message_id === settledBeforeLoss.details.message_id);
+
+    socketControl.holdNextACK();
+    const interruptedByDisconnectPromise = sender.executeTool("agent_send", {
+      to: recipientAddress,
+      body: bodies.interruptedByDisconnect,
+    }) as Promise<ToolResult>;
+    await waitUntil(() => socketControl.heldACKs.length === 1, "holding recipient ACK before disconnect");
+    const disconnectACK = socketControl.heldACKs[0];
+    assert.match(disconnectACK.messageID, UUID_V7);
+    assert.match(disconnectACK.deliveryID, UUID_V7);
+    messageIDs.push(disconnectACK.messageID);
+    const disconnectedSocket = socketControl.attempts.at(-1)?.socket;
+    assert.ok(disconnectedSocket);
+    disconnectedSocket.terminate();
+    const interruptedByDisconnect = await within(
+      interruptedByDisconnectPromise,
+      "settling recipient disconnect",
+    );
+    assert.deepEqual(interruptedByDisconnect.details, {
+      message_id: disconnectACK.messageID,
+      status: "timeout",
+      reason: "recipient_disconnected",
+    });
+    await nextEvent(first.relay.output, "send_settled", (event) =>
+      event.message_id === disconnectACK.messageID && event.reason === "recipient_disconnected");
+    await waitUntil(() => clock.pendingCount === 1, "recipient reconnect deadline");
+    await clock.advanceBy(500);
+    const reconnectedRecipient = await nextEvent(
+      first.relay.output,
+      "auth_accepted",
+      (event) => event.cwd === recipient.cwd,
+    );
+    assert.equal(reconnectedRecipient.address, recipientAddress);
+    assert.equal(reconnectedRecipient.route_id, recipientRouteID);
+    assert.equal(socketControl.attempts.length, 2);
+    await boundedQuietCheckpoint(
+      sender,
+      recipientAddress,
+      recipient,
+      2,
+      "reconnect emitted no startup or historical delivery",
+    );
+
+    const freshAfterReconnect = await within(sender.executeTool("agent_send", {
+      to: recipientAddress,
+      body: bodies.freshAfterReconnect,
+    }), "settling fresh post-reconnect send") as ToolResult;
+    assert.deepEqual(freshAfterReconnect.details, {
+      message_id: freshAfterReconnect.details.message_id,
+      status: "received",
+    });
+    assert.match(freshAfterReconnect.details.message_id, UUID_V7);
+    messageIDs.push(freshAfterReconnect.details.message_id);
+    await nextEvent(first.relay.output, "send_settled", (event) =>
+      event.message_id === freshAfterReconnect.details.message_id);
+
+    socketControl.holdNextACK();
+    const interruptedByRestartPromise = sender.executeTool("agent_send", {
+      to: recipientAddress,
+      body: bodies.interruptedByRestart,
+    });
+    const restartRejection = assert.rejects(
+      within(interruptedByRestartPromise, "abandoning send on graceful relay shutdown"),
+      (error: unknown) => error instanceof Error &&
+        error.name === "RosterRequestError" &&
+        (error as Error & { reason?: string }).reason === "disconnected",
+    );
+    await waitUntil(() => socketControl.heldACKs.length === 2, "holding recipient ACK before restart");
+    const restartACK = socketControl.heldACKs[1];
+    assert.match(restartACK.messageID, UUID_V7);
+    assert.match(restartACK.deliveryID, UUID_V7);
+    messageIDs.push(restartACK.messageID);
 
     assert.deepEqual(await readdir(serverState), ["allowlist.json"]);
     const allowlistPath = join(serverState, "allowlist.json");
@@ -297,39 +518,158 @@ test("durable allowlist restores real extension authorization across one child-p
     assert.equal((await stat(allowlistPath)).mode & 0o777, 0o600);
     const privatePEM = await readFile(join(pairedExtensionState, "installation-ed25519.pem"), "utf8");
     const beforeStop = await readFile(allowlistPath, "utf8");
-    const storedBeforeStop = assertClosedAllowlist(beforeStop, [SECRET_BODY, privatePEM.trim(), pairingCode]);
+    const storedBeforeStop = assertClosedAllowlist(beforeStop, [...allBodies, ...messageIDs, privatePEM.trim(), pairingCode]);
     assert.equal(storedBeforeStop.clients[0].client_id, acceptedPair.client_id);
     assert.equal(storedBeforeStop.clients[0].client_public_key, acceptedPair.client_public_key);
 
     await stopRelay(first.relay);
-    await waitUntil(() => clock.pendingCount === 1, "restart reconnect deadline");
+    await restartRejection;
+    await waitUntil(() => clock.pendingCount === 2, "sender and recipient restart reconnect deadlines");
     const afterStop = await readFile(allowlistPath, "utf8");
     assert.equal(afterStop, beforeStop);
-    assertClosedAllowlist(afterStop, [SECRET_BODY, privatePEM.trim(), pairingCode]);
+    assertClosedAllowlist(afterStop, [...allBodies, ...messageIDs, privatePEM.trim(), pairingCode]);
 
     const second = await startRelay(binary, repositoryRoot, serverState, undefined, listen);
     relays.push(second.relay);
     assert.equal(second.ready.address, listen);
     assert.equal(await readFile(allowlistPath, "utf8"), beforeStop);
     await clock.advanceBy(500);
-    const restoredAuth = await nextEvent(
-      second.relay.output,
-      "auth_accepted",
-      (event) => event.cwd === subject.cwd,
+    const restartedAuth = [
+      await nextEvent(second.relay.output, "auth_accepted"),
+      await nextEvent(second.relay.output, "auth_accepted"),
+    ];
+    assert.deepEqual(
+      new Set(restartedAuth.map((event) => event.cwd)),
+      new Set([sender.cwd, recipient.cwd]),
     );
-    assert.equal(restoredAuth.client_id, acceptedPair.client_id);
-    assert.equal(restoredAuth.client_public_key, acceptedPair.client_public_key);
-    assert.equal(restoredAuth.route_id, originalRouteID);
-    assert.equal(restoredAuth.address, originalAddress);
+    const restartedSender = restartedAuth.find((event) => event.cwd === sender.cwd);
+    const restartedRecipient = restartedAuth.find((event) => event.cwd === recipient.cwd);
+    assert.ok(restartedSender);
+    assert.ok(restartedRecipient);
+    assert.equal(restartedSender.address, senderAddress);
+    assert.equal(restartedSender.client_id, acceptedPair.client_id);
+    assert.equal(restartedSender.client_public_key, acceptedPair.client_public_key);
+    assert.equal(restartedRecipient.address, recipientAddress);
+    assert.equal(restartedRecipient.route_id, recipientRouteID);
+    assert.equal(socketControl.attempts.length, 3);
+    await boundedQuietCheckpoint(
+      sender,
+      recipientAddress,
+      recipient,
+      4,
+      "restart emitted no startup or historical delivery",
+    );
 
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = pairedExtensionState;
-    const observer = new FakePiHost();
-    observer.cwd = "/srv/restart-observer";
-    relayExtension(observer.api as never);
-    hosts.push(observer);
-    await observer.emit("session_start", { type: "session_start", reason: "startup" });
-    await nextEvent(second.relay.output, "auth_accepted", (event) => event.cwd === observer.cwd);
-    assert.deepEqual(await listedAddresses(observer), [originalAddress]);
+    const freshAfterRestart = await within(sender.executeTool("agent_send", {
+      to: recipientAddress,
+      body: bodies.freshAfterRestart,
+    }), "settling fresh post-restart send") as ToolResult;
+    assert.deepEqual(freshAfterRestart.details, {
+      message_id: freshAfterRestart.details.message_id,
+      status: "received",
+    });
+    assert.match(freshAfterRestart.details.message_id, UUID_V7);
+    messageIDs.push(freshAfterRestart.details.message_id);
+    await nextEvent(second.relay.output, "send_settled", (event) =>
+      event.message_id === freshAfterRestart.details.message_id);
+
+    const messageFrames = recipientMessages(socketControl.frames);
+    assert.deepEqual(
+      socketControl.frames.map((frame) => ({ attempt: frame.attempt, type: frame.type })),
+      [
+        { attempt: 1, type: "welcome" },
+        { attempt: 1, type: "roster" },
+        { attempt: 1, type: "message" },
+        { attempt: 1, type: "message" },
+        { attempt: 2, type: "welcome" },
+        { attempt: 2, type: "message" },
+        { attempt: 2, type: "message" },
+        { attempt: 3, type: "welcome" },
+        { attempt: 3, type: "message" },
+      ],
+      "recipient sockets received only welcome, requested roster, and exact current delivery frames",
+    );
+    assert.deepEqual(
+      messageFrames.map((frame) => ({
+        attempt: frame.attempt,
+        messageID: frame.messageID,
+        deliveryID: frame.deliveryID,
+        body: frame.body,
+      })),
+      [
+        {
+          attempt: 1,
+          messageID: settledBeforeLoss.details.message_id,
+          deliveryID: messageFrames[0]?.deliveryID,
+          body: bodies.settledBeforeLoss,
+        },
+        {
+          attempt: 1,
+          messageID: disconnectACK.messageID,
+          deliveryID: disconnectACK.deliveryID,
+          body: bodies.interruptedByDisconnect,
+        },
+        {
+          attempt: 2,
+          messageID: freshAfterReconnect.details.message_id,
+          deliveryID: messageFrames[2]?.deliveryID,
+          body: bodies.freshAfterReconnect,
+        },
+        {
+          attempt: 2,
+          messageID: restartACK.messageID,
+          deliveryID: restartACK.deliveryID,
+          body: bodies.interruptedByRestart,
+        },
+        {
+          attempt: 3,
+          messageID: freshAfterRestart.details.message_id,
+          deliveryID: messageFrames[4]?.deliveryID,
+          body: bodies.freshAfterRestart,
+        },
+      ],
+    );
+    for (const frame of messageFrames) {
+      assert.match(String(frame.deliveryID), UUID_V7);
+    }
+    assert.equal(new Set(messageIDs).size, 5);
+    assert.equal(new Set(messageFrames.map((frame) => frame.messageID)).size, 5);
+    assert.equal(new Set(messageFrames.map((frame) => frame.deliveryID)).size, 5);
+    assert.deepEqual(
+      injectedText(recipient).map((text, index) => ({
+        body: allBodies.find((body) => text.endsWith(`\n${body}`)),
+        messageID: messageIDs.find((messageID) => text.includes(`id=${messageID}`)),
+        frameMessageID: messageFrames[index]?.messageID,
+      })),
+      allBodies.map((body, index) => ({
+        body,
+        messageID: messageIDs[index],
+        frameMessageID: messageIDs[index],
+      })),
+    );
+    assert.deepEqual(recipient.sendMessageAttempts, []);
+    assert.deepEqual(sender.sendUserMessageAttempts, []);
+    assert.deepEqual(sender.sendMessageAttempts, []);
+
+    const firstEvents = first.relay.output.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const secondEvents = second.relay.output.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const settlementEvents = [...firstEvents, ...secondEvents].filter((event) =>
+      event.event === "send_settled" && messageIDs.includes(String(event.message_id)));
+    assert.deepEqual(
+      settlementEvents.map((event) => ({ messageID: event.message_id, reason: event.reason, body: event.body })),
+      [
+        { messageID: messageIDs[0], reason: "received", body: "<redacted>" },
+        { messageID: messageIDs[1], reason: "recipient_disconnected", body: "<redacted>" },
+        { messageID: messageIDs[2], reason: "received", body: "<redacted>" },
+        { messageID: messageIDs[4], reason: "received", body: "<redacted>" },
+      ],
+    );
+    assert.equal(settlementEvents.some((event) => event.message_id === restartACK.messageID), false);
+    for (const body of allBodies) {
+      assert.equal(extensionLogs.some((line) => line.includes(body)), false);
+      assert.equal(first.relay.output.lines.some((line) => line.includes(body)), false);
+      assert.equal(second.relay.output.lines.some((line) => line.includes(body)), false);
+    }
 
     const unknownPEM = await writeInstallationKey(unknownExtensionState);
     process.env.PI_MESSAGING_RELAY_STATE_DIR = unknownExtensionState;
@@ -355,7 +695,13 @@ test("durable allowlist restores real extension authorization across one child-p
 
     const afterRestart = await readFile(allowlistPath, "utf8");
     assert.equal(afterRestart, beforeStop);
-    assertClosedAllowlist(afterRestart, [SECRET_BODY, privatePEM.trim(), unknownPEM.trim(), pairingCode]);
+    assertClosedAllowlist(afterRestart, [
+      ...allBodies,
+      ...messageIDs,
+      privatePEM.trim(),
+      unknownPEM.trim(),
+      pairingCode,
+    ]);
     assert.deepEqual(await readdir(serverState), ["allowlist.json"]);
     assert.equal(second.relay.stderr.length, 0);
     assert.equal(first.relay.stderr.length, 0);
@@ -385,6 +731,7 @@ test("durable allowlist restores real extension authorization across one child-p
         relay.closeOutput();
       }
     }
+    socketControl.restore();
     restoreReconnect();
     console.error = originalError;
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
