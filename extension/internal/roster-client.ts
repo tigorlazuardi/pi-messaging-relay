@@ -15,6 +15,8 @@ const MAX_CURSOR_CHARACTERS = 5_856;
 const DEFAULT_LIST_RESPONSE_TIMEOUT_MS = 5_000;
 // ponytail: fixed to 8s; make configurable when another production deadline profile exists.
 const DEFAULT_SEND_RESPONSE_TIMEOUT_MS = 8_000;
+// ponytail: fixed to 4s; revisit only when another measured transport deadline profile exists.
+const DEFAULT_SEND_RETRY_DELAY_MS = 4_000;
 
 /** Stable local retained-socket failure with a telemetry-safe reason. */
 export class RosterRequestError extends Error {
@@ -38,7 +40,8 @@ export type SendResult =
   | { message_id: string; status: "received" }
   | { message_id: string; status: "timeout"; reason: "offline" }
   | { message_id: string; status: "timeout"; reason: "ack_timeout" }
-  | { message_id: string; status: "timeout"; reason: "recipient_disconnected" };
+  | { message_id: string; status: "timeout"; reason: "recipient_disconnected" }
+  | { message_id: string; status: "denied"; reason: "message_id_conflict" };
 
 type ResponseDeadline = {
   cancel(): void;
@@ -49,17 +52,28 @@ type ResponseDeadlineFactory = (expire: () => void, durationMS: number) => Respo
 type PendingOperation = {
   kind: "list" | "send";
   requestID: string;
+  retryRequestID?: string;
   messageID?: string;
+  retryFrame?: (requestID: string) => string;
+  firstWriteCompleted: boolean;
   resolve(value: RosterPage | SendResult): void;
   reject(error: Error): void;
   deadline: ResponseDeadline;
+  retryDeadline?: ResponseDeadline;
   signal: AbortSignal;
   onAbort(): void;
+};
+
+type LateSendResponse = {
+  requestID: string;
+  messageID: string;
+  result: SendResult;
 };
 
 type RosterClientOptions = {
   responseTimeoutMS?: number;
   responseDeadlineFactory?: ResponseDeadlineFactory;
+  retryDeadlineFactory?: ResponseDeadlineFactory;
   settle?: () => Promise<void>;
   selfAddress?: string;
   deliverUserMessage?: (body: string) => void;
@@ -70,6 +84,7 @@ export class RosterClient {
   private readonly socket: WebSocket;
   private readonly responseTimeoutMS: number | undefined;
   private readonly responseDeadlineFactory: ResponseDeadlineFactory;
+  private readonly retryDeadlineFactory: ResponseDeadlineFactory;
   private readonly settle: () => Promise<void>;
   private readonly selfAddress: string | undefined;
   private readonly deliverUserMessage: ((body: string) => void) | undefined;
@@ -77,11 +92,13 @@ export class RosterClient {
   private terminal = false;
   private inboundProcessing = false;
   private writeInFlight: Promise<void> | undefined;
+  private lateSendResponse: LateSendResponse | undefined;
 
   constructor(socket: WebSocket, options: RosterClientOptions = {}) {
     this.socket = socket;
     this.responseTimeoutMS = options.responseTimeoutMS;
     this.responseDeadlineFactory = options.responseDeadlineFactory ?? startResponseDeadline;
+    this.retryDeadlineFactory = options.retryDeadlineFactory ?? startResponseDeadline;
     this.settle = options.settle ?? (() => terminateAndWait(socket));
     this.selfAddress = options.selfAddress;
     this.deliverUserMessage = options.deliverUserMessage;
@@ -131,13 +148,15 @@ export class RosterClient {
     const requestID = generateUUIDv7();
     const messageID = generateUUIDv7();
     const encodedRe = re === undefined ? "" : `,"re":${JSON.stringify(re)}`;
-    const frame = `{"v":1,"type":"send","request_id":${JSON.stringify(requestID)},` +
-      `"payload":{"message_id":${JSON.stringify(messageID)},"to":${JSON.stringify(to)},` +
-      `"body":${encodedBody}${encodedRe}}}`;
+    const immutablePayload = `{"message_id":${JSON.stringify(messageID)},"to":${JSON.stringify(to)},` +
+      `"body":${encodedBody}${encodedRe}}`;
+    const makeFrame = (frameRequestID: string) =>
+      `{"v":1,"type":"send","request_id":${JSON.stringify(frameRequestID)},"payload":${immutablePayload}}`;
+    const frame = makeFrame(requestID);
     if (Buffer.byteLength(frame, "utf8") > MAX_FRAME_BYTES) {
       return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send frame exceeds 512 KiB."));
     }
-    return this.beginOperation("send", requestID, messageID, frame, signal) as Promise<SendResult>;
+    return this.beginOperation("send", requestID, messageID, frame, signal, makeFrame) as Promise<SendResult>;
   }
 
   private beginOperation(
@@ -146,6 +165,7 @@ export class RosterClient {
     messageID: string | undefined,
     frame: string,
     signal: AbortSignal,
+    retryFrame?: (requestID: string) => string,
   ): Promise<RosterPage | SendResult> {
     if (this.terminal || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(this.operationError(kind, "disconnected"));
@@ -167,6 +187,8 @@ export class RosterClient {
         kind,
         requestID,
         messageID,
+        retryFrame,
+        firstWriteCompleted: false,
         resolve,
         reject,
         deadline: { cancel: () => undefined },
@@ -194,7 +216,23 @@ export class RosterClient {
         return;
       }
       pending.deadline = deadline;
-      void this.write(frame).catch(() => {
+      if (kind === "send") {
+        try {
+          pending.retryDeadline = this.retryDeadlineFactory(
+            () => this.retrySend(pending),
+            DEFAULT_SEND_RETRY_DELAY_MS,
+          );
+          if (!pending.retryDeadline || typeof pending.retryDeadline.cancel !== "function") {
+            throw new Error("invalid retry deadline");
+          }
+        } catch {
+          void this.failTerminal(this.operationError(kind, "disconnected"));
+          return;
+        }
+      }
+      void this.write(frame).then(() => {
+        pending.firstWriteCompleted = true;
+      }).catch(() => {
         void this.failTerminal(this.operationError(kind, "disconnected"));
       });
     });
@@ -220,6 +258,16 @@ export class RosterClient {
         return;
       }
 
+      const late = this.lateSendResponse;
+      if (late && parsed.request_id === late.requestID) {
+        const result = parseSendResult(parsed, late.requestID, late.messageID);
+        if (JSON.stringify(result) !== JSON.stringify(late.result)) {
+          throw new Error("conflicting paired send result");
+        }
+        this.lateSendResponse = undefined;
+        return;
+      }
+
       const pending = this.pending;
       if (!pending) throw new Error("unsolicited relay response");
       let result: RosterPage | SendResult;
@@ -227,7 +275,22 @@ export class RosterClient {
         if (data.byteLength > MAX_ROSTER_FRAME_BYTES) throw new Error("oversized roster frame");
         result = parseRoster(parsed, pending.requestID);
       } else {
-        result = parseSendResult(parsed, pending.requestID, pending.messageID as string);
+        const responseRequestID = typeof parsed.request_id === "string" ? parsed.request_id : "";
+        if (responseRequestID !== pending.requestID && responseRequestID !== pending.retryRequestID) {
+          throw new Error("invalid send result correlation");
+        }
+        result = parseSendResult(parsed, responseRequestID, pending.messageID as string);
+        const pairedRequestID = responseRequestID === pending.requestID
+          ? pending.retryRequestID
+          : pending.requestID;
+        if (pairedRequestID) {
+          if (this.lateSendResponse) throw new Error("paired response drain capacity reached");
+          this.lateSendResponse = {
+            requestID: pairedRequestID,
+            messageID: pending.messageID as string,
+            result,
+          };
+        }
       }
       this.clearPending();
       pending.resolve(result);
@@ -238,6 +301,18 @@ export class RosterClient {
         : undefined);
     }
   };
+
+  private retrySend(pending: PendingOperation): void {
+    if (this.pending !== pending || pending.kind !== "send" || !pending.firstWriteCompleted ||
+        this.writeInFlight || this.terminal || this.socket.readyState !== WebSocket.OPEN || !pending.retryFrame) {
+      return;
+    }
+    const requestID = generateUUIDv7();
+    pending.retryRequestID = requestID;
+    void this.write(pending.retryFrame(requestID)).catch(() => {
+      void this.failTerminal(this.operationError("send", "disconnected"));
+    });
+  }
 
   private async acceptDelivery(delivery: InboundDelivery, renderedBody: string): Promise<void> {
     try {
@@ -304,6 +379,7 @@ export class RosterClient {
     const pending = this.pending;
     if (!pending) return;
     cancelResponseDeadline(pending.deadline);
+    if (pending.retryDeadline) cancelResponseDeadline(pending.retryDeadline);
     pending.signal.removeEventListener("abort", pending.onAbort);
     this.pending = undefined;
   }
@@ -420,6 +496,10 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
        payload.reason === "ack_timeout" ||
        payload.reason === "recipient_disconnected")) {
     return { message_id: messageID, status: "timeout", reason: payload.reason };
+  }
+  if (hasExactKeys(payload, ["message_id", "status", "reason"]) &&
+      payload.status === "denied" && payload.reason === "message_id_conflict") {
+    return { message_id: messageID, status: "denied", reason: "message_id_conflict" };
   }
   throw new Error("invalid send result payload");
 }

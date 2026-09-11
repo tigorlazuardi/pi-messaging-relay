@@ -291,6 +291,136 @@ test("send generates internal IDs and accepts only exact correlated send_result"
   assert.deepEqual(await resultPromise, { message_id: payload.message_id, status: "received" });
 });
 
+test("send retries once on the current socket with one message ID and drains the paired late result", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const retryDeadlines: Array<{ expire(): void; cancelled: boolean; durationMS: number }> = [];
+  const controller = new AbortController();
+  const client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    retryDeadlineFactory: (expire, durationMS) => {
+      const deadline = { expire, durationMS, cancelled: false };
+      retryDeadlines.push(deadline);
+      return { cancel: () => { deadline.cancelled = true; } };
+    },
+  });
+
+  const firstPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send(
+    "opaque-destination",
+    { nested: { b: 2, a: "same" } },
+    undefined,
+    controller.signal,
+  );
+  const first = await firstPromise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(retryDeadlines.length, 1);
+  assert.equal(retryDeadlines[0]?.durationMS, 4_000);
+
+  const retryPromise = nextClientRequest(pair.server);
+  retryDeadlines[0]?.expire();
+  const retry = await retryPromise;
+  assert.notEqual(retry.request_id, first.request_id);
+  assert.match(String(retry.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.deepEqual(retry.payload, first.payload);
+  assert.equal(retryDeadlines.length, 1, "retry must not schedule another retry");
+
+  const payload = first.payload as Record<string, unknown>;
+  const resultFrame = (requestID: unknown) => JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: requestID,
+    payload: { message_id: payload.message_id, status: "received" },
+  });
+  pair.server.send(resultFrame(retry.request_id));
+  assert.deepEqual(await resultPromise, { message_id: payload.message_id, status: "received" });
+  assert.equal(retryDeadlines[0]?.cancelled, true);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+
+  const listRequestPromise = nextClientRequest(pair.server);
+  const listResultPromise = client.list(undefined, new AbortController().signal);
+  const listRequest = await listRequestPromise;
+  pair.server.send(resultFrame(first.request_id));
+  pair.server.send(roster(String(listRequest.request_id), { peers: [] }));
+  assert.deepEqual(await listResultPromise, { peers: [] });
+});
+
+test("send does not queue a retry behind an unresolved first write", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  let expireRetry: (() => void) | undefined;
+  const originalSend = pair.client.send.bind(pair.client);
+  let retryScheduled = false;
+  let releaseFirstWrite: (() => void) | undefined;
+  pair.client.send = ((data: WebSocket.Data, callback?: (error?: Error) => void) => {
+    assert.equal(retryScheduled, true, "retry trigger must start before the first write");
+    originalSend(data);
+    releaseFirstWrite = () => callback?.();
+    return pair.client;
+  }) as typeof pair.client.send;
+  const client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    retryDeadlineFactory: (expire, durationMS) => {
+      assert.equal(durationMS, 4_000);
+      retryScheduled = true;
+      expireRetry = expire;
+      return { cancel: () => undefined };
+    },
+  });
+
+  const firstPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send("opaque-destination", "same", undefined, new AbortController().signal);
+  const first = await firstPromise;
+  assert.ok(expireRetry);
+  expireRetry();
+  assert.ok(releaseFirstWrite);
+  releaseFirstWrite();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const outbound: string[] = [];
+  pair.server.on("message", (data) => outbound.push(data.toString("utf8")));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(outbound, []);
+  const payload = first.payload as Record<string, unknown>;
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: first.request_id,
+    payload: { message_id: payload.message_id, status: "received" },
+  }));
+  assert.equal((await resultPromise).status, "received");
+});
+
+test("send accepts only exact message_id_conflict denial and keeps the socket usable", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, {
+    responseTimeoutMS: 1_000,
+    retryDeadlineFactory: () => ({ cancel: () => undefined }),
+  });
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.send("opaque-destination", "hello", undefined, new AbortController().signal);
+  const request = await requestPromise;
+  const messageID = String((request.payload as Record<string, unknown>).message_id);
+  pair.server.send(JSON.stringify({
+    v: 1,
+    type: "send_result",
+    request_id: request.request_id,
+    payload: { message_id: messageID, status: "denied", reason: "message_id_conflict" },
+  }));
+  assert.deepEqual(await resultPromise, {
+    message_id: messageID,
+    status: "denied",
+    reason: "message_id_conflict",
+  });
+
+  const listRequestPromise = nextClientRequest(pair.server);
+  const listResultPromise = client.list(undefined, new AbortController().signal);
+  const listRequest = await listRequestPromise;
+  pair.server.send(roster(String(listRequest.request_id), { peers: [] }));
+  assert.deepEqual(await listResultPromise, { peers: [] });
+});
+
 test("send accepts exact recipient_disconnected and keeps the socket usable for list", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);

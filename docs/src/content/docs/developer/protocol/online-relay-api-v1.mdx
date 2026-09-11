@@ -44,9 +44,9 @@ Every WebSocket text frame is one JSON object:
 
 - `v` is the protocol major.
 - `type` comes from a closed operation set.
-- `request_id` is a sender-generated UUIDv7 used only to correlate one request and response. Server-pushed events may omit it.
+- `request_id` is a sender-generated UUIDv7 used only to correlate one request frame and response. A retry is another frame and therefore uses a fresh request ID. Server-pushed events may omit it.
 - `payload` is an object whose schema depends on `type`.
-- `message_id` identifies a logical message and supports reply correlation. It is not a request ID.
+- `message_id` identifies one logical message and supports retry deduplication and reply correlation. It is not a request ID.
 - `delivery_id` identifies one server offer to a recipient and is used only for the recipient extension ACK.
 - `body` is either a string or a JSON object. The recipient extension converts an object to canonical compact JSON before Pi injection.
 
@@ -60,14 +60,14 @@ A post-authentication parser starts at a message boundary and either dispatches 
 
 Operation-level outcomes are a different state transition: a structurally valid operation reaches the operation dispatcher, a canonical result may be returned, and the parser returns to the next message boundary without closing. Tickets #36 and #13 implement live `list`/`roster` discovery, which remains connected after authentication. Tickets #14–#17 implement successful idle and busy string/object paths plus correlated replies through deterministic provenance and exact recipient acknowledgment. Ticket #18 implements immediate offline results at an exact current-registry miss. Ticket #19 implements a bounded missing-ACK result after a recipient offer was written. Ticket #20 implements exact recipient-session-loss settlement after lookup and before ACK. Ticket #21 abandons exact sender-owned pending work when that sender session disconnects, without adding a public result.
 
-The server enforces one active `list` or `send` dispatcher at a time per authenticated connection. One mutex-protected state machine owns admission, unsupported-concurrency terminal closure, shutdown, and failure. The initial admission allows the first operation. After its dispatcher returns and any response has a bounded settlement owner, the coordinator atomically publishes the next admission before allowing that response worker to write. The sole reader then atomically either claims an already-published admission for immediate dispatcher handoff or claims terminal closure; it never waits with a decoded operation for future admission.
+The server enforces one active distinct `list` or `send` dispatcher at a time per authenticated connection. One mutex-protected state machine owns admission, unsupported-concurrency terminal closure, shutdown, and failure. The initial admission allows the first operation. After its dispatcher returns and its one or two response items have bounded sequencer ownership, the coordinator atomically publishes the next admission before opening their shared write gate. The sole reader then atomically either claims an already-published admission for immediate dispatcher handoff or claims terminal closure; it never waits with a decoded distinct operation for future admission. The sequencer owns at most four responses: an earlier logical operation's original/retry pair may remain active and queued after its first response becomes peer-visible, while the next conforming logical operation reserves its own original/retry pair.
 
-This dispatcher-completion boundary is deliberate. A WebSocket peer can observe a response before the server's `Write` returns, so response-write completion cannot distinguish a conforming post-response frame from an earlier pipelined frame. If frame B claims before A publishes admission, B is discarded and the session is hard-closed without a new error or operation result. If A publishes first, B is accepted for immediate next dispatch even when A's response settlement is still finishing. Ordered response settlement remains bounded, and there is never more than one active delivery dispatch or pending send for that connection. This is not the 128-send pipelining owned by ticket #25.
+This dispatcher-completion boundary is deliberate. A WebSocket peer can observe a response before the server's `Write` returns, so response-write completion cannot distinguish a conforming post-response frame from an earlier pipelined frame. If distinct frame B claims before A publishes admission, B is discarded and the session is hard-closed without a new error or operation result. If A publishes first, B is accepted for immediate next dispatch even when A's response settlement is still finishing. Ordered response settlement remains bounded, and there is never more than one active delivery dispatch or distinct pending send for that connection. This is not the 128-send pipelining owned by ticket #25.
 
-`received` is the response-free exception because one authenticated session can simultaneously be a sender and a recipient. The sole reader dispatches each validated ACK candidate synchronously, one at a time, without retaining it or consuming `list`/`send` admission. The delivery dispatcher still accepts only the exact recipient session plus matching delivery and message IDs; unknown, stale, or wrong-session ACKs remain harmless. This exception preserves valid recipient overlap but does not authorize an operation queue.
+`received` is the response-free exception because one authenticated session can simultaneously be a sender and a recipient. The sole reader dispatches each validated ACK candidate synchronously, one at a time, without retaining it or consuming `list`/`send` admission. The delivery dispatcher still accepts only the exact recipient session plus matching delivery and message IDs; unknown, stale, or wrong-session ACKs remain harmless. An exact repeated `send` or conflict for the current authenticated sender session and message ID is the other narrow exception: the reader classifies it against already-owned bounded state before ordinary admission, attaches at most one pending retry, and never dispatches a second recipient offer. A third pending repeat or bounded response overflow fails closed. These exceptions preserve valid overlap without authorizing a second distinct pending send or an operation queue.
 
 <Decision title="Linearize operation admission at completed dispatcher ownership" status="accepted">
-One synchronization domain gives frame claim and admission publication a deterministic winner. Dispatcher completion—not peer-visible response timing—publishes the next admission because the latter is not observable reliably at the server. An admitted frame receives the sole dispatcher immediately; an earlier frame closes instead of waiting. At most one ordered response settlement may overlap the next active dispatcher, so no second pending send or #25 capacity is introduced.
+One synchronization domain gives distinct-frame claim and admission publication a deterministic winner. Dispatcher completion—not peer-visible response timing—publishes the next admission because the latter is not observable reliably at the server. An admitted distinct frame receives the sole dispatcher immediately; an earlier distinct frame closes instead of waiting. One fixed four-slot response sequencer covers the exact conforming maximum—prior original/retry pair plus next original/retry pair—while preserving order, so no second distinct pending send or #25 capacity is introduced.
 </Decision>
 
 <Decision title="Fail closed on protocol ambiguity but keep operation denials recoverable" status="accepted">
@@ -405,9 +405,9 @@ After lookup finds an exact authenticated recipient, failure to write the offer 
 <Aside type="note" title="Implementation boundary">
 Tickets #14–#21 implement successful string and object delivery, correlated replies, immediate current-registry-miss settlement, bounded missing-ACK settlement, recipient-session-loss settlement, and exact sender-session-loss cleanup through the same ordinary send path: extension-generated request and message IDs, exact opaque-address lookup, no history-derived routing, server-generated delivery IDs only after a recipient is found, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact one-argument idle injection, exact busy `{ deliverAs: "followUp" }` injection, exact recipient ACK authorization, independently correlated `received` results, exact `timeout/offline` miss results, and exact `timeout/ack_timeout` results after an offered delivery receives no exact ACK within five seconds. The reply destination and `re` value are copied from the original injected provenance; no sender field can select a generated ID, delivery mode, or steering.
 
-A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each online reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. Retry/dedupe (#22–#23), 256 KiB body denial (#24), and 128-send pipelining (#25) remain incomplete.
+A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each online reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. The one transport retry reuses only its own new logical message ID; it never reuses the replied-to ID. The 256 KiB body denial (#24) and 128-send pipelining (#25) remain incomplete.
 
-The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs and malformed `re` values fail content-free before IDs or socket work. The sender extension accepts exactly the closed correlated result payloads `{message_id,status:"received"}`, `{message_id,status:"timeout",reason:"offline"}`, `{message_id,status:"timeout",reason:"recipient_disconnected"}`, and `{message_id,status:"timeout",reason:"ack_timeout"}`. Every other status/reason pair, including a missing or extra field or a future reason, is an invalid response that terminally closes the retained socket. If #24 or another explicitly scoped ticket implements an additional sender outcome, that work must explicitly expand the result type and parser allowlist before acceptance; no additional outcome is claimed today. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
+The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs and malformed `re` values fail content-free before IDs or socket work. The sender extension accepts exactly the closed correlated result payloads `{message_id,status:"received"}`, `{message_id,status:"timeout",reason:"offline"}`, `{message_id,status:"timeout",reason:"recipient_disconnected"}`, `{message_id,status:"timeout",reason:"ack_timeout"}`, and `{message_id,status:"denied",reason:"message_id_conflict"}`. Every other status/reason pair, including a missing or extra field or a future reason, is an invalid response that terminally closes the retained socket. If #24 or another explicitly scoped ticket implements an additional sender outcome, that work must explicitly expand the result type and parser allowlist before acceptance; no additional outcome is claimed today. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
 </Aside>
 
 ### I/O examples
@@ -559,6 +559,35 @@ The local extension accepts safe string or JSON-object bodies under its closed t
     }
     ```
   </TabItem>
+  <TabItem label="Retry frame">
+    ```json
+    {
+      "v": 1,
+      "type": "send",
+      "request_id": "01993c84-6e49-7e86-9cd2-0a56fb819de2",
+      "payload": {
+        "message_id": "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+        "to": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
+        "re": "01993c80-40de-79d7-9b2c-1349f88bb408",
+        "body": "Review the API contract"
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Conflict result">
+    ```json
+    {
+      "v": 1,
+      "type": "send_result",
+      "request_id": "01993c84-7f50-7f97-acde-1b670c92aef3",
+      "payload": {
+        "message_id": "01993c84-fc2b-7e1c-af99-61b8118ac6df",
+        "status": "denied",
+        "reason": "message_id_conflict"
+      }
+    }
+    ```
+  </TabItem>
   <TabItem label="Concurrent sender effect">
     ```text
     input: sender pipelines a second send while delivery 01993c85-d827-7cd9-966c-07aa3ee42e47 is pending
@@ -567,7 +596,7 @@ The local extension accepts safe string or JSON-object bodies under its closed t
   </TabItem>
 </Tabs>
 
-A reply uses the same ordinary `agent_send({ to, body, re })` and wire `send` operations. The receiving agent copies `to` from the original header's complete JSON-quoted `from` value and copies `re` from its `id`. The extension generates a fresh request ID and reply `message_id`; the relay generates a fresh delivery ID. The reply ACK and `send_result` settle only that reply call, independently of the original result. The model cannot supply any of those generated IDs. There is no automatic reply, special reply operation, server message-history lookup, or guarantee of completion or another reply. `re` carries correlation only and grants no routing authority. Internal retry remains deferred to ticket #22.
+A reply uses the same ordinary `agent_send({ to, body, re })` and wire `send` operations. The receiving agent copies `to` from the original header's complete JSON-quoted `from` value and copies `re` from its `id`. The extension generates a fresh request ID and reply `message_id`; the relay generates a fresh delivery ID. The reply ACK and `send_result` settle only that reply call, independently of the original result. The model cannot supply any of those generated IDs. There is no automatic reply, special reply operation, server message-history lookup, or guarantee of completion or another reply. `re` carries correlation only and grants no routing authority.
 
 The recipient injects one user message with this exact shape:
 
@@ -580,9 +609,31 @@ The `re` segment exists only when a valid supplied UUIDv7 is present. Ticket #17
 
 String bodies follow that LF unchanged, with no trim or normalization. Object bodies use a project-specific canonical compact encoder. At every object depth it sorts own enumerable string keys by ECMAScript lexical comparison of UTF-16 code units and emits entries directly in that order; integer-like keys are therefore lexical (`"10"` before `"2"`) rather than JavaScript property-enumeration order. Arrays preserve order. Null, booleans, finite numbers, and strings use deterministic `JSON.stringify` primitive representations. No whitespace is added. This algorithm is not claimed to implement RFC 8785 or JCS.
 
+## Retry identity and retained deduplication
+
+The extension builds one immutable send payload and starts one eight-second logical response deadline, one abort owner, and one retry trigger before its first write. At exactly four seconds from logical-operation start, it makes one internal response retry only when the first write has already completed successfully, no response settled, the same retained socket is still current/open, and no write is unresolved. An unresolved or failed first write is not retried and follows existing terminal failure or logical-deadline behavior. The retry uses the same message ID and byte-identical payload with a fresh UUIDv7 request ID. It does not reconnect, reset the trigger or logical deadline, queue behind a write, create another retry, or replay after lifecycle loss. A valid result correlated to either request ID and the shared message ID settles the model operation once; the other exact paired result may be drained without poisoning the next operation.
+
+The relay keys duplicate identity by the exact authenticated sender-session authority plus message ID. The immutable fingerprint includes exact `to`, `re` absence or decoded value, and the semantic JSON body. Object whitespace, member order, and equivalent string escapes do not matter; arrays remain ordered, decoded strings and object keys compare by value, and JSON numbers compare by exact mathematical decimal value, so `1`, `1.0`, and `1e0` are equal. Destination, `re`, or semantic body changes return the request-correlated recoverable denial `{message_id,status:"denied",reason:"message_id_conflict"}` without changing the original or closing either healthy socket. The fingerprint and raw body are never logged.
+
+An identical pending repeat attaches only its request correlation to the original work. Settlement returns the same payload for both frame request IDs but creates no second delivery ID, offer, Pi injection, ACK timer, or logical settlement event. An identical settled repeat returns the retained result immediately with its own request ID. Another authenticated sender session has a separate namespace even when it submits the same message ID.
+
+The recipient-owned window retains only `received` and `timeout/ack_timeout`, and only while its exact recipient session remains live. Each exact recipient session retains at most 1,024 settled message IDs. Settlement insertion determines age; inserting entry 1,025 evicts the oldest still-retained insertion without refreshing age on replay. Pending entries do not consume this settled capacity. Because ordinary admission permits one distinct active dispatch per authenticated sender and the registry permits 1,024 sessions, pending records remain separately finite until #25 adds its accepted 128-send policy. Once an evicted ID is also no longer the sender-current record described next, it is unknown and a later frame is a new logical send with a fresh delivery offer.
+
+Recipient-owned retention still contains only `received` and `timeout/ack_timeout`. Separately, the relay retains at most one sender-owned current-logical tombstone per exact authenticated sender session. That tombstone preserves the fingerprint and any selected result—including `timeout/offline` or `timeout/recipient_disconnected`—long enough to classify the one already-emitted current-socket retry after recipient cleanup. Recipient loss removes that recipient's settled window and prevents racing insertion, but cannot remove another session's sender-current tombstone; recipient-window eviction likewise cannot evict it.
+
+The sender-current tombstone is released only after a repeated frame is classified and its response has reserved bounded sequencer ownership, when the sole reader admits the next safely ordered distinct `list` or `send` operation, on exact sender loss, or on shutdown. Frame order proves a retry for the previous logical operation cannot follow the sender's next distinct frame. Once neither recipient-window nor sender-current ownership remains, a future send is new. Sender loss removes all records indexed to that exact session, and shutdown clears the entire memory-only ledger. No ownership transfers to a reconnect and no old recipient offer is replayed.
+
+<Decision title="Bound logical-message identity to exact live sessions" status="accepted">
+Retain recipient-owned `received` and `ack_timeout` outcomes in a 1,024-entry oldest-settled window, plus at most one separate sender-current result per exact sender session. Exact reverse ownership indexes make sender/recipient cleanup proportional to only that session's records. This provides deterministic idempotence across recipient cleanup without persistence, replay, global-map lifecycle scans, or unbounded sender caches.
+</Decision>
+
+<Decision title="Retry once inside one logical deadline" status="accepted">
+Four seconds from logical-operation start gives a missing response one current-socket retry before the fixed eight-second client deadline while preserving the relay's full five-second ACK window. Eligibility requires an already successful first write; unresolved or failed writes are never retry triggers. Ponytail: retry timing is fixed to four seconds from operation start; make it configurable only when a second measured transport deadline profile exists.
+</Decision>
+
 ## Current delivery failure boundary
 
-Four sender outcomes are finalized. An exact recipient ACK returns the correlated `send_result` with `status: "received"`. An exact miss at the current published-session lookup immediately returns the same request and message correlation with `status: "timeout"` and `reason: "offline"`. That miss is a normal machine result, not a local exception or protocol denial, and the sender connection remains open for a later list or send. It reveals only current absence: known-offline and never-published valid opaque destinations have the same result, with no history or existence state.
+Five sender result shapes are finalized. An exact recipient ACK returns the correlated `send_result` with `status: "received"`. An exact miss at the current published-session lookup immediately returns the same request and message correlation with `status: "timeout"` and `reason: "offline"`. That miss is a normal machine result, not a local exception or protocol denial, and the sender connection remains open for a later list or send. It reveals only current absence: known-offline and never-published valid opaque destinations have the same result, with no history or existence state.
 
 After a recipient is found and its offer is successfully written, the relay starts exactly five seconds for the exact recipient session to return matching delivery and message IDs. Expiry atomically removes that pending offer before returning the correlated `send_result` with `status: "timeout"` and `reason: "ack_timeout"`. A valid ACK that wins before expiry still returns `received`; the deadline boundary chooses only one settlement. A later ACK finds no pending offer, emits no response, changes no result, and leaves the recipient connection healthy. The released slot is immediately available for another send. `ack_timeout` says only that an offer was written but no exact extension ACK arrived by the deadline; it is not a model-read, work-completion, queue-durability, or message-durability status.
 
@@ -604,11 +655,13 @@ The currently enforced ceilings are:
 - 64 nested object or array containers, counting the outer envelope as depth 1;
 - 4,389 UTF-8 bytes for an opaque address;
 - exactly five seconds for the relay's pending recipient ACK wait;
-- five seconds for the extension's `list_peers` response and eight seconds for its `agent_send` response;
+- five seconds for the extension's `list_peers` response, a retry trigger at four seconds from `agent_send` start, and eight seconds for its complete `agent_send` response;
+- 1,024 retained settled message IDs per exact recipient session, evicting the oldest settled insertion;
+- one pending retry attachment, one sender-current tombstone per exact sender session, and four bounded response-sequencer ownership slots per authenticated serve;
 - 1,024 tracked server connections; and
 - one use and exactly ten minutes for a pairing code, with the deadline itself expired.
 
-Retry and idempotence (#22), dedupe behavior (#23), the distinct 256 KiB body rule (#24), 128-send pipelining (#25), automatic reconnect (#26), restart authentication (#27), broader restart/reconnect replay assertions (#28), and additional diagnostics (#29) remain deferred. Ticket #21 adds no retry, automatic reconnect, persistence, replay, or public result mechanism. This version publishes no I/O shape or runtime guarantee for those remaining seams.
+Retry idempotence (#22) and bounded dedupe retention (#23) are implemented together. The distinct 256 KiB body rule (#24), 128-send pipelining (#25), automatic reconnect (#26), restart authentication (#27), broader restart/reconnect replay assertions (#28), and additional diagnostics (#29) remain deferred. This version adds no reconnect, persistence, offline inbox, replay, or extra model tool.
 
 ## Operational evidence
 

@@ -33,6 +33,7 @@ type sendOperationPayload struct {
 	To        string
 	Body      json.RawMessage
 	Re        string
+	RePresent bool
 }
 
 type receivedOperationPayload struct {
@@ -41,11 +42,14 @@ type receivedOperationPayload struct {
 }
 
 type clientOperation struct {
-	Type      string
-	RequestID string
-	List      *listOperationPayload
-	Send      *sendOperationPayload
-	Received  *receivedOperationPayload
+	Type       string
+	RequestID  string
+	List       *listOperationPayload
+	Send       *sendOperationPayload
+	Received   *receivedOperationPayload
+	Record     *dedupeRecord
+	Dedupe     string
+	ObservedAt time.Time
 }
 
 type operationResponse struct {
@@ -98,6 +102,15 @@ func noOperationDispatcher(
 type authenticatedRead struct {
 	operation clientOperation
 	failure   *protocolFailure
+}
+
+type authenticatedResponseWork struct {
+	encoded        []byte
+	log            logEvent
+	started        time.Time
+	measureLatency bool
+	start          <-chan struct{}
+	done           chan<- bool
 }
 
 type authenticatedOperationAdmission struct {
@@ -160,8 +173,13 @@ func (service *sessionAuthService) serveAuthenticated(
 	reads := make(chan authenticatedRead)
 	readDone := make(chan struct{})
 	admission := newAuthenticatedOperationAdmission()
+	// One preceding logical operation can still own its original+retry pair
+	// after the first response becomes peer-visible. The next conforming logical
+	// send can then own its own original+retry pair: four is the exact maximum.
+	responseQueue := make(chan authenticatedResponseWork, 4)
+	responseSlots := make(chan struct{}, 4)
+	responseDone := make(chan struct{})
 
-	var activeSettlement <-chan bool
 	var terminateOnce sync.Once
 	terminate := func() {
 		terminateOnce.Do(func() {
@@ -174,11 +192,122 @@ func (service *sessionAuthService) serveAuthenticated(
 	defer func() {
 		terminate()
 		<-readDone
-		if activeSettlement != nil {
-			<-activeSettlement
+		<-responseDone
+	}()
+
+	prepareResponse := func(
+		operation clientOperation,
+		response operationResponse,
+		operationStarted time.Time,
+		start <-chan struct{},
+	) (authenticatedResponseWork, error) {
+		encodedResponse, err := encodeOperationResponse(operation, response)
+		if err != nil {
+			return authenticatedResponseWork{}, err
+		}
+		event := "operation_settled"
+		level := "info"
+		if operation.Type == "send" && response.Outcome == "settled" && operation.Dedupe == "" {
+			event = "send_settled"
+		}
+		if response.Outcome == "denied" {
+			event = "operation_denied"
+			level = "warn"
+		}
+		log := logEvent{
+			Level:          level,
+			Event:          event,
+			Result:         response.Outcome,
+			Reason:         response.Code,
+			Code:           response.Code,
+			Type:           operation.Type,
+			RequestID:      operation.RequestID,
+			Count:          response.PeerCount,
+			MessageID:      response.MessageID,
+			DeliveryID:     response.DeliveryID,
+			SenderRoute:    response.SenderRoute,
+			RecipientRoute: response.RecipientRoute,
+			Status:         response.Status,
+			Dedupe:         operation.Dedupe,
+		}
+		if operation.Type == "send" {
+			log.Body = redacted
+		}
+		return authenticatedResponseWork{
+			encoded:        encodedResponse,
+			log:            log,
+			started:        operationStarted,
+			measureLatency: true,
+			start:          start,
+		}, nil
+	}
+	enqueueResponse := func(work authenticatedResponseWork) bool {
+		select {
+		case responseSlots <- struct{}{}:
+		default:
+			return false
+		}
+		select {
+		case responseQueue <- work:
+			return true
+		case <-serveContext.Done():
+			<-responseSlots
+			return false
+		}
+	}
+
+	go func() {
+		defer close(responseDone)
+		for {
+			select {
+			case work := <-responseQueue:
+				finish := func(settled bool) {
+					if work.done == nil {
+						return
+					}
+					select {
+					case work.done <- settled:
+					default:
+					}
+				}
+				select {
+				case <-work.start:
+				case <-serveContext.Done():
+					finish(false)
+					<-responseSlots
+					return
+				}
+				writeContext, cancelWrite := context.WithTimeout(serveContext, protocolResponseWriteTimeout)
+				err := service.connections.writeToSession(writeContext, session, work.encoded)
+				cancelWrite()
+				if err != nil {
+					finish(false)
+					<-responseSlots
+					terminate()
+					return
+				}
+				if work.measureLatency {
+					work.log.LatencyMS = latencySince(work.started)
+				}
+				if service.beforeResponseAudit != nil {
+					service.beforeResponseAudit(work.log)
+				}
+				if !service.writeAudit(work.log) {
+					finish(false)
+					<-responseSlots
+					terminate()
+					return
+				}
+				finish(true)
+				<-responseSlots
+			case <-serveContext.Done():
+				return
+			}
 		}
 	}()
 
+	immediateStart := make(chan struct{})
+	close(immediateStart)
 	go func() {
 		defer close(readDone)
 		defer close(reads)
@@ -206,6 +335,41 @@ func (service *sessionAuthService) serveAuthenticated(
 				continue
 			}
 
+			operationStarted := time.Now()
+			operation.ObservedAt = operationStarted
+			if failure == nil && operation.Type == "send" {
+				if service.beforeRepeatedSendObservation != nil {
+					service.beforeRepeatedSendObservation(operation)
+				}
+				observation, observeErr := service.connections.dedupe.observe(session, operation)
+				if observeErr != nil {
+					service.reportFatal(fmt.Errorf("classify repeated send: %w", observeErr))
+					terminate()
+					return
+				}
+				switch observation.kind {
+				case dedupePendingAttached:
+					continue
+				case dedupeImmediate:
+					operation.Dedupe = observation.dedupe
+					work, prepareErr := prepareResponse(operation, observation.response, operationStarted, immediateStart)
+					if prepareErr != nil {
+						service.reportFatal(fmt.Errorf("prepare repeated send response: %w", prepareErr))
+						terminate()
+						return
+					}
+					if !enqueueResponse(work) {
+						terminate()
+						return
+					}
+					service.connections.dedupe.releaseCurrent(observation.record)
+					continue
+				case dedupeOverflow:
+					terminate()
+					return
+				}
+			}
+
 			if service.beforeOperationAdmissionDecision != nil {
 				service.beforeOperationAdmissionDecision(operation)
 			}
@@ -214,10 +378,19 @@ func (service *sessionAuthService) serveAuthenticated(
 				service.afterOperationAdmissionDecision(operation, admitted)
 			}
 			if !admitted {
-				operation = clientOperation{}
-				failure = nil
 				terminate()
 				return
+			}
+			if failure == nil && operation.Type == "send" {
+				if beginErr := service.connections.dedupe.begin(session, &operation); beginErr != nil {
+					service.reportFatal(fmt.Errorf("begin send dedupe record: %w", beginErr))
+					terminate()
+					return
+				}
+			} else if failure == nil && operation.Type == "list" {
+				// Frame ordering proves a retry emitted for the previous logical send
+				// would already have been classified before this admitted list.
+				service.connections.dedupe.advanceSender(session)
 			}
 			select {
 			case reads <- authenticatedRead{operation: operation, failure: failure}:
@@ -230,131 +403,91 @@ func (service *sessionAuthService) serveAuthenticated(
 		}
 	}()
 
-	waitSettlement := func() bool {
-		if activeSettlement == nil {
-			return true
-		}
-		settled := <-activeSettlement
-		activeSettlement = nil
-		return settled
-	}
-	startSettlement := func(encodedResponse []byte, log logEvent, operationStarted time.Time) func() {
-		start := make(chan struct{})
-		done := make(chan bool, 1)
-		activeSettlement = done
-		go func() {
-			select {
-			case <-start:
-			case <-serveContext.Done():
-				done <- false
-				return
-			}
-			writeContext, cancelWrite := context.WithTimeout(serveContext, protocolResponseWriteTimeout)
-			err := service.connections.writeToSession(writeContext, session, encodedResponse)
-			cancelWrite()
-			if err != nil {
-				terminate()
-				done <- false
-				return
-			}
-			log.LatencyMS = latencySince(operationStarted)
-			if !service.writeAudit(log) {
-				terminate()
-				done <- false
-				return
-			}
-			done <- true
-		}()
-		return func() { close(start) }
-	}
-
 	for read := range reads {
 		operation, failure := read.operation, read.failure
 		if failure != nil {
-			if !waitSettlement() {
+			encoded, encodeErr := encodeProtocolError(*failure)
+			if encodeErr != nil {
 				return
 			}
-			if !service.writeAudit(logEvent{
-				Level:     "warn",
-				Event:     "protocol_rejected",
-				Result:    "rejected",
-				Reason:    failure.Reason,
-				Code:      failure.Code,
-				Type:      failure.Type,
-				RequestID: failure.RequestID,
+			done := make(chan bool, 1)
+			if !enqueueResponse(authenticatedResponseWork{
+				encoded: encoded,
+				log: logEvent{
+					Level:     "warn",
+					Event:     "protocol_rejected",
+					Result:    "rejected",
+					Reason:    failure.Reason,
+					Code:      failure.Code,
+					Type:      failure.Type,
+					RequestID: failure.RequestID,
+				},
+				started: time.Now(),
+				start:   immediateStart,
+				done:    done,
 			}) {
 				return
 			}
-			if encoded, encodeErr := encodeProtocolError(*failure); encodeErr == nil {
-				writeContext, cancelWrite := context.WithTimeout(serveContext, protocolResponseWriteTimeout)
-				_ = service.connections.writeToConnection(writeContext, connection, encoded)
-				cancelWrite()
+			select {
+			case <-done:
+			case <-serveContext.Done():
 			}
 			return
 		}
 
 		operationStarted := time.Now()
 		response, respond, err := service.dispatchOperation(serveContext, session, operation)
+		attached := service.connections.dedupe.complete(operation.Record, response, respond)
 		if err != nil {
 			service.reportFatal(fmt.Errorf("dispatch %s operation: %w", operation.Type, err))
 			return
 		}
-		var beginSettlement func()
+
+		start := make(chan struct{})
 		if respond {
-			encodedResponse, encodeErr := encodeOperationResponse(operation, response)
-			if encodeErr != nil {
+			work, prepareErr := prepareResponse(operation, response, operationStarted, start)
+			if prepareErr != nil {
 				service.reportFatal(fmt.Errorf(
 					"prepare %s operation response for request %s: %w",
 					operation.Type,
 					operation.RequestID,
-					encodeErr,
+					prepareErr,
 				))
 				return
 			}
-			event := "operation_settled"
-			level := "info"
-			if operation.Type == "send" && response.Outcome == "settled" {
-				event = "send_settled"
-			}
-			if response.Outcome == "denied" {
-				event = "operation_denied"
-				level = "warn"
-			}
-			log := logEvent{
-				Level:          level,
-				Event:          event,
-				Result:         response.Outcome,
-				Reason:         response.Code,
-				Code:           response.Code,
-				Type:           operation.Type,
-				RequestID:      operation.RequestID,
-				Count:          response.PeerCount,
-				MessageID:      response.MessageID,
-				DeliveryID:     response.DeliveryID,
-				SenderRoute:    response.SenderRoute,
-				RecipientRoute: response.RecipientRoute,
-				Status:         response.Status,
-			}
-			if operation.Type == "send" {
-				log.Body = redacted
-			}
-			if !waitSettlement() {
+			if !enqueueResponse(work) {
 				return
 			}
-			beginSettlement = startSettlement(encodedResponse, log, operationStarted)
+			if attached != nil {
+				attachedStarted := operationStarted
+				if !attached.ObservedAt.IsZero() {
+					attachedStarted = attached.ObservedAt
+				}
+				attachedWork, attachedErr := prepareResponse(*attached, response, attachedStarted, start)
+				if attachedErr != nil {
+					service.reportFatal(fmt.Errorf("prepare attached send response: %w", attachedErr))
+					return
+				}
+				if !enqueueResponse(attachedWork) {
+					return
+				}
+			}
+			if attached != nil {
+				service.connections.dedupe.releaseCurrent(operation.Record)
+			}
+			if service.afterOperationResponseReservation != nil {
+				service.afterOperationResponseReservation(operation)
+			}
 		}
 		if !admission.publish(service.connections.closingSignal()) {
 			return
 		}
-		if beginSettlement != nil {
-			beginSettlement()
-		}
+		close(start)
 		if service.afterOperationAdmissionPublication != nil {
 			service.afterOperationAdmissionPublication(operation)
 		}
 	}
 }
-
 func readClientOperation(
 	ctx context.Context,
 	connection *websocket.Conn,
@@ -548,6 +681,7 @@ func decodeSendPayload(data []byte) (sendOperationPayload, bool) {
 		if err := json.Unmarshal(re, &payload.Re); err != nil || !isUUIDv7(payload.Re) {
 			return sendOperationPayload{}, false
 		}
+		payload.RePresent = true
 	}
 	return payload, true
 }

@@ -108,6 +108,7 @@ func (dispatcher *deliveryDispatcher) send(
 			Status:         "timeout",
 		}, true, nil
 	}
+	dispatcher.registry.dedupe.bindRecipient(operation.Record, recipient)
 	deliveryID, err := generateServerUUIDv7(time.Now())
 	if err != nil {
 		return operationResponse{}, false, fmt.Errorf("generate delivery ID: %w", err)
@@ -301,6 +302,8 @@ func (dispatcher *deliveryDispatcher) handleSessionUnavailable(session *authenti
 		}
 	}
 	dispatcher.unlock()
+	dispatcher.registry.dedupe.forgetSender(session)
+	dispatcher.registry.dedupe.forgetRecipient(session)
 }
 
 func (dispatcher *deliveryDispatcher) shutdown() {
@@ -311,6 +314,7 @@ func (dispatcher *deliveryDispatcher) shutdown() {
 		close(pending.shutdown)
 	}
 	dispatcher.unlock()
+	dispatcher.registry.dedupe.shutdown()
 }
 
 func (dispatcher *deliveryDispatcher) lock()   { dispatcher.mu.Lock() }

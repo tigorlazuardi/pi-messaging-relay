@@ -1,6 +1,6 @@
 ---
 title: Send an online message
-description: Send online messages and interpret offline, recipient-disconnected, ACK-timeout, and received results.
+description: Send retry-safe online messages and interpret received, timeout, and message-ID-conflict results.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -17,6 +17,7 @@ import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 5. Treat `status: "timeout", reason: "offline"` as immediate current absence; the same connection remains usable.
 6. Treat `status: "timeout", reason: "recipient_disconnected"` as relay-observed loss of the selected recipient session or failure to write its offer before ACK; the sender connection remains usable.
 7. Treat `status: "timeout", reason: "ack_timeout"` as an offer written to a connected recipient that did not return the exact ACK within five seconds; both connections remain usable.
+8. Treat `status: "denied", reason: "message_id_conflict"` as safe rejection of changed immutable content under one generated logical ID; both healthy connections remain usable.
 </Steps>
 
 The extension creates the message ID. Do not add `message_id`, delivery options, or steering fields to tool input. Every recipient sees a provenance header containing the complete quoted sender address and generated message ID. The extension treats that address as opaque; copy it whole. Delivery mode comes only from the recipient's current local state: an idle recipient gets `pi.sendUserMessage(rendered)` with no options, while a busy recipient gets `pi.sendUserMessage(rendered, { deliverAs: "followUp" })`. A follow-up waits behind all active recipient work; it does not steer or change the current run.
@@ -42,13 +43,19 @@ An incoming message starts with a header like:
 
 The extension generates a new reply message ID; it never reuses the original ID. The relay generates a new delivery ID and settles the reply independently from the original send. `re` is correlation metadata only: it does not authorize delivery, trigger a special reply operation, or prove that a retained original exists. The server performs no message-history or existence lookup. Replies are never automatic, and `received` guarantees neither completed work nor another reply.
 
-## Current limits
+## Retry and current limits
+
+For each `agent_send`, the extension creates one logical message ID and one immutable payload. Its retry trigger starts with the logical operation and fires at exactly four seconds. It makes exactly one internal retry only when the first write has already completed successfully, no response settled, no write is unresolved, and that same socket remains current and open. An unresolved or failed first write is not retried and follows existing terminal failure or eight-second logical-deadline behavior. The retry does not reconnect, replay after disconnect, restart its trigger, wait behind a write, or extend the deadline. A result for either request frame settles the tool once; an exact paired late result is drained instead of damaging the next operation.
+
+The relay recognizes the retry by the exact authenticated sender session and message ID. An identical retained request never causes a second recipient injection. Changing destination, `re` presence/value, or semantic body under that ID returns `denied/message_id_conflict`; normal extension code retransmits its already-built payload, so this denial mainly identifies a faulty or hostile raw client.
 
 This release completes successful idle and busy string/object delivery with deterministic provenance, ordinary correlated replies with fresh IDs and independent results, immediate `timeout/offline` settlement when the exact destination is absent from the current registry, `timeout/recipient_disconnected` settlement when the selected recipient session or offer write disappears before ACK, and `timeout/ack_timeout` settlement when a written offer receives no exact ACK within five seconds. String bodies are unchanged after the one LF that separates the header. Object keys are sorted recursively by JavaScript UTF-16 lexical order, including integer-like names; arrays retain their order and output is compact JSON. A registry miss creates no recipient offer, delivery ID, pending work, or history and does not close the sender connection. ACK timeout removes the pending offer before responding; a late ACK produces no response, cannot change the result, and does not damage the recipient connection. Disconnect cancellation releases every affected pending offer once. If the sender connection itself disappears while offers are pending, the relay removes only that exact sender session's work immediately. No result or `send_settled` can be delivered for the unreachable sender; late recipient ACKs are ignored, recipient presence remains available, and other senders continue normally. Self-send disconnect is sender-owned and likewise produces no result. ACK, expiry, recipient disconnect, sender disconnect, and shutdown compete for exact ownership, so a stale event cannot relabel the result. Reconnecting the same installation and address does not replay interrupted offers; stale ACKs are harmless, and only a fresh send creates a fresh offer. Automatic reconnect is not available.
 
 Only one `list_peers` or `agent_send` request may be active on one extension connection. A concurrent extension request fails locally without being sent or queued. The relay independently allows only one active list/send operation per connection. It considers an operation complete when its server work—including any recipient ACK wait—ends, not when its response finishes crossing the socket. A raw frame processed before that completion gets a generic closed session and is discarded; one processed afterward may proceed. Raw clients cannot infer this ordering from when they called `Write`, so they must wait for each response. The relay never holds a frame waiting for future admission, and future 128-send pipelining remains ticket #25.
 
-Recipient acknowledgements remain valid while that same authenticated session has its own outgoing operation pending; one session can act as sender and recipient. This ACK overlap adds no list/send pipelining promise and no ACK queue. After an offline, recipient-disconnected, or ACK-timeout result, use the same sender connection for `list_peers` or another send. A disconnected sender must authenticate a subsequent session; its abandoned send is not retried or replayed. The extension allows five seconds for a list response and eight seconds for a send response. The eight-second send deadline starts before relay processing and leaves room for the relay's bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender response write, and scheduling. It does not reduce the recipient's five seconds. There is no transport retry, offline inbox, persistence, replay, broadcast, delivery history, or proof that an absent route existed before. The final 256 KiB body rejection behavior belongs to #24; every complete transport frame is currently bounded to 512 KiB.
+Recipient acknowledgements remain valid while that same authenticated session has its own outgoing operation pending; one session can act as sender and recipient. This ACK overlap adds no list/send pipelining promise and no ACK queue. After an offline, recipient-disconnected, ACK-timeout, or message-ID-conflict result, use the same sender connection for `list_peers` or another send. A disconnected sender must authenticate a subsequent session; its abandoned send is not retried or replayed. The extension allows five seconds for a list response, triggers one eligible retry at four seconds, and keeps eight seconds for the complete send response. The eight-second send deadline starts before relay processing and leaves room for the relay's bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender response write, and scheduling. It does not reduce the recipient's five seconds.
+
+The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each exact recipient session. The oldest settled insertion is evicted when entry 1,025 settles. IDs still inside that window return their known result or a stable conflict without another offer. Separately, one current logical result per exact sender session—including `offline` or `recipient_disconnected`—survives recipient cleanup only long enough to classify the permitted already-emitted retry. It clears after that retry response is reserved, when the next distinct list or send starts, on sender loss, or on server shutdown. Recipient-window eviction cannot remove this one sender-current result. Once neither owner remains, the ID is unknown and a later frame is a new logical send; models still cannot choose or reuse IDs. There is no offline inbox, persistence, reconnect replay, broadcast, delivery history, or proof that an absent route existed before. The final 256 KiB body rejection behavior belongs to #24; every complete transport frame is currently bounded to 512 KiB.
 
 ### I/O examples
 
@@ -99,6 +106,16 @@ Recipient acknowledgements remain valid while that same authenticated session ha
     {"message_id":"01993c89-3cd5-7543-98f9-27db4c435b40","status":"timeout","reason":"ack_timeout"}
     ```
   </TabItem>
+  <TabItem label="Conflict output">
+    ```json
+    {"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"message_id_conflict"}
+    ```
+  </TabItem>
+  <TabItem label="Automatic retry effect">
+    ```text
+    logical clock reaches 4s + first write already succeeded + no response → one same-socket frame with fresh request_id, unchanged message_id/body/to/re, original 8s deadline
+    ```
+  </TabItem>
   <TabItem label="Reply input copied from header">
     ```json
     {"to":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","body":{"answer":"Reviewed","ready":true},"re":"01993c84-fc2b-7e1c-af99-61b8118ac6df"}
@@ -140,7 +157,8 @@ Message bodies are not persisted or logged. Server telemetry includes public rou
 - **Offline result:** refresh `list_peers` or choose another destination. The retained connection is still usable; retrying the same absent address does not create an inbox or history.
 - **Recipient-disconnected result:** the relay found the listed recipient but observed its exact session disappear or could not write the offer before ACK. Every affected pending slot is released once. The sender socket stays usable; a later recipient connection receives no old offer.
 - **ACK-timeout result:** the recipient was connected when the relay wrote the offer but no exact extension ACK arrived within five seconds. The pending slot is released and both sockets remain usable.
-- **Disconnected error:** pair and authenticate the installation, or start a new Pi session if the retained socket closed. The relay immediately releases pending work owned by that exact sender session, returns no unreachable result, and never retries or replays it. Reconnect is deferred.
+- **Message-ID-conflict result:** the relay already knows that generated ID with different immutable content. Normal extension retries cannot create this because they resend the exact built payload. Keep the socket, record the request and message IDs, and inspect custom raw-client behavior; bodies and fingerprints remain redacted.
+- **Disconnected error:** pair and authenticate the installation, or start a new Pi session if the retained socket closed. The relay immediately releases pending work owned by that exact sender session, returns no unreachable result, and never reconnects or replays it. Reconnect is deferred.
 - **Unsafe JSON object error:** use only JSON values in plain objects and dense arrays. Cycles, accessors, nonfinite numbers, `undefined`, bigint, symbols, functions, custom object prototypes, and malformed Unicode are rejected before transport without logging content.
 - **Concurrent request error:** wait for the current list or send operation to settle. The extension rejects this locally; a custom raw client that bypasses the extension is closed by the relay. No request is queued.
 - **Need proof of completion:** ask the recipient to send a later ordinary correlated reply. That reply is separate evidence, not a guarantee; either `received` result is intentionally not proof of model work.

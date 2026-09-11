@@ -117,6 +117,7 @@ type sessionConnectionRegistry struct {
 	shutdownOnce         sync.Once
 	onSessionUnavailable func(*authenticatedSession)
 	onShutdown           func()
+	dedupe               *dedupeLedger
 }
 
 func newSessionConnectionRegistry() *sessionConnectionRegistry {
@@ -129,6 +130,7 @@ func newSessionConnectionRegistryWithLimit(limit int) *sessionConnectionRegistry
 		entries: make(map[*trackedSessionConnection]struct{}),
 		changed: make(chan struct{}, 1),
 		closed:  make(chan struct{}),
+		dedupe:  newDedupeLedger(),
 	}
 }
 
@@ -329,23 +331,6 @@ func (registry *sessionConnectionRegistry) writeToSession(
 	return writeTrackedConnection(ctx, destination, frame)
 }
 
-func (registry *sessionConnectionRegistry) writeToConnection(
-	ctx context.Context,
-	connection *websocket.Conn,
-	frame []byte,
-) error {
-	registry.mu.Lock()
-	var destination *trackedSessionConnection
-	for entry := range registry.entries {
-		if entry.connection == connection {
-			destination = entry
-			break
-		}
-	}
-	registry.mu.Unlock()
-	return writeTrackedConnection(ctx, destination, frame)
-}
-
 func writeTrackedConnection(ctx context.Context, destination *trackedSessionConnection, frame []byte) error {
 	if destination == nil || destination.connection == nil {
 		return errors.New("tracked destination is unavailable")
@@ -365,6 +350,9 @@ type sessionAuthService struct {
 	beforeOperationAdmissionDecision   func(clientOperation)
 	afterOperationAdmissionDecision    func(clientOperation, bool)
 	afterOperationAdmissionPublication func(clientOperation)
+	beforeRepeatedSendObservation      func(clientOperation)
+	afterOperationResponseReservation  func(clientOperation)
+	beforeResponseAudit                func(logEvent)
 	authTimeout                        time.Duration
 }
 

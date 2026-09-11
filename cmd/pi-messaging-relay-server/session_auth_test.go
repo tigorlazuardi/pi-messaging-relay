@@ -423,9 +423,10 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 				t.Fatalf("write valid operation: %v", err)
 			}
 		}
+		const secondMessageID = "01993c84-fc2b-7e1c-af99-61b8118ac6e0"
 		operations := []string{
 			exact,
-			fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":"peer","body":{"nested":{"allowed":true}}}}`, requestID, messageID),
+			fmt.Sprintf(`{"v":1,"type":"send","request_id":%q,"payload":{"message_id":%q,"to":"peer","body":{"nested":{"allowed":true}}}}`, requestID, secondMessageID),
 		}
 		wantStatuses := []string{"denied", "received"}
 		for attempt, wantStatus := range wantStatuses {

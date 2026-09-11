@@ -42,6 +42,7 @@ type logEvent struct {
 	SenderRoute     string `json:"sender_route,omitempty"`
 	RecipientRoute  string `json:"recipient_route,omitempty"`
 	Status          string `json:"status,omitempty"`
+	Dedupe          string `json:"dedupe,omitempty"`
 	Body            string `json:"body,omitempty"`
 	PairingCode     string `json:"pairing_code,omitempty"`
 	PrivateKey      string `json:"private_key,omitempty"`
