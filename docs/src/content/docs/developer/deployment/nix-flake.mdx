@@ -1,0 +1,278 @@
+---
+title: Export relay packages and systemd modules from a Nix flake
+description: Proposed reproducible package outputs and runtime-tested NixOS/Home Manager service contracts for Pi Messaging Relay.
+status: accepted
+date: 2026-09-12
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Decision from '../../../../components/Decision.astro';
+
+The repository will expose two build products and two server-only service modules from one dependency-light Nix flake. The extension output is a complete local Pi package path. The server output is the Linux Go executable. NixOS runs the server as a system service; Home Manager runs the same public service contract in the user's systemd manager.
+
+<Decision title="Export exactly two package derivations" status="accepted">
+`packages.<system>` has exactly `pi-messaging-relay-extension`, `pi-messaging-relay-server`, and `default`. `default.drvPath` equals the server package's `drvPath`, leaving exactly two unique derivations. Checks and development shells remain outside `packages`.
+</Decision>
+
+<Decision title="Keep both modules server-only and nginx consumer-owned" status="accepted">
+Both modules define `services.pi-messaging-relay` with the same five public options. They do not install the extension into Pi settings and do not enable or mutate nginx. Consumers may read `host` and `port`; they own all proxy behavior and security.
+</Decision>
+
+<Decision title="Use systemd scope to separate service ownership" status="accepted">
+The NixOS module creates a named static system identity and a system unit. The Home Manager module creates a user unit and never sets `User` or `Group`. Both use systemd `StateDirectory` for private state creation before process start.
+</Decision>
+
+## Flake outputs
+
+Initial systems are `x86_64-linux` and `aarch64-linux`. The server intentionally has a Linux-only state-security boundary.
+
+| Output | Contract |
+|---|---|
+| `packages.<system>.pi-messaging-relay-extension` | Root is directly consumable by Pi and contains only package metadata, runtime source, and production dependencies. |
+| `packages.<system>.pi-messaging-relay-server` | Contains `$out/bin/pi-messaging-relay-server`. |
+| `packages.<system>.default` | Exact alias of the server derivation. |
+| `nixosModules.pi-messaging-relay` / `.default` | Named module and exact alias. |
+| `homeManagerModules.pi-messaging-relay` / `.default` | Named module and exact alias. |
+| `checks.<system>.*` | Package, runtime, parity, and existing-suite checks. |
+| `devShells.<system>.default` | Go 1.24 plus Node.js 24/npm. |
+
+The flake pins `nixpkgs` and Home Manager in `flake.lock`; Home Manager follows the same nixpkgs input. The researched Home Manager revision `cd1c9e552f41894aeb5cc5cb353d5a1d61550357` confirms `systemd.user.services` support, while state creation relies on systemd's scope-aware `StateDirectory`, not an invented Home Manager XDG creation option. The implementation records its final locked revisions in acceptance evidence.
+
+Per-system outputs use `nixpkgs.lib.genAttrs`. No `flake-utils` or `flake-parts` input is justified for two Linux systems.
+
+### Server package
+
+The server uses `buildGoModule`, the locked Go module graph, a fixed `vendorHash`, and `subPackages = [ "cmd/pi-messaging-relay-server" ]`. Standard builder checks remain enabled; an explicit flake check also runs the repository's complete Go suite so process acceptance remains visible.
+
+### Extension package
+
+The extension uses the npm lockfile and a fixed `npmDepsHash`, with no nonexistent build step. Its output root contains `package.json`, `index.ts`, `internal/`, and production `node_modules`; tests and development files are absent. Pi accepts this exact absolute directory as a local package and resolves `pi.extensions` relative to its root.
+
+<Decision title="Preserve package-local TypeBox for this Nix output" status="accepted">
+Pi's general package guidance classifies bundled core `typebox` as a peer dependency. This repository already pins and tests `typebox` as an extension-local runtime dependency. Nix packaging will not silently change that manifest contract: the self-contained output retains the pinned dependency, and a real Pi load test is authoritative. Any later peer-dependency migration is a separate compatibility issue.
+</Decision>
+
+The real-Pi oracle uses nixpkgs Pi 0.85.1. Its complete process contract is:
+
+```bash
+root="$(mktemp -d)"
+mkdir -p "$root/home" "$root/config" "$root/cache" "$root/state" "$root/pi-agent" "$root/pi-packages"
+printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+  env -i \
+    HOME="$root/home" \
+    XDG_CONFIG_HOME="$root/config" \
+    XDG_CACHE_HOME="$root/cache" \
+    XDG_STATE_HOME="$root/state" \
+    PI_CODING_AGENT_DIR="$root/pi-agent" \
+    PI_PACKAGE_DIR="$root/pi-packages" \
+    PI_OFFLINE=1 \
+    /nix/store/<coreutils>/bin/timeout --signal=TERM 20s \
+    /nix/store/<pi-0.85.1>/bin/pi \
+      --mode rpc --no-session --no-extensions \
+      -e /nix/store/<extension>/
+```
+
+The single LF-terminated request is followed by stdin EOF. Pi must emit a successful response with `id = "commands"` and `command = "get_commands"`; its `relay-pair` item must have `source = "extension"` and `sourceInfo.path` beneath the exact extension store root. Pi must then exit `0` before timeout. Stderr must contain only expected relay lifecycle JSONL and no extension-load error. The check creates and cleans the isolated root without relying on ambient credentials, settings, packages, or network. Existing extension tests independently prove `list_peers` and `agent_send` registration and behavior from the same source/dependency graph.
+
+References: [Pi local package and dependency contract](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/packages.md), [Pi RPC `get_commands`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/rpc.md), and [nixpkgs `buildNpmPackage`](https://nixos.org/manual/nixpkgs/stable/#javascript-buildNpmPackage).
+
+## Shared module interface
+
+Both modules expose exactly these five public options with equal names, types, defaults, and package-default identity:
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `services.pi-messaging-relay.enable` | boolean | `false` | Create and start the service. |
+| `services.pi-messaging-relay.package` | package | matching flake server package | Executable override. |
+| `services.pi-messaging-relay.host` | enum | `"127.0.0.1"` | Either `"127.0.0.1"` or `"::1"`. |
+| `services.pi-messaging-relay.port` | port | `43127` | Stable nonzero port reusable by consumer configuration. |
+| `services.pi-messaging-relay.pairingCodeFile` | null or safe basename | `null` | Optional direct child used to disclose one startup pairing code. |
+
+The pairing basename matches `[A-Za-z0-9][A-Za-z0-9._-]*`, excluding `.`/`..` and `allowlist.json`. Whitespace, control characters, quotes, `%`, separators, and leading dashes are rejected at evaluation.
+
+One shared listener renderer produces `127.0.0.1:PORT` for IPv4 and `[::1]:PORT` for IPv6. Tests cover both. Consumer URL composition must apply the same IPv6 brackets; the modules intentionally do not produce nginx configuration.
+
+<Aside type="caution" title="A proxy remains consumer-owned">
+The relay still binds only to loopback. Reading `host` and `port` does not make public exposure supported. Nginx enablement, WebSocket forwarding, TLS, access control, and rate limits remain outside this feature and require consumer-owned configuration. Current extension clients still terminate at a numeric HTTP loopback origin.
+</Aside>
+
+## Exact process arguments
+
+Each module generates a tiny store-backed launcher and gives systemd only that launcher's absolute path as `ExecStart`. The launcher uses shell-safe fixed build-time values, reads systemd's `STATE_DIRECTORY`, verifies it is nonempty, and executes:
+
+```text
+pi-messaging-relay-server --listen RENDERED_HOST_PORT --state-dir "$STATE_DIRECTORY"
+```
+
+When pairing disclosure is enabled, it appends one argument:
+
+```text
+--pairing-code-file "$STATE_DIRECTORY/SAFE_BASENAME"
+```
+
+This avoids interpolating public strings or an XDG path into systemd's command parser. Runtime tests include IPv6 and a Home Manager state root containing a space, proving the server receives exact argv. Unsafe basename characters fail evaluation rather than relying on quoting.
+
+## NixOS system service
+
+The NixOS module:
+
+- declares user `pi-messaging-relay` with `isSystemUser = true` and group `pi-messaging-relay`;
+- lets NixOS allocate and persist the numeric UID/GID locally; no global fixed numeric IDs are reserved;
+- sets unit `User` and `Group` to that identity and explicitly disables `DynamicUser`;
+- sets `StateDirectory=pi-messaging-relay` and `StateDirectoryMode=0700`, yielding `/var/lib/pi-messaging-relay` owned by that identity;
+- starts from `multi-user.target`, uses `Restart=on-failure`, `RestartSec=2s`, `StartLimitIntervalSec=30s`, and `StartLimitBurst=3`; and
+- applies least-privilege hardening while retaining loopback IPv4/IPv6 and required Linux filesystem operations.
+
+Hardening includes `UMask=0077`, no new privileges, strict system protection, private temporary storage, protected kernel/control-group surfaces, native syscall architecture, restricted namespaces/realtime/SUID/SGID, and address families limited to Unix, IPv4, and IPv6. `PrivateNetwork` is not used because it removes required loopback networking. No unverified syscall filter is added.
+
+## Home Manager user service
+
+The Home Manager module:
+
+- creates `systemd.user.services.pi-messaging-relay` and no system unit;
+- never sets `User`, `Group`, or `DynamicUser` and therefore runs as the user-manager owner;
+- sets `StateDirectory=pi-messaging-relay` and `StateDirectoryMode=0700`, which systemd user scope resolves beneath `$XDG_STATE_HOME` (normally `~/.local/state`), creates before start, and exports as `STATE_DIRECTORY`;
+- starts from `default.target` with the same bounded restart policy; and
+- applies only hardening supported by a user manager, including `UMask=0077`, `NoNewPrivileges`, and restricted address families.
+
+A NixOS VM activates pinned Home Manager for a real test user and drives the real user manager. The test proves the actual directory path, owner, mode, argv, unit scope, restart, and journal. It includes an XDG state path containing a space. Enabling lingering remains an operator decision and is not mutated by the module.
+
+Reference: [systemd `StateDirectory` and scope-specific state roots](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+
+## Pairing bootstrap and crash recovery
+
+`pairingCodeFile = null` is the safe default. To authorize an extension, an operator temporarily chooses a unique generation basename such as `pairing-2026-09-12-a`, activates, reads the server-created mode-`0600` file through a trusted local terminal, pairs once, then returns the option to `null`.
+
+The module never deletes or overwrites a pairing file. SIGKILL, OOM, or host loss may retain it; the bounded start policy then reaches `start-limit-hit` instead of looping forever. Journald must show the existing-file startup reason without the raw code. Immediate recovery semantics require clearing the failed/start-limit counters in the correct system or user scope before starting the corrected generation; merely stopping and reactivating is insufficient.
+
+Runtime acceptance pre-creates a stale pairing entry, proves startup failure does not overwrite/delete it, proves `start-limit-hit`, checks actionable redacted journal output, clears counters in the correct scope, then immediately recovers with a new basename before the 30-second interval expires. No declarative activation performs credential cleanup. Ticket 6 owns the executable system and user operator procedures for inspecting the credential, choosing a new basename or `null`, resetting the correct scope, reactivating, and verifying `server_ready`; this design page will link that user guide before publication.
+
+## Diagnostics and telemetry
+
+No new telemetry stack is justified. The daemon already emits one JSON object per line: normal lifecycle/protocol/settlement events on stdout and fatal failure on stderr. systemd sends both streams to journald under the unit. Modules add no parser, health endpoint, metrics, traces, OpenTelemetry SDK, collector, exporter, or heartbeat logs.
+
+Runtime module tests query the actual system or user journal for `server_ready`, `server_stopped`, and a bounded startup failure. Pairing-code fixture contents never appear. Existing `<redacted>` behavior remains unchanged; public correlation and route identifiers remain visible under the accepted support-debug contract.
+
+## Acceptance seams
+
+1. **Go package:** build the server output; bounded process smoke observes `server_ready`, sends SIGTERM, observes `server_stopped`, and exits zero using private test state.
+2. **Extension package:** build the self-contained root; a bounded isolated Pi 0.85.1 RPC load proves package-root discovery, dependency resolution, `relay-pair` provenance, expected lifecycle JSONL, and zero load errors; existing extension tests stay green.
+3. **NixOS module runtime:** a NixOS VM proves system-unit identity, IPv4/IPv6 argv, private retained state, hardening-compatible readiness, restart/stop, bounded stale-pairing failure/recovery, journald events, and secret absence.
+4. **Home Manager module runtime:** a NixOS VM with pinned Home Manager proves real user-unit scope, XDG path including whitespace, ownership/mode, exact argv, IPv4/IPv6, restart/stop, journald events, and no system identity directives.
+5. **Parity and aggregate flake:** evaluation compares exact public option names/types/defaults/package identity, exact package attr names and unique `drvPath`s, module aliases, invalid-input failures, and negative boundaries: neither module mutates Pi package settings, nginx, firewall, or the other systemd scope. `nix flake check` runs all checks on supported systems where each runtime check is executable.
+6. **Consumer documentation:** user guides cover extension/package consumption, both service scopes, temporary pairing and stale-file recovery, journals, upgrades/rollback, consumer-owned host/port composition, security, limits, and troubleshooting; docs build passes.
+
+Each numbered seam becomes one implementation ticket and owns its documentation directly affected by that seam. Ticket 6 owns the consolidated operator path and cross-links rather than changing runtime behavior.
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Extension package input">
+    ```nix
+    {
+      programs.pi.settings.packages = [
+        "${inputs.pi-messaging-relay.packages.${pkgs.system}.pi-messaging-relay-extension}"
+      ];
+    }
+    ```
+  </TabItem>
+  <TabItem label="Pi settings result">
+    ```text
+    Pi loads /nix/store/<hash>-pi-messaging-relay-extension as a local package root.
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Pi RPC stdin">
+    ```json
+    {"id":"commands","type":"get_commands"}
+    ```
+  </TabItem>
+  <TabItem label="Pi RPC stdout">
+    ```json
+    {"id":"commands","type":"response","command":"get_commands","success":true,"data":{"commands":[{"name":"relay-pair","source":"extension","sourceInfo":{"path":"/nix/store/<hash>-pi-messaging-relay-extension/index.ts","source":"<CLI source>","scope":"temporary","origin":"top-level"}}]}}
+    ```
+  </TabItem>
+  <TabItem label="Process result">
+    ```text
+    stdin: closed after one LF-terminated record
+    exit: 0 before 20-second timeout
+    stderr: expected relay lifecycle JSONL only
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="NixOS input">
+    ```nix
+    {
+      services.pi-messaging-relay = {
+        enable = true;
+        host = "::1";
+        port = 43127;
+        pairingCodeFile = "pairing-2026-09-12-a";
+      };
+    }
+    ```
+  </TabItem>
+  <TabItem label="System result">
+    ```text
+    identity: pi-messaging-relay (named static system user/group)
+    listen argv: [::1]:43127
+    state: /var/lib/pi-messaging-relay (0700)
+    pairing file: pairing-2026-09-12-a (0600, server-created)
+    logs: journalctl -u pi-messaging-relay.service
+    ```
+  </TabItem>
+  <TabItem label="Invalid input">
+    ```text
+    pairingCodeFile = "../pairing-code"
+    evaluation error: pairingCodeFile must be one safe direct-child basename
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Home Manager input">
+    ```nix
+    {
+      services.pi-messaging-relay = {
+        enable = true;
+        host = "127.0.0.1";
+        port = 43127;
+      };
+    }
+    ```
+  </TabItem>
+  <TabItem label="User result">
+    ```text
+    scope: systemd --user
+    state: $XDG_STATE_HOME/pi-messaging-relay (0700)
+    listen argv: 127.0.0.1:43127
+    logs: journalctl --user -u pi-messaging-relay.service
+    ```
+  </TabItem>
+</Tabs>
+
+Consumer code may read, without mutation by this module:
+
+```nix
+let relay = config.services.pi-messaging-relay;
+in {
+  # Consumer decides how to bracket IPv6 and configure its own proxy boundary.
+  _module.args.relayUpstream = {
+    inherit (relay) host port;
+  };
+}
+```
+
+## Out of scope
+
+- Publishing to npm or wrapping/installing Pi.
+- Mutating Pi settings, nginx, firewall, TLS, VPN, SSH, DNS, or public access.
+- Dynamic users, fixed global numeric IDs, containers, socket activation, multiple instances, arbitrary server arguments, or configurable state roots.
+- macOS services or non-Linux server claims.
+- New protocol behavior, health endpoints, OpenTelemetry, metrics, traces, or dashboards.
+
+Ponytail: support two Linux systems, two unique package derivations, one service instance, fixed scope-owned state, host limited to standard IPv4/IPv6 loopback, safe pairing basenames, and port `43127` by default. Broaden only for a second real consumer.
