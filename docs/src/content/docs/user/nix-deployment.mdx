@@ -1,0 +1,435 @@
+---
+title: Deploy with Nix
+description: Consume the pinned relay flake, run its system or user service, recover stale pairing credentials, and upgrade or roll back safely.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The flake supports `x86_64-linux` and `aarch64-linux`. It exports a self-contained Pi extension package, a Linux relay server package, and server-only NixOS and Home Manager modules. Both services bind only to `127.0.0.1` or `::1`.
+
+<Aside type="caution" title="No public exposure">
+These modules do not configure nginx, TLS, a firewall, VPN, SSH, or Pi settings. Keep the relay on loopback. A consumer that adds a proxy owns its complete exposure and security boundary.
+</Aside>
+
+## Add the flake input
+
+Pin the repository from your own flake:
+
+```nix
+{
+  inputs.pi-messaging-relay.url = "github:tigorlazuardi/pi-messaging-relay";
+}
+```
+
+The server executable is available as `inputs.pi-messaging-relay.packages.${pkgs.system}.pi-messaging-relay-server`. The `default` package is the exact same derivation.
+
+## Install the extension package
+
+Add the complete store root to the Pi package list owned by your configuration:
+
+```nix
+{
+  programs.pi.settings.packages = [
+    "${inputs.pi-messaging-relay.packages.${pkgs.system}.pi-messaging-relay-extension}"
+  ];
+}
+```
+
+The package root contains production `typebox` and `ws` dependencies. It needs no activation-time `npm install`. Set `PI_MESSAGING_RELAY_URL` where Pi starts, using the service's numeric loopback origin, for example `http://127.0.0.1:43127`.
+
+## Choose one service scope
+
+<Tabs>
+  <TabItem label="NixOS system service">
+    ```nix
+    {
+      imports = [ inputs.pi-messaging-relay.nixosModules.pi-messaging-relay ];
+      services.pi-messaging-relay = {
+        enable = true;
+        host = "127.0.0.1";
+        port = 43127;
+      };
+    }
+    ```
+
+    The service runs as static system user/group `pi-messaging-relay`. systemd creates `/var/lib/pi-messaging-relay` with mode `0700`.
+  </TabItem>
+  <TabItem label="Home Manager user service">
+    ```nix
+    {
+      imports = [ inputs.pi-messaging-relay.homeManagerModules.pi-messaging-relay ];
+      services.pi-messaging-relay = {
+        enable = true;
+        host = "127.0.0.1";
+        port = 43127;
+      };
+    }
+    ```
+
+    The service runs as the user-manager owner, without `User`, `Group`, or `DynamicUser`. systemd creates `$XDG_STATE_HOME/pi-messaging-relay` with mode `0700`, normally `~/.local/state/pi-messaging-relay`. Starting it without login may require operator-managed lingering; the module does not enable lingering.
+  </TabItem>
+</Tabs>
+
+Both modules expose only `enable`, `package`, `host`, `port`, and `pairingCodeFile`. The pairing filename is either `null` or one safe direct-child basename. It cannot be `.`, `..`, `allowlist.json`, begin with `-`, or contain whitespace, `%`, quotes, control characters, or path separators.
+
+## Pair one extension
+
+`pairingCodeFile = null` is the safe default. Pairing requires one temporary deployment generation.
+
+<Steps>
+1. Choose a unique basename, such as `pairing-2026-09-13-a`, and set `pairingCodeFile` to it.
+2. Activate the NixOS or Home Manager generation.
+3. In a trusted local terminal, read only the selected file:
+
+   ```console
+   $ sudo cat /var/lib/pi-messaging-relay/pairing-2026-09-13-a
+   ```
+
+   For Home Manager:
+
+   ```console
+   $ cat "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/pairing-2026-09-13-a"
+   ```
+
+4. Enter the value directly into `/relay-pair` in Pi. Never paste it into logs, chat, screenshots, or shell arguments.
+5. Return `pairingCodeFile` to `null` and activate again. Successful pairing or clean shutdown removes the server-owned current file; the allowlist remains.
+</Steps>
+
+## Read journals
+
+System scope:
+
+```console
+$ sudo journalctl -u pi-messaging-relay.service
+$ sudo journalctl -u pi-messaging-relay.service -o cat | grep '"event":"server_ready"'
+```
+
+User scope:
+
+```console
+$ journalctl --user -u pi-messaging-relay.service
+$ journalctl --user -u pi-messaging-relay.service -o cat | grep '"event":"server_ready"'
+```
+
+The daemon emits one JSON object per line. Normal lifecycle events include `server_ready` and `server_stopped`; fatal startup failures use `server_failed`. Pairing codes, private keys, nonces, signatures, and bodies remain `<redacted>`.
+
+## Recover a stale pairing file
+
+A crash can leave the selected file in place. The server refuses to overwrite or delete it, retries at most three starts in 30 seconds, and can reach `start-limit-hit`. Merely reactivating does not clear that counter.
+
+<Aside type="danger" title="Credential deletion is deliberate and irreversible">
+First stop the correct service scope. Inspect the exact path, regular-file type, owner, and mode. Preserve it when evidence is needed. If deleting, target only the verified stale pairing basename—never the state directory or `allowlist.json`. Deletion destroys that undisclosed pairing code but does not revoke already paired keys.
+</Aside>
+
+### System service recovery
+
+<Steps>
+1. Stop and inspect the exact failed unit and entry:
+
+   ```console
+   $ sudo systemctl stop pi-messaging-relay.service
+   $ sudo systemctl status pi-messaging-relay.service
+   $ sudo stat --format='path=%n type=%F owner=%U:%G mode=%a' \
+       /var/lib/pi-messaging-relay/pairing-2026-09-13-a
+   ```
+
+   Continue only if the path is the intended regular file, owner is `pi-messaging-relay:pi-messaging-relay`, and mode is `600`.
+2. Either preserve the entry and select a new unique basename, or deliberately remove only that verified entry:
+
+   ```console
+   $ sudo unlink -- /var/lib/pi-messaging-relay/pairing-2026-09-13-a
+   ```
+3. Set `pairingCodeFile` to the new basename, or to `null` when no new pairing is needed.
+4. Reset the system-scope failure counter:
+
+   ```console
+   $ sudo systemctl reset-failed pi-messaging-relay.service
+   ```
+5. Capture the matching unit-journal cursor immediately before activation. Require the corrected unit to become active, then require a new readiness event after that cursor within 30 seconds:
+
+   ```bash
+   recovery_cursor="$(sudo journalctl -u pi-messaging-relay.service -n 0 --show-cursor)" || {
+     printf '%s\n' 'Could not capture system recovery journal cursor; recovery stopped.' >&2
+     exit 1
+   }
+   recovery_cursor="${recovery_cursor#-- cursor: }"
+   test -n "$recovery_cursor" || {
+     printf '%s\n' 'System recovery journal cursor was empty; recovery stopped.' >&2
+     exit 1
+   }
+   sudo nixos-rebuild switch --flake '.#HOST' || {
+     printf '%s\n' 'Corrected NixOS activation failed; recovery stopped.' >&2
+     exit 1
+   }
+   sudo systemctl is-active pi-messaging-relay.service >/dev/null || {
+     printf '%s\n' 'Corrected system service is not active; recovery stopped.' >&2
+     exit 1
+   }
+   sudo timeout --signal=TERM 30s \
+     journalctl -u pi-messaging-relay.service -o cat \
+       --after-cursor="$recovery_cursor" --follow |
+     grep -m 1 '"event":"server_ready"' || {
+       printf '%s\n' 'No fresh system server_ready within 30 seconds; recovery stopped.' >&2
+       exit 1
+     }
+   ```
+
+   Any cursor, activation, active-state, journal-query, or timeout failure stops recovery. Do not use older journal lines as readiness evidence.
+</Steps>
+
+### User service recovery
+
+<Steps>
+1. Stop and inspect the user unit and exact entry. If `XDG_STATE_HOME` is unset, use `$HOME/.local/state`:
+
+   ```console
+   $ systemctl --user stop pi-messaging-relay.service
+   $ systemctl --user status pi-messaging-relay.service
+   $ stat --format='path=%n type=%F owner=%U:%G mode=%a' \
+       "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/pairing-2026-09-13-a"
+   ```
+
+   Continue only if it is the intended regular file, owned by the user-manager owner and mode `600`.
+2. Preserve it and choose a new basename, or deliberately remove only the verified entry:
+
+   ```console
+   $ unlink -- "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/pairing-2026-09-13-a"
+   ```
+3. Set a new unique `pairingCodeFile`, or `null` when pairing is unnecessary.
+4. Reset the user-scope failure counter:
+
+   ```console
+   $ systemctl --user reset-failed pi-messaging-relay.service
+   ```
+5. Capture the matching user-unit journal cursor immediately before activation. Require the corrected unit to become active, then require a new readiness event after that cursor within 30 seconds:
+
+   ```bash
+   recovery_cursor="$(journalctl --user -u pi-messaging-relay.service -n 0 --show-cursor)" || {
+     printf '%s\n' 'Could not capture user recovery journal cursor; recovery stopped.' >&2
+     exit 1
+   }
+   recovery_cursor="${recovery_cursor#-- cursor: }"
+   test -n "$recovery_cursor" || {
+     printf '%s\n' 'User recovery journal cursor was empty; recovery stopped.' >&2
+     exit 1
+   }
+   home-manager switch --flake '.#USER@HOST' || {
+     printf '%s\n' 'Corrected Home Manager activation failed; recovery stopped.' >&2
+     exit 1
+   }
+   systemctl --user is-active pi-messaging-relay.service >/dev/null || {
+     printf '%s\n' 'Corrected user service is not active; recovery stopped.' >&2
+     exit 1
+   }
+   timeout --signal=TERM 30s \
+     journalctl --user -u pi-messaging-relay.service -o cat \
+       --after-cursor="$recovery_cursor" --follow |
+     grep -m 1 '"event":"server_ready"' || {
+       printf '%s\n' 'No fresh user server_ready within 30 seconds; recovery stopped.' >&2
+       exit 1
+     }
+   ```
+
+   Any cursor, activation, active-state, journal-query, or timeout failure stops recovery. Do not use older journal lines as readiness evidence.
+</Steps>
+
+## Compose a consumer-owned upstream
+
+Read `host` and `port` without changing them. Bracket IPv6 when composing a URL:
+
+```nix
+let
+  relay = config.services.pi-messaging-relay;
+  renderedHost = if relay.host == "::1" then "[::1]" else relay.host;
+in {
+  _module.args.relayOrigin = "http://${renderedHost}:${toString relay.port}";
+}
+```
+
+This remains a loopback origin. It is not a proxy recipe and does not make public exposure supported.
+
+## Upgrade and roll back
+
+<Steps>
+1. Keep `flake.lock` under version control. Update only the relay input and inspect the lock diff:
+
+   ```console
+   $ nix flake lock --update-input pi-messaging-relay
+   $ git diff -- flake.lock
+   ```
+2. From the consumer flake directory, build the newly pinned extension store root before activation. Record the printed path; this exact value is `new_extension` in the Pi-side check below.
+
+   ```console
+   $ new_extension="$(nix build --no-link --print-out-paths --impure --expr \
+       'let consumer = builtins.getFlake (toString ./.); in consumer.inputs.pi-messaging-relay.packages.${builtins.currentSystem}.pi-messaging-relay-extension')"
+   $ printf 'new pinned extension root: %s\n' "$new_extension"
+   ```
+3. Capture a journal cursor immediately before activation, activate, then require `server_ready` after that cursor. Use the commands for the service scope you are upgrading:
+
+   <Tabs>
+     <TabItem label="NixOS system scope">
+       ```bash
+       server_cursor="$(sudo journalctl -n 0 --show-cursor | sed -n 's/^-- cursor: //p')"
+       test -n "$server_cursor" || { printf '%s\n' 'Could not capture system journal cursor.' >&2; exit 1; }
+       sudo nixos-rebuild switch --flake '.#HOST' || {
+         printf '%s\n' 'NixOS upgrade activation failed; roll back.' >&2
+         exit 1
+       }
+       sudo timeout --signal=TERM 30s \
+         journalctl -u pi-messaging-relay.service -o cat \
+           --after-cursor="$server_cursor" --follow |
+         grep -m 1 '"event":"server_ready"' || {
+           printf '%s\n' 'No fresh system server_ready within 30 seconds; roll back.' >&2
+           exit 1
+         }
+       ```
+     </TabItem>
+     <TabItem label="Home Manager user scope">
+       ```bash
+       server_cursor="$(journalctl --user -n 0 --show-cursor | sed -n 's/^-- cursor: //p')"
+       test -n "$server_cursor" || { printf '%s\n' 'Could not capture user journal cursor.' >&2; exit 1; }
+       home-manager switch --flake '.#USER@HOST' || {
+         printf '%s\n' 'Home Manager upgrade activation failed; roll back.' >&2
+         exit 1
+       }
+       timeout --signal=TERM 30s \
+         journalctl --user -u pi-messaging-relay.service -o cat \
+           --after-cursor="$server_cursor" --follow |
+         grep -m 1 '"event":"server_ready"' || {
+           printf '%s\n' 'No fresh user server_ready within 30 seconds; roll back.' >&2
+           exit 1
+         }
+       ```
+     </TabItem>
+   </Tabs>
+
+   Only a matching event after `server_cursor` proves this activation reached readiness. The relay journal proves server behavior only; it cannot prove which extension package Pi loaded.
+4. Separately prove extension loading with a bounded, isolated real Pi RPC process. This does not use the installed identity or print credentials. It requires `timeout`, `node`, and the normal `pi` executable in `PATH`.
+
+   ```bash
+   probe="$(mktemp -d)"
+   trap 'rm -rf -- "$probe"' EXIT
+   mkdir -p "$probe/home" "$probe/config" "$probe/cache" "$probe/state" "$probe/pi-agent"
+
+   rpc_output="$(
+     printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+       env -i \
+         HOME="$probe/home" \
+         XDG_CONFIG_HOME="$probe/config" \
+         XDG_CACHE_HOME="$probe/cache" \
+         XDG_STATE_HOME="$probe/state" \
+         PI_CODING_AGENT_DIR="$probe/pi-agent" \
+         PI_OFFLINE=1 \
+         PATH="$PATH" \
+         timeout --signal=TERM 20s \
+         pi --mode rpc --no-session --no-extensions -e "$new_extension/" \
+         2>"$probe/pi.stderr"
+   )" || { printf '%s\n' 'Pi extension probe failed; inspect private probe stderr locally.' >&2; exit 1; }
+
+   source_path="$(printf '%s\n' "$rpc_output" | node -e '
+     const fs = require("node:fs");
+     const response = JSON.parse(fs.readFileSync(0, "utf8"));
+     const command = response.data?.commands?.find((item) =>
+       item.name === "relay-pair" && item.source === "extension");
+     if (response.id !== "commands" || response.command !== "get_commands" ||
+         response.success !== true || typeof command?.sourceInfo?.path !== "string") process.exit(1);
+     process.stdout.write(command.sourceInfo.path);
+   ')" || { printf '%s\n' 'Pi get_commands response lacked relay-pair provenance.' >&2; exit 1; }
+
+   case "$source_path" in
+     "$new_extension"/*)
+       printf 'verified sourceInfo.path: %s\n' "$source_path"
+       ;;
+     *)
+       printf 'wrong extension root: expected beneath %s, got %s\n' \
+         "$new_extension/" "$source_path" >&2
+       exit 1
+       ;;
+   esac
+   ```
+
+   Success requires `relay-pair`'s nested `sourceInfo.path` to begin with the complete `new pinned extension root` printed in step 2 plus `/`; compare the hash-bearing `/nix/store/...-pi-messaging-relay-extension` path, not only its package name. The probe's private stderr is Pi-side extension lifecycle evidence; keep it local because operational diagnostics can contain public identity and route metadata.
+5. In a journal terminal, capture a second cursor and begin the matching 30-second watcher. Immediately afterward, run normal configured Pi as `pi` in another trusted terminal. Do not use the isolated probe environment from step 4.
+
+   <Tabs>
+     <TabItem label="NixOS system scope journal">
+       ```bash
+       auth_cursor="$(sudo journalctl -n 0 --show-cursor | sed -n 's/^-- cursor: //p')"
+       test -n "$auth_cursor" || { printf '%s\n' 'Could not capture system journal cursor.' >&2; exit 1; }
+       sudo timeout --signal=TERM 30s \
+         journalctl -u pi-messaging-relay.service -o cat \
+           --after-cursor="$auth_cursor" --follow |
+         grep -m 1 '"event":"auth_accepted"' || {
+           printf '%s\n' 'No fresh system auth_accepted within 30 seconds; roll back.' >&2
+           exit 1
+         }
+       ```
+     </TabItem>
+     <TabItem label="Home Manager user scope journal">
+       ```bash
+       auth_cursor="$(journalctl --user -n 0 --show-cursor | sed -n 's/^-- cursor: //p')"
+       test -n "$auth_cursor" || { printf '%s\n' 'Could not capture user journal cursor.' >&2; exit 1; }
+       timeout --signal=TERM 30s \
+         journalctl --user -u pi-messaging-relay.service -o cat \
+           --after-cursor="$auth_cursor" --follow |
+         grep -m 1 '"event":"auth_accepted"' || {
+           printf '%s\n' 'No fresh user auth_accepted within 30 seconds; roll back.' >&2
+           exit 1
+         }
+       ```
+     </TabItem>
+   </Tabs>
+
+   ```console
+   $ pi
+   ```
+
+   Upgrade succeeds only when the fresh `server_ready`, exact extension-root provenance, and fresh `auth_accepted` all pass. Keep normal Pi output local; it is separate from server-journal evidence and can contain public identity and route metadata.
+6. A missing cursor, command failure, or absent matching event at either 30-second deadline fails validation. Stop rather than widening the journal window or retrying indefinitely, and roll back to the previous declarative generation:
+
+   ```console
+   $ sudo nixos-rebuild switch --rollback
+   ```
+
+   For Home Manager, inspect `home-manager generations`, verify the selected previous store path, then run its `activate` executable. Re-run steps 2–5 after rollback: `new_extension` must now be the known-good pinned store root, and Pi's nested `sourceInfo.path` must be beneath that rollback root.
+7. Re-pin the known-good relay lock revision before normal activation. Package rollback does not erase or roll back the retained allowlist.
+</Steps>
+
+## Limits and troubleshooting
+
+- One service instance and fixed scope-owned state are supported. Arbitrary state roots, public listeners, socket activation, containers, and multiple instances are outside this contract.
+- **`pairingCodeFile` evaluation failure** — use one safe basename, not a path.
+- **Unit reaches `start-limit-hit`** — follow the matching scope procedure; resetting the other scope has no effect.
+- **`file exists` in `server_failed`** — preserve the stale entry or verify and unlink exactly it, then select a new basename or `null`.
+- **No user service after logout** — decide whether operator policy permits lingering. The module does not mutate it.
+- **Pi cannot connect** — ensure `PI_MESSAGING_RELAY_URL` uses configured numeric loopback host and port. For IPv6, use `http://[::1]:43127`.
+- **State permission failure** — do not weaken mode `0700` or casually change ownership. Verify service scope and restore its owner.
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="NixOS input">
+    ```nix
+    services.pi-messaging-relay = {
+      enable = true;
+      host = "::1";
+      port = 43127;
+      pairingCodeFile = "pairing-2026-09-13-a";
+    };
+    ```
+  </TabItem>
+  <TabItem label="Runtime result">
+    ```text
+    unit: pi-messaging-relay.service (system scope)
+    argv: --listen [::1]:43127 --state-dir /var/lib/pi-messaging-relay
+    state mode: 0700
+    journal: {"level":"info","event":"server_ready",...}
+    ```
+  </TabItem>
+  <TabItem label="Invalid input">
+    ```text
+    pairingCodeFile = "../code"
+    evaluation fails before activation
+    ```
+  </TabItem>
+</Tabs>

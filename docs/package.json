@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "astro build",
+    "build": "astro build && node --test scripts/*.test.mjs && node scripts/check-internal-links.mjs dist https://tigorlazuardi.github.io/pi-messaging-relay/ && node scripts/check-nix-recovery-procedures.mjs src/content/docs/user/nix-deployment.mdx",
     "preview": "astro preview",
     "astro": "astro"
   },

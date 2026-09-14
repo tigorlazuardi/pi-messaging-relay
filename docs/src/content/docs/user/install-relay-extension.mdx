@@ -72,7 +72,7 @@ $ PI_MESSAGING_RELAY_STATE_DIR=/tmp/my-relay-extension-state \
 
 ## Install as a local Pi package
 
-After `npm --prefix extension ci`, add the extension directory to user settings:
+For a self-contained store package, follow [Deploy with Nix](../nix-deployment/#install-the-extension-package). From a checkout, after `npm --prefix extension ci`, add the extension directory to user settings:
 
 ```console
 $ pi install "$PWD/extension"
@@ -154,7 +154,7 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
 - Public keys, complete routes, and opaque message IDs remain visible for support correlation. Pairing code, nonce, signature, private-key, and body fields use literal `<redacted>`. Heartbeat ping/pong ticks are not logged at normal levels.
 - The extension does not expose send transport request IDs or server-generated delivery IDs in its settlement event because the model-tool boundary does not own them. Match `message_id` and both routes to the server's authoritative `send_settled` when deeper transport correlation is needed.
-- Relay v1 emits logs only. It has no OpenTelemetry exporter, metrics endpoint, or traces. See [Structured relay diagnostics](../developer/relay/structured-diagnostics/) for complete event schemas and support workflow.
+- Relay v1 emits logs only. It has no OpenTelemetry exporter, metrics endpoint, or traces. See [Structured relay diagnostics](../../developer/relay/structured-diagnostics/) for complete event schemas and support workflow.
 
 ## Troubleshooting
 

@@ -34,9 +34,9 @@ Initial systems are `x86_64-linux` and `aarch64-linux`. The server intentionally
 | `nixosModules.pi-messaging-relay` / `.default` | Named module and exact alias. |
 | `homeManagerModules.pi-messaging-relay` / `.default` | Named module and exact alias. |
 | `checks.<system>.*` | Package, runtime, parity, and existing-suite checks. |
-| `devShells.<system>.default` | Go 1.24 plus Node.js 24/npm. |
+| `devShells.<system>.default` | Compatible locked Go compiler plus Node.js 24/npm. |
 
-The flake pins `nixpkgs` and Home Manager in `flake.lock`; Home Manager follows the same nixpkgs input. The researched Home Manager revision `cd1c9e552f41894aeb5cc5cb353d5a1d61550357` confirms `systemd.user.services` support, while state creation relies on systemd's scope-aware `StateDirectory`, not an invented Home Manager XDG creation option. The implementation records its final locked revisions in acceptance evidence.
+The flake pins `nixpkgs` and Home Manager in `flake.lock`; Home Manager follows the same nixpkgs input. Package, check, and development-shell execution use the locked nixpkgs default Go compiler (Go 1.26.7 at the accepted revision), which is compatible with the repository's preserved `go 1.24.0` module contract. No second nixpkgs input or custom compiler is introduced. The researched Home Manager revision `cd1c9e552f41894aeb5cc5cb353d5a1d61550357` confirms `systemd.user.services` support, while state creation relies on systemd's scope-aware `StateDirectory`, not an invented Home Manager XDG creation option. The implementation records its final locked revisions in acceptance evidence.
 
 Per-system outputs use `nixpkgs.lib.genAttrs`. No `flake-utils` or `flake-parts` input is justified for two Linux systems.
 
@@ -56,7 +56,7 @@ The real-Pi oracle uses nixpkgs Pi 0.85.1. Its complete process contract is:
 
 ```bash
 root="$(mktemp -d)"
-mkdir -p "$root/home" "$root/config" "$root/cache" "$root/state" "$root/pi-agent" "$root/pi-packages"
+mkdir -p "$root/home" "$root/config" "$root/cache" "$root/state" "$root/pi-agent"
 printf '%s\n' '{"id":"commands","type":"get_commands"}' |
   env -i \
     HOME="$root/home" \
@@ -64,7 +64,6 @@ printf '%s\n' '{"id":"commands","type":"get_commands"}' |
     XDG_CACHE_HOME="$root/cache" \
     XDG_STATE_HOME="$root/state" \
     PI_CODING_AGENT_DIR="$root/pi-agent" \
-    PI_PACKAGE_DIR="$root/pi-packages" \
     PI_OFFLINE=1 \
     /nix/store/<coreutils>/bin/timeout --signal=TERM 20s \
     /nix/store/<pi-0.85.1>/bin/pi \
@@ -110,7 +109,7 @@ When pairing disclosure is enabled, it appends one argument:
 --pairing-code-file "$STATE_DIRECTORY/SAFE_BASENAME"
 ```
 
-This avoids interpolating public strings or an XDG path into systemd's command parser. Runtime tests include IPv6 and a Home Manager state root containing a space, proving the server receives exact argv. Unsafe basename characters fail evaluation rather than relying on quoting.
+This avoids interpolating public strings or an XDG path into systemd's command parser. Runtime tests include IPv4 and IPv6 in both service scopes, proving the server receives exact argv. Unsafe basename characters fail evaluation rather than relying on quoting.
 
 ## NixOS system service
 
@@ -135,7 +134,7 @@ The Home Manager module:
 - starts from `default.target` with the same bounded restart policy; and
 - applies only hardening supported by a user manager, including `UMask=0077`, `NoNewPrivileges`, and restricted address families.
 
-A NixOS VM activates pinned Home Manager for a real test user and drives the real user manager. The test proves the actual directory path, owner, mode, argv, unit scope, restart, and journal. It includes an XDG state path containing a space. Enabling lingering remains an operator decision and is not mutated by the module.
+A NixOS VM activates pinned Home Manager for real test users and drives their real user managers with normal scope-owned XDG state roots. The test proves the actual directory paths, owners, modes, IPv4 and IPv6 argv, unit scope, restart, and journal. Enabling lingering remains an operator decision and is not mutated by the module.
 
 Reference: [systemd `StateDirectory` and scope-specific state roots](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
 
@@ -145,7 +144,7 @@ Reference: [systemd `StateDirectory` and scope-specific state roots](https://www
 
 The module never deletes or overwrites a pairing file. SIGKILL, OOM, or host loss may retain it; the bounded start policy then reaches `start-limit-hit` instead of looping forever. Journald must show the existing-file startup reason without the raw code. Immediate recovery semantics require clearing the failed/start-limit counters in the correct system or user scope before starting the corrected generation; merely stopping and reactivating is insufficient.
 
-Runtime acceptance pre-creates a stale pairing entry, proves startup failure does not overwrite/delete it, proves `start-limit-hit`, checks actionable redacted journal output, clears counters in the correct scope, then immediately recovers with a new basename before the 30-second interval expires. No declarative activation performs credential cleanup. Ticket 6 owns the executable system and user operator procedures for inspecting the credential, choosing a new basename or `null`, resetting the correct scope, reactivating, and verifying `server_ready`; this design page will link that user guide before publication.
+Runtime acceptance pre-creates a stale pairing entry, proves startup failure does not overwrite/delete it, proves `start-limit-hit`, checks actionable redacted journal output, clears counters in the correct scope, then immediately recovers with a new basename before the 30-second interval expires. No declarative activation performs credential cleanup. Follow the authoritative [system or user stale-pairing recovery procedure](../../../user/nix-deployment/#recover-a-stale-pairing-file) to inspect the credential, choose a new basename or `null`, reset the correct scope, reactivate, and verify `server_ready`.
 
 ## Diagnostics and telemetry
 
@@ -158,7 +157,7 @@ Runtime module tests query the actual system or user journal for `server_ready`,
 1. **Go package:** build the server output; bounded process smoke observes `server_ready`, sends SIGTERM, observes `server_stopped`, and exits zero using private test state.
 2. **Extension package:** build the self-contained root; a bounded isolated Pi 0.85.1 RPC load proves package-root discovery, dependency resolution, `relay-pair` provenance, expected lifecycle JSONL, and zero load errors; existing extension tests stay green.
 3. **NixOS module runtime:** a NixOS VM proves system-unit identity, IPv4/IPv6 argv, private retained state, hardening-compatible readiness, restart/stop, bounded stale-pairing failure/recovery, journald events, and secret absence.
-4. **Home Manager module runtime:** a NixOS VM with pinned Home Manager proves real user-unit scope, XDG path including whitespace, ownership/mode, exact argv, IPv4/IPv6, restart/stop, journald events, and no system identity directives.
+4. **Home Manager module runtime:** a NixOS VM with pinned Home Manager proves real user-unit scope, normal scope-owned XDG state paths, ownership/mode, exact argv, IPv4/IPv6, restart/stop, journald events, and no system identity directives.
 5. **Parity and aggregate flake:** evaluation compares exact public option names/types/defaults/package identity, exact package attr names and unique `drvPath`s, module aliases, invalid-input failures, and negative boundaries: neither module mutates Pi package settings, nginx, firewall, or the other systemd scope. `nix flake check` runs all checks on supported systems where each runtime check is executable.
 6. **Consumer documentation:** user guides cover extension/package consumption, both service scopes, temporary pairing and stale-file recovery, journals, upgrades/rollback, consumer-owned host/port composition, security, limits, and troubleshooting; docs build passes.
 
