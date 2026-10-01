@@ -53,7 +53,7 @@ let
   home = homeFor { };
   nixOptions = nixos.options.services.pi-messaging-relay;
   homeOptions = home.options.services.pi-messaging-relay;
-  optionNames = [ "enable" "host" "package" "pairingCodeFile" "port" ];
+  optionNames = [ "enable" "host" "package" "port" "secretFile" ];
   defaultsEqual = name:
     if name == "package"
     then nixOptions.${name}.default.drvPath == homeOptions.${name}.default.drvPath
@@ -62,8 +62,12 @@ let
     { host = "localhost"; }
     { port = 0; }
     { port = 65536; }
-  ] ++ map (pairingCodeFile: { inherit pairingCodeFile; }) [
-    "." ".." "allowlist.json" "../code" "dir/code" "white space" "quote\"" "percent%" "-leading" "tab\tname"
+  ] ++ map (secretFile: { inherit secretFile; }) [
+    ""
+    "relay-secret"
+    "secrets/relay-secret"
+    "../relay-secret"
+    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-leaked-secret"
   ];
   nixosRejects = value: !(builtins.tryEval (nixosFor {
     services.pi-messaging-relay = value;

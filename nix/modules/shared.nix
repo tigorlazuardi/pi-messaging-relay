@@ -1,13 +1,15 @@
 { lib, pkgs, serverPackage }:
 let
   inherit (lib) mkOption types;
-  safePairingBasename = value:
-    value != "."
-    && value != ".."
-    && value != "allowlist.json"
-    && builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" value != null;
-  pairingBasenameType = types.nullOr (types.addCheck types.str safePairingBasename);
   nonzeroPortType = types.addCheck types.port (value: value != 0);
+  # Guardrail (accepted auth v2, "Nix and secrets guardrail"): the option may name
+  # only an absolute host path outside the world-readable Nix store. A store path
+  # or a string with store context (a derivation secret) fails evaluation.
+  hostSecretFileType = types.nullOr (types.addCheck types.str (value:
+    lib.isString value
+    && lib.hasPrefix "/" value
+    && !lib.hasPrefix "/nix/store/" value
+  ));
 
   options = {
     enable = lib.mkEnableOption "Pi Messaging Relay server";
@@ -27,10 +29,18 @@ let
       default = 43127;
       description = "Nonzero relay listener port.";
     };
-    pairingCodeFile = mkOption {
-      type = pairingBasenameType;
+    secretFile = mkOption {
+      type = hostSecretFileType;
       default = null;
-      description = "Optional safe direct-child basename for one startup pairing code.";
+      description = ''
+        Optional absolute host path to the operator-owned server secret file,
+        satisfying the server's --secret-file contract: a direct child of the
+        state directory, mode 0600, 1-512 bytes after trimming. When set, the
+        launcher passes --secret-file; when null, the server starts with
+        authentication off. The path is passed through verbatim and never
+        copied into or read from the Nix store; rotate by rewriting the file
+        and restarting the service.
+      '';
     };
   };
 
@@ -45,8 +55,8 @@ let
         (renderListener cfg.host cfg.port)
         "--state-dir"
       ];
-      pairingArg = lib.optionalString (cfg.pairingCodeFile != null) ''
-        argv+=(--pairing-code-file "$STATE_DIRECTORY/${cfg.pairingCodeFile}")
+      secretArg = lib.optionalString (cfg.secretFile != null) ''
+        argv+=(--secret-file ${lib.escapeShellArg cfg.secretFile})
       '';
     in pkgs.writeShellScript "pi-messaging-relay-launcher" ''
       set -eu
@@ -55,9 +65,9 @@ let
         exit 1
       fi
       argv=(${lib.escapeShellArgs argv} "$STATE_DIRECTORY")
-      ${pairingArg}
+      ${secretArg}
       exec "''${argv[@]}"
     '';
 in {
-  inherit options renderListener makeLauncher safePairingBasename;
+  inherit options renderListener makeLauncher hostSecretFileType;
 }

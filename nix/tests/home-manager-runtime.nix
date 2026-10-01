@@ -52,7 +52,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"{userctl} restart pi-messaging-relay.service")
         machine.wait_until_succeeds(f"{userctl} is-active pi-messaging-relay.service")
         machine.wait_until_succeeds(f"{journal} | grep '\"event\":\"server_ready\"'")
-        machine.succeed(f"{journal} | grep '\"event\":\"pairing_code_created\"' | grep '<redacted>'")
+        machine.succeed(f"{journal} | grep '\"auth\":\"off\"'")
         machine.succeed(f"test $(stat -c %a {state}) = 700")
         machine.succeed(f"test $(stat -c %U {state}) = {user}")
         fragment = machine.succeed(f"{userctl} cat pi-messaging-relay.service")
@@ -63,6 +63,7 @@ pkgs.testers.runNixOSTest {
         argv = machine.succeed(f"tr '\\0' '\\n' </proc/{pid}/cmdline")
         assert f"--listen\n{listener}\n" in argv
         assert f"--state-dir\n{state}\n" in argv
+        assert "--secret-file\n" not in argv
         machine.succeed(f"{userctl} restart pi-messaging-relay.service")
         machine.wait_until_succeeds(f"test $({journal} | grep -c '\"event\":\"server_ready\"') -ge 2")
         machine.succeed(f"{userctl} stop pi-messaging-relay.service")
