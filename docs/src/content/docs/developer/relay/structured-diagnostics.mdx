@@ -8,10 +8,14 @@ date: 2026-09-11
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The relay emits structured logs for operator diagnosis without retaining message content or authentication material. Under protocol v2 ([online relay authentication v2](../../protocol/online-relay-auth-v2/)) the only credential is one optional static shared secret checked at the HTTP upgrade, so no pairing, key, challenge, or signature event exists. Normal server events go to the server process's stdout. Fatal server startup or runtime failure goes to server stderr as `server_failed`. Extension events go to the Pi process's stderr through `console.error`. Every nonempty line is exactly one JSON object; event values are JSON-escaped and never create a second physical line.
+The relay emits structured logs for operator diagnosis without retaining message content or authentication material. Under protocol v2 ([online relay authentication v2](../../protocol/online-relay-auth-v2/)) the only credential is one optional static shared secret checked at the HTTP upgrade, so no pairing, key, challenge, or signature event exists. Normal server events go to the server process's stdout. Fatal server startup or runtime failure goes to server stderr as `server_failed`. Extension events go to the Pi process's stderr through `console.error`, except that the interactive TUI never receives them on stderr — a persisted TUI session appends every event to its own JSONL log file, and headless hosts keep the stderr stream as their record. Every nonempty line is exactly one JSON object; event values are JSON-escaped and never create a second physical line.
 
 <Decision title="Keep diagnostics in two process-owned JSONL streams" status="accepted">
 The server owns authoritative protocol and delivery outcomes on stdout. The extension owns Pi-session, reconnect, and model-tool outcomes on Pi stderr. This preserves settlement authority while allowing operators to correlate both sides without a logger framework, exporter, or new protocol surface.
+</Decision>
+
+<Decision title="Persisted TUI sessions capture per-session files; headless hosts keep stderr" status="accepted">
+The interactive TUI mutes stderr diagnostics, so its record lives in one JSONL file per persisted session at `~/.local/state/pi-messaging-relay/sessions/<session-file>.log.jsonl` (`PI_MESSAGING_RELAY_LOG_DIR` overrides the directory; `XDG_STATE_HOME` is honored). Appends are fire-and-forget single `O_APPEND` writes with no locking or fsync — one session owns one file, so no cross-session synchronization exists — and the in-session `/relay-logs` command tails the newest 200 lines on demand. Headless hosts (rpc, print, json) and in-memory sessions capture no file: their stderr stream is the record, and `/relay-logs` reports exactly that instead of inventing a capture.
 </Decision>
 
 ## Severity and event vocabulary
@@ -34,6 +38,8 @@ The server owns authoritative protocol and delivery outcomes on stdout. The exte
 `session_capacity_rejected` and `protocol_rejected` are recoverable server warnings with stable `result` and stable `reason`/`code` as applicable. An upgrade rejection before any WebSocket exists is `auth_rejected` with `reason: "not_authorized"` and no request or route field; post-hello rejections (`invalid_hello`, `route_conflict`, `welcome_failed`) add the hello request ID when available.
 
 ### Extension stderr
+
+Per-session JSONL capture mirrors this table exactly: the file stores the same one-object-per-line events, in emit order, that stderr hosts receive. The `/relay-logs` command reads the newest 200 lines of the current session's file; headless hosts and in-memory sessions have no file, so the command reports that their stderr stream is the record.
 
 | Event | Level | Stable fields beyond `level` and `event` |
 |---|---|---|

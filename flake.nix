@@ -190,10 +190,13 @@
             name = "pi-messaging-relay-extension-load";
             nodes.machine = { ... }: {
               environment.systemPackages = [ pkgs.pi-coding-agent pkgs.jq ];
+              # The oracle binds fixed ports 45673/45674; a leftover listener
+              # from any earlier run must not silently poison this check.
+              networking.firewall.enable = false;
             };
             testScript = ''
               machine.start()
-              machine.succeed("${extensionOracle}")
+              print(machine.succeed("${extensionOracle} 2>&1 || (echo ORACLE-FAILED; exit 1)"))
             '';
           };
           parity = import ./nix/tests/parity.nix {

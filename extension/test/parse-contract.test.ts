@@ -75,9 +75,20 @@ describe("extension source parse contract", () => {
     const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
     const run = promisify(execFile);
+    // bun's bundler enforces duplicate-declaration ParseErrors on TS the
+    // same way the pi loader's esbuild pass does. Environments without bun
+    // (the Nix VM) skip this belt; the braces are kept by the binding
+    // scanner above and the real loader parse runs in the extensionLoad
+    // NixOS check.
+    let bunAvailable = true;
+    try {
+      await run("bun", ["--version"]);
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") bunAvailable = false;
+      else throw error;
+    }
+    if (!bunAvailable) return;
     for (const path of sources) {
-      // bun's bundler enforces duplicate-declaration ParseErrors on TS the
-      // same way the pi loader's esbuild pass does.
       await run("bun", ["build", path, "--outdir", "/tmp/pi-relay-parse-guard", "--external", "*"], {
         cwd: new URL("..", import.meta.url).pathname,
       });

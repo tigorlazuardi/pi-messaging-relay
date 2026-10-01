@@ -157,6 +157,7 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 - Its pinned WebSocket client enforces a 512 KiB socket-wide ceiling before complete message delivery; hello and welcome messages keep a 16 KiB semantic ceiling. Shutdown requests graceful close for at most one second, then destroys and settles an unresponsive transport.
 - The extension does not expose send transport request IDs or server-generated delivery IDs in its settlement event because the model-tool boundary does not own them. Match `message_id` and both routes to the server's authoritative `send_settled` when deeper transport correlation is needed.
 - The relay emits logs only. It has no OpenTelemetry exporter, metrics endpoint, or traces. See [Structured relay diagnostics](../../developer/relay/structured-diagnostics/) for complete event schemas and support workflow.
+- The interactive TUI never prints relay diagnostics into the transcript. A persisted session records every event in its own JSONL file under `~/.local/state/pi-messaging-relay/sessions/` (`PI_MESSAGING_RELAY_LOG_DIR` overrides the directory); run `/relay-logs` inside Pi to see the newest 200 lines as an overlay (Escape closes, `r` refreshes). Headless runs (rpc, print, json) and in-memory sessions keep no file — their stderr stream is the record, and `/relay-logs` says so.
 
 ## Troubleshooting
 

@@ -1,9 +1,14 @@
-import { hostname as operatingSystemHostname } from "node:os";
+import { hostname as operatingSystemHostname, homedir } from "node:os";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { senderLabel } from "./internal/message-renderer.ts";
+import {
+  appendDiagnosticLine,
+  readSessionLogTail,
+  resolveSessionLogPath,
+} from "./internal/session-log.ts";
 import { Text, truncateToWidth, type CardTheme } from "./internal/relay-box.ts";
 
 import {
@@ -39,6 +44,9 @@ const RELAY_MESSAGE_TYPE = "pi-messaging-relay-message-v1";
 const RELAY_RESULT_LIST_TYPE = "pi-messaging-relay-roster-v1";
 const RELAY_RESULT_SEND_TYPE = "pi-messaging-relay-send-v1";
 const REDACTED = "<redacted>";
+// ponytail: fixed 200-line /relay-logs tail; make configurable when an
+// operator needs more scrollback.
+const RELAY_LOG_TAIL_LINES = 200;
 
 const listPeersParameters = Type.Object(
   {
@@ -78,11 +86,24 @@ const agentSendParameters = Type.Object(
 // stale closures cannot re-enable output after the instance is discarded.
 let diagnosticsMuted = false;
 
+// Persisted-session capture: when the host reports one persisted session file
+// (interactive TUI), every diagnostic event is appended to that session's own
+// JSONL log under the relay state dir. Headless hosts and in-memory sessions
+// capture nothing; they keep the stderr stream, which is their display.
+let sessionLogPath: string | undefined;
+
 function emitDiagnostic(event: Record<string, unknown>): void {
+  const line = JSON.stringify(event);
+  // Capture first: the per-session file works in every host, muted or not.
+  try {
+    if (sessionLogPath) appendDiagnosticLine(sessionLogPath, line);
+  } catch {
+    // Capture must never replace lifecycle, transport, or model-tool ownership.
+  }
   // When the interactive TUI is active the footer indicator already owns
   // relay state display; console output would only pollute the transcript.
   try {
-    if (!diagnosticsMuted) console.error(JSON.stringify(event));
+    if (!diagnosticsMuted) console.error(line);
   } catch {
     // Diagnostics must never replace lifecycle, transport, or model-tool ownership.
   }
@@ -582,6 +603,19 @@ export default function relayExtension(pi: ExtensionAPI): void {
         route_id: sessionRouteID,
       });
     }
+    sessionCWD = ctx.cwd;
+    activeSessionIdle = () => ctx.isIdle();
+    activeUI = (ctx as { ui?: unknown }).ui;
+    // Mute and capture state must be set before the first diagnostic of the
+    // session; the previous ordering leaked one relay_session_started line
+    // to every TUI transcript on boot.
+    diagnosticsMuted = (ctx as { mode?: unknown }).mode === "tui";
+    const reportedSessionFile = (ctx as { sessionManager?: { getSessionFile?: () => unknown } })
+      .sessionManager?.getSessionFile?.();
+    sessionLogPath = diagnosticsMuted && typeof reportedSessionFile === "string"
+      ? resolveSessionLogPath(process.env, homedir(), reportedSessionFile)
+      : undefined;
+    startupAttempted = false;
     emitDiagnostic({
       level: "info",
       event: "relay_session_started",
@@ -589,11 +623,6 @@ export default function relayExtension(pi: ExtensionAPI): void {
       reason,
       route_id: sessionRouteID,
     });
-    sessionCWD = ctx.cwd;
-    activeSessionIdle = () => ctx.isIdle();
-    activeUI = (ctx as { ui?: unknown }).ui;
-    diagnosticsMuted = (ctx as { mode?: unknown }).mode === "tui";
-    startupAttempted = false;
     await connectOnce();
   });
 
@@ -629,6 +658,79 @@ export default function relayExtension(pi: ExtensionAPI): void {
       ? theme as CardTheme
       : undefined;
     return new RelayCardComponent(details, cardTheme, options.expanded === true);
+  });
+
+  // /relay-logs: on-demand diagnostic snapshot. Persisted TUI sessions read
+  // their own JSONL log tail; the overlay keeps stderr noise out of the
+  // transcript. Headless hosts and in-memory sessions have no file — the
+  // command says so, because their stderr stream is already the record.
+  pi.registerCommand("relay-logs", {
+    description: "Show a snapshot of captured relay diagnostic events",
+    handler: async (_args, ctx) => {
+      const tailLines = () =>
+        sessionLogPath ? readSessionLogTail(sessionLogPath, RELAY_LOG_TAIL_LINES) : Promise.resolve([] as string[]);
+      const snapshotText = async () => {
+        const lines = await tailLines();
+        const header = sessionLogPath
+          ? `relay diagnostics — ${lines.length} line(s), max ${RELAY_LOG_TAIL_LINES} — ${sessionLogPath}`
+          : "relay diagnostics — no session log (headless host or in-memory session; stderr carries the stream)";
+        return [header, ...lines].join("\n");
+      };
+      const ui = (ctx as { ui?: unknown }).ui as { custom?: unknown } | undefined;
+      let overlayFactory: ((
+        factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: boolean) => void) => unknown,
+        options?: { overlay?: boolean },
+      ) => Promise<unknown>) | undefined;
+      try {
+        if (ui && typeof ui.custom === "function") {
+          overlayFactory = ui.custom as typeof overlayFactory;
+        }
+      } catch {
+        // Hosts forbidding live UI access fall through to the stderr snapshot.
+      }
+      if (overlayFactory) {
+        try {
+          await overlayFactory(
+            (_tui, _theme, _keybindings, done) => {
+              const view = new Text("");
+              let rendered = "";
+              void snapshotText().then((text) => {
+                rendered = text;
+              });
+              (view as unknown as { render: (width: number) => string[] }).render = () =>
+                rendered.split("\n");
+              (view as { onKey?: (key: string) => boolean }).onKey = (key) => {
+                if (key === "escape" || key === "return") {
+                  done(true);
+                  return true;
+                }
+                if (key === "r") {
+                  void snapshotText().then((text) => {
+                    rendered = text;
+                  });
+                  return true;
+                }
+                return false;
+              };
+              return view;
+            },
+            { overlay: true },
+          );
+          return;
+        } catch {
+          // Overlay unavailable (host without overlay support, UI teardown);
+          // fall through to the stderr snapshot.
+        }
+      }
+      const snapshot = await snapshotText();
+      for (const line of snapshot.split("\n")) {
+        try {
+          console.error(line);
+        } catch {
+          return;
+        }
+      }
+    },
   });
 
   const renderResultLine = (

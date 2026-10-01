@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
 
 import { clientConfigurationPath, ENDPOINT_ENV } from "../internal/client-config.ts";
+import { readSessionLogTail } from "../internal/session-log.ts";
 import { installReconnectDependenciesForTest } from "../internal/reconnect.ts";
 import { FakePiHost } from "./fake-pi-host.ts";
 
@@ -25,6 +27,19 @@ async function createHome(context: { after(callback: () => Promise<void>): void 
   const home = await mkdtemp(join(tmpdir(), "pi-relay-extension-"));
   context.after(async () => rm(home, { recursive: true, force: true }));
   return home;
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  action: string,
+  timeoutMS = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMS;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for ${action}`);
 }
 
 async function writeConfig(home: string, text: string, mode: number): Promise<void> {
@@ -163,10 +178,11 @@ test("loads and runs disconnected handlers without starting resources", { concur
   }
 
   assert.deepEqual(host.registrations, [
+    { kind: "command", name: "relay-logs" },
     { kind: "tool", name: "list_peers" },
     { kind: "tool", name: "agent_send" },
   ]);
-  assert.deepEqual([...host.commands.keys()], []);
+  assert.deepEqual([...host.commands.keys()], ["relay-logs"]);
   assert.deepEqual([...host.tools.keys()], ["list_peers", "agent_send"]);
   assert.deepEqual(resourceAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);
@@ -424,4 +440,69 @@ test("both tools fail through Pi's thrown-error path while disconnected", { conc
   assert.deepEqual(host.sendMessageAttempts, []);
   assert.deepEqual(host.sendUserMessageAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);
+});
+
+test("headless host keeps no session log; /relay-logs reports the stderr stream", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
+  const host = new FakePiHost();
+  const logs = captureStructuredErrors();
+
+  try {
+    const relayExtension = await loadIsolatedRelayExtension("relay-logs-headless");
+    relayExtension(host.api as never);
+    await host.emit("session_start", { type: "session_start", reason: "startup" });
+    await assert.rejects(host.executeTool("list_peers", {}));
+    await host.executeCommand("relay-logs");
+  } finally {
+    logs.restore();
+    environment.restore();
+  }
+
+  // Headless (print-mode) hosts never capture a file; their stderr stream is
+  // the record, and the command says so instead of inventing one.
+  assert.ok(logs.lines.some((line) => line.includes("no session log")), JSON.stringify(logs.lines));
+  assert.equal(logs.lines.some((line) => line.includes("relay_operation_failed") && line.startsWith("relay diagnostics")), false);
+  assert.deepEqual(host.liveAccessAttempts, ["ctx.ui.custom"]);
+  assert.deepEqual(host.notifications, []);
+});
+
+test("persisted TUI session logs per-session file, stderr stays quiet, /relay-logs tails it", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
+  const logDir = join(home, "relay-logs");
+  process.env.PI_MESSAGING_RELAY_LOG_DIR = logDir;
+  const host = new FakePiHost();
+  host.mode = "tui";
+  host.sessionFile = join(home, "session.jsonl");
+  const logs = captureStructuredErrors();
+
+  try {
+    const relayExtension = await loadIsolatedRelayExtension("relay-logs-tui");
+    relayExtension(host.api as never);
+    await host.emit("session_start", { type: "session_start", reason: "startup" });
+    await assert.rejects(host.executeTool("list_peers", {}));
+    // Append writes are fire-and-forget; wait until the events land.
+    await waitUntil(
+      () => existsSync(join(logDir, "session.jsonl.log.jsonl")),
+      "per-session diagnostic log file",
+      2_000,
+    );
+    await waitUntil(
+      () => readSessionLogTail(join(logDir, "session.jsonl.log.jsonl"), 200).then((lines) => lines.length >= 2),
+      "session log captures started plus failed operation",
+      2_000,
+    );
+    assert.equal(logs.lines.length, 0, "muted TUI hosts must not receive stderr diagnostics");
+    await host.executeCommand("relay-logs");
+  } finally {
+    logs.restore();
+    delete process.env.PI_MESSAGING_RELAY_LOG_DIR;
+    environment.restore();
+  }
+
+  const snapshotLines = logs.lines.filter((line) => line.includes("relay_operation_failed"));
+  assert.ok(snapshotLines.length >= 1, `expected tail lines in snapshot, got: ${JSON.stringify(logs.lines)}`);
+  assert.ok(logs.lines.some((line) => line.includes(logDir)), `header must name the log file: ${JSON.stringify(logs.lines)}`);
+  assert.deepEqual(host.liveAccessAttempts, ["ctx.ui.custom"]);
 });

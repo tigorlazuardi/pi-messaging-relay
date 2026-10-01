@@ -37,6 +37,9 @@ export class FakePiHost {
   readonly statusMessages: Array<{ key: string; text: string | undefined }> = [];
   readonly events = new Map<string, EventHandler[]>();
   cwd = "/tmp/fake-pi-session";
+  /** Persisted session file reported through ctx.sessionManager; undefined
+   * mirrors in-memory sessions, which capture no per-session log. */
+  sessionFile: string | undefined = undefined;
   /** Host mode reported on ctx; default mirrors no-UI hosts for diagnostic streaming. */
   mode = "print";
   private idle = true;
@@ -163,6 +166,7 @@ export class FakePiHost {
         mode: this.mode,
         sessionManager: {
           getEntries: () => [...this.sessionEntries],
+          getSessionFile: () => this.sessionFile,
         },
         isIdle: () => {
           const error = this.nextIdleCheckError;
