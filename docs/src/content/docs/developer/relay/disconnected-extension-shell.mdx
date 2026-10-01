@@ -11,7 +11,7 @@ import Decision from '../../../../components/Decision.astro';
 The extension package in `extension/` establishes the Pi-facing surface. Loading its default factory registers one human command, `/relay-pair`, and exactly two model tools, `list_peers` and `agent_send`.
 
 <Aside type="note" title="Authenticated roster and message delivery">
-The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers authenticate and retain one WebSocket shared by bounded `list_peers`, `agent_send`, and recipient delivery. Deterministic provenance formatting, successful string/object idle injection and busy follow-up injection, replies, finalized failure results, and bounded automatic reconnect are connected. Loading the factory still requires no relay server and no model call.
+The command performs installation pairing and persists an extension-local Ed25519 private key. Session lifecycle handlers authenticate and retain one WebSocket shared by bounded `list_peers`, `agent_send`, and recipient delivery. Deterministic provenance formatting, successful string/object idle injection and busy steered injection, replies, finalized failure results, and bounded automatic reconnect are connected. Loading the factory still requires no relay server and no model call.
 </Aside>
 
 ## Registration and lifecycle boundary
@@ -143,7 +143,7 @@ Handlers execute directly through the recorded registrations. The acceptance ass
 - one retained authenticated socket from either lifecycle ordering, followed by idempotent shutdown settlement;
 - fake-clock reconnect progression with deterministic jitter, exact same-session route/address retention, authenticated presence disappearance and restoration, fresh new/fork routes, and no post-shutdown timer or attempt; and
 - real-server address-only roster membership, strict continuation, disconnect removal, hostile-response closure, shared local single-flight rejection, and abort/timeout/close cleanup; and
-- real-server string/object delivery through two extension instances, exact deterministic provenance and canonical object text, no-option idle injection and busy `{ deliverAs: "followUp" }` injection, stale-session and idle-predicate failure safety, thrown-Pi-call best-effort ACK, sender schema rejection of IDs/modes, no steering, unique IDs, exact ACK correlation, accepted `sender_capacity` compatibility results, redacted logs, and deterministic `received` output.
+- real-server string/object delivery through two extension instances, exact deterministic provenance and canonical object text, turn-trigger idle injection and busy `{ deliverAs: "steer" }` injection, stale-session and idle-predicate failure safety, thrown-Pi-call best-effort ACK, sender schema rejection of IDs/modes, unique IDs, exact ACK correlation, accepted `sender_capacity` compatibility results, redacted logs, and deterministic `received` output.
 
 The primary pairing acceptance additionally starts the real Go child, invokes the registered command, and inspects only observable permission, public metadata, persistence, notification, injection, and process-log boundaries.
 

@@ -1,6 +1,6 @@
 type SendUserMessage = (
   body: string,
-  options?: { deliverAs: "followUp" },
+  options?: { deliverAs: "steer" },
 ) => void;
 
 type InjectInbound = (
@@ -21,7 +21,10 @@ type RelayCardDetails = {
  * Captures one recipient session and fails safe when its identity or idle
  * observation is stale. Card injection is tried first so the host renders the
  * inbound message through the relay renderer; any refusal falls back to the
- * original user-message injection with unchanged semantics.
+ * original user-message injection. Busy delivery uses steer, never followUp:
+ * follow-ups land in the user's editable message queue, so a peer message
+ * would appear inside the human's typed-input queue; steer hands the message
+ * to the model at the next safe boundary without touching that queue.
  */
 export function createRecipientDelivery(
   sendUserMessage: SendUserMessage,
@@ -44,6 +47,6 @@ export function createRecipientDelivery(
       return;
     }
     if (deliverWhileIdle) sendUserMessage(body);
-    else sendUserMessage(body, { deliverAs: "followUp" });
+    else sendUserMessage(body, { deliverAs: "steer" });
   };
 }

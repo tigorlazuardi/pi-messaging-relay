@@ -263,7 +263,7 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     );
 
     await waitForAttempt(recipient, 1);
-    assert.deepEqual(recipient.sendMessageAttempts[0]?.slice(1), [{ deliverAs: "followUp" }]);
+    assert.deepEqual(recipient.sendMessageAttempts[0]?.slice(1), [{ deliverAs: "steer" }]);
     const originalInjection = parseInjection((recipient.sendMessageAttempts[0]?.[0] as { content: string }).content);
     assert.equal(originalInjection.from, senderAuth.address);
     assert.equal(originalInjection.re, undefined);
@@ -377,8 +377,6 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
 
     assert.deepEqual(sender.sendUserMessageAttempts, []);
     assert.deepEqual(recipient.sendUserMessageAttempts, []);
-    assert.equal(JSON.stringify(sender.sendMessageAttempts).includes("steer"), false);
-    assert.equal(JSON.stringify(recipient.sendMessageAttempts).includes("steer"), false);
     for (const privateValue of [
       originalBody,
       canonicalReplyBody,

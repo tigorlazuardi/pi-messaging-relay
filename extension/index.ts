@@ -319,7 +319,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
             () => activeSessionIdle === identity.sessionIdle,
             (body, details, deliverWhileIdle) =>
               injectInbound(body, details, deliverWhileIdle) ||
-              (deliverWhileIdle ? pi.sendUserMessage(body) : pi.sendUserMessage(body, { deliverAs: "followUp" })),
+              (deliverWhileIdle ? pi.sendUserMessage(body) : pi.sendUserMessage(body, { deliverAs: "steer" })),
           ),
           onDisconnected: () => {
             if (!retained || !connection) return;
@@ -615,7 +615,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
         content: renderedBody,
         display: true,
         details,
-      }, deliverWhileIdle ? { triggerTurn: true } : { deliverAs: "followUp" });
+      }, deliverWhileIdle ? { triggerTurn: true } : { deliverAs: "steer" });
       return true;
     } catch {
       return false;

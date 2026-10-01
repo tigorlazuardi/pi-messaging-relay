@@ -17,7 +17,7 @@ test("missing active recipient identity fails safe to follow-up delivery", () =>
 
   deliver("missing identity body");
 
-  assert.deepEqual(attempts, [["missing identity body", { deliverAs: "followUp" }]]);
+  assert.deepEqual(attempts, [["missing identity body", { deliverAs: "steer" }]]);
 });
 
 test("recipient identity change during idle observation fails safe to follow-up delivery", () => {
@@ -37,7 +37,7 @@ test("recipient identity change during idle observation fails safe to follow-up 
 
   assert.deepEqual(attempts, [[
     "identity changed while checking idle",
-    { deliverAs: "followUp" },
+    { deliverAs: "steer" },
   ]]);
 });
 
@@ -51,5 +51,5 @@ test("recipient idle predicate exception fails safe to follow-up delivery", () =
 
   deliver("idle check failed");
 
-  assert.deepEqual(attempts, [["idle check failed", { deliverAs: "followUp" }]]);
+  assert.deepEqual(attempts, [["idle check failed", { deliverAs: "steer" }]]);
 });

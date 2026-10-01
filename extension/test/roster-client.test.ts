@@ -838,7 +838,7 @@ test("captured recipient injection renders every body and re variant before exac
     assert.equal(rendered.slice(0, rendered.indexOf("\n")).includes("\u2029"), false);
     assert.deepEqual(
       attempts[index],
-      variant.idle ? [rendered] : [rendered, { deliverAs: "followUp" }],
+      variant.idle ? [rendered] : [rendered, { deliverAs: "steer" }],
     );
     assert.equal(rendered.split("\n", 1)[0].includes("re="), variant.re !== undefined);
     assert.equal(ack.type, "received");
@@ -848,7 +848,6 @@ test("captured recipient injection renders every body and re variant before exac
       message_id: variant.messageID,
     });
   }
-  assert.equal(JSON.stringify(attempts).includes("steer"), false);
 });
 
 test("retained socket fails safe after its recipient session identity is replaced", { timeout: 2_000 }, async (context) => {
@@ -894,9 +893,8 @@ test("retained socket fails safe after its recipient session identity is replace
   const ack = JSON.parse(ackFrame) as Record<string, unknown>;
   assert.deepEqual(attempts, [[
     "[pi-messaging-relay] message from \"sender\" (id=01993c84-fc2b-7e1c-af99-61b8118ac6df):\nretained socket body",
-    { deliverAs: "followUp" },
+    { deliverAs: "steer" },
   ]]);
-  assert.equal(JSON.stringify(attempts).includes("steer"), false);
   assert.match(String(ack.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(ackFrame, JSON.stringify({
     v: 1,

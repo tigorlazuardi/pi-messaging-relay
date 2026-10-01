@@ -379,7 +379,7 @@ sequenceDiagram
     SA->>SE: agent_send(to, body, re?)
     SE->>R: send(request_id, message_id, to, body, re?)
     R->>RE: message(delivery_id, message_id, from, to, body, re?)
-    RE->>RP: sendMessage card (followUp when busy; user-message fallback)
+    RE->>RP: sendMessage card (steer when busy; user-message fallback)
     RE->>R: received(delivery_id, message_id)
     R->>SE: send_result(received)
     SE->>SA: received
@@ -398,8 +398,8 @@ sequenceDiagram
 `received` means the recipient extension received the frame and attempted `pi.sendUserMessage`. Pi 0.84.2 exposes no enqueue or persistence receipt, so this status never claims durable Pi acceptance, model read, task completion, or reply.
 </Decision>
 
-<Decision title="Preserve active work with follow-up delivery" status="accepted">
-When Pi is busy, the extension always uses `deliverAs: "followUp"`. A sender cannot steer another active session in v1.
+<Decision title="Preserve active work with steered delivery" status="accepted">
+When Pi is busy, the extension uses `deliverAs: "steer"`, never `followUp`: a follow-up lands in the user's editable message queue, which would let peer messages surface inside the human's typed-input queue. Steering hands the message to the model at the next safe boundary without aborting tool calls and without touching the user's queue. A sender cannot force immediate interruption of another active session.
 </Decision>
 
 <Decision title="Settle an exact registry miss as offline" status="accepted">
@@ -411,7 +411,7 @@ After lookup finds an exact authenticated recipient, failure to write the offer 
 </Decision>
 
 <Aside type="note" title="Implementation boundary">
-Tickets #14–#21 implement successful string and object delivery, correlated replies, immediate current-registry-miss settlement, bounded missing-ACK settlement, recipient-session-loss settlement, and exact sender-session-loss cleanup through the same ordinary send path: extension-generated request and message IDs, exact opaque-address lookup, no history-derived routing, server-generated delivery IDs only after a recipient is found, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact one-argument idle injection, exact busy `{ deliverAs: "followUp" }` injection, exact recipient ACK authorization, independently correlated `received` results, exact `timeout/offline` miss results, and exact `timeout/ack_timeout` results after an offered delivery receives no exact ACK within five seconds. The reply destination and `re` value are copied from the original injected provenance; no sender field can select a generated ID, delivery mode, or steering.
+Tickets #14–#21 implement successful string and object delivery, correlated replies, immediate current-registry-miss settlement, bounded missing-ACK settlement, recipient-session-loss settlement, and exact sender-session-loss cleanup through the same ordinary send path: extension-generated request and message IDs, exact opaque-address lookup, no history-derived routing, server-generated delivery IDs only after a recipient is found, raw JSON-value object forwarding, deterministic provenance rendering, current recipient-local `ctx.isIdle()` selection, exact idle turn-trigger injection, exact busy `{ deliverAs: "steer" }` injection, exact recipient ACK authorization, independently correlated `received` results, exact `timeout/offline` miss results, and exact `timeout/ack_timeout` results after an offered delivery receives no exact ACK within five seconds. The reply destination and `re` value are copied from the original injected provenance; no sender field can select a generated ID, delivery mode, or steering.
 
 A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each online reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. The one transport retry reuses only its own new logical message ID; it never reuses the replied-to ID. Raw authenticated clients may pipeline up to 128 distinct logical sends per exact sender session; the extension intentionally remains single-flight.
 
@@ -771,7 +771,7 @@ Example ACK-timeout server log:
 A focused Pi 0.84.2 runtime experiment verified:
 
 - idle `pi.sendUserMessage` starts a real user turn;
-- busy `deliverAs: "followUp"` preserves ordering and runs after active work;
+- busy `deliverAs: "steer"` delivers at the next safe model boundary without aborting tool calls and without entering the user's editable queue;
 - abort stops current work but does not discard an already queued follow-up; and
 - RPC `new_session` waits for queued follow-up completion before replacing the session.
 

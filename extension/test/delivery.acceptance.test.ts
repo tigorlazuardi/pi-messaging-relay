@@ -311,7 +311,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
         delivered[1],
         delivery.idle && !delivery.throwFromIdleCheck
           ? { triggerTurn: true }
-          : { deliverAs: "followUp" },
+          : { deliverAs: "steer" },
       );
       assert.equal(recipient.sendUserMessageAttempts.length, 0, "card injection must not leak into user-message seam");
       assert.equal(rendered.includes(`id=${result.details.message_id}`), true);
@@ -336,7 +336,6 @@ test("agent_send crosses real relay and two real extensions before settling rece
     assert.equal(new Set(messageIDs).size, deliveries.length);
     assert.equal(new Set(deliveryIDs).size, deliveries.length);
     assert.deepEqual(sender.sendMessageAttempts, []);
-    assert.equal(JSON.stringify(recipient.sendMessageAttempts).includes("steer"), false);
     const stringBodies = deliveries.filter((delivery) => typeof delivery.body === "string")
       .map((delivery) => delivery.body as string);
     assert.equal(stringBodies.some((body) =>
