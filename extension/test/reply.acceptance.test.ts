@@ -87,10 +87,11 @@ async function waitForAttempt(host: FakePiHost, count: number): Promise<void> {
     };
     const check = () => {
       timer = undefined;
-      if (host.sendUserMessageAttempts.length >= count) {
+      const total = host.sendUserMessageAttempts.length + host.sendMessageAttempts.length;
+      if (total >= count) {
         settle();
       } else if (Date.now() >= deadline) {
-        settle(new Error("timed out recipient sendUserMessage attempt"));
+        settle(new Error("timed out recipient inbound injection attempt"));
       } else {
         timer = setTimeout(check, Math.min(1, deadline - Date.now()));
       }
@@ -262,8 +263,8 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     );
 
     await waitForAttempt(recipient, 1);
-    assert.deepEqual(recipient.sendUserMessageAttempts[0]?.slice(1), [{ deliverAs: "followUp" }]);
-    const originalInjection = parseInjection(recipient.sendUserMessageAttempts[0]?.[0]);
+    assert.deepEqual(recipient.sendMessageAttempts[0]?.slice(1), [{ deliverAs: "followUp" }]);
+    const originalInjection = parseInjection((recipient.sendMessageAttempts[0]?.[0] as { content: string }).content);
     assert.equal(originalInjection.from, senderAuth.address);
     assert.equal(originalInjection.re, undefined);
     assert.equal(originalInjection.body, originalBody);
@@ -305,8 +306,9 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     );
 
     await waitForAttempt(sender, 1);
-    assert.deepEqual(sender.sendUserMessageAttempts[0]?.slice(1), []);
-    const replyInjection = parseInjection(sender.sendUserMessageAttempts[0]?.[0]);
+    assert.deepEqual(sender.sendUserMessageAttempts, []);
+    assert.deepEqual(sender.sendMessageAttempts[0]?.slice(1), [{ triggerTurn: true }]);
+    const replyInjection = parseInjection((sender.sendMessageAttempts[0]?.[0] as { content: string }).content);
     assert.equal(replyInjection.from, recipientAddress);
     assert.equal(replyInjection.re, originalInjection.messageID);
     assert.equal(replyInjection.body, canonicalReplyBody);
@@ -373,10 +375,10 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
       2,
     );
 
-    assert.deepEqual(sender.sendMessageAttempts, []);
-    assert.deepEqual(recipient.sendMessageAttempts, []);
-    assert.equal(JSON.stringify(sender.sendUserMessageAttempts).includes("steer"), false);
-    assert.equal(JSON.stringify(recipient.sendUserMessageAttempts).includes("steer"), false);
+    assert.deepEqual(sender.sendUserMessageAttempts, []);
+    assert.deepEqual(recipient.sendUserMessageAttempts, []);
+    assert.equal(JSON.stringify(sender.sendMessageAttempts).includes("steer"), false);
+    assert.equal(JSON.stringify(recipient.sendMessageAttempts).includes("steer"), false);
     for (const privateValue of [
       originalBody,
       canonicalReplyBody,

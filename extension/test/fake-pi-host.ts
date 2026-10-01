@@ -3,6 +3,11 @@ type CommandRegistration = {
   handler: (args: string, context: unknown) => Promise<void> | void;
 };
 
+type MessageRendererRegistration = {
+  customType: string;
+  renderer: unknown;
+};
+
 type ToolRegistration = {
   name: string;
   label: string;
@@ -21,6 +26,7 @@ type EventHandler = (event: unknown, context: unknown) => Promise<unknown> | unk
 export class FakePiHost {
   readonly commands = new Map<string, CommandRegistration>();
   readonly tools = new Map<string, ToolRegistration>();
+  readonly messageRenderers = new Map<string, MessageRendererRegistration>();
   readonly registrations: Array<{ kind: "command" | "tool"; name: string }> = [];
   readonly notifications: Notification[] = [];
   readonly sendMessageAttempts: unknown[] = [];
@@ -31,6 +37,8 @@ export class FakePiHost {
   readonly statusMessages: Array<{ key: string; text: string | undefined }> = [];
   readonly events = new Map<string, EventHandler[]>();
   cwd = "/tmp/fake-pi-session";
+  /** Host mode reported on ctx; default mirrors no-UI hosts for diagnostic streaming. */
+  mode = "print";
   private idle = true;
   private nextIdleCheckError: Error | undefined;
   private nextSendUserMessageError: Error | undefined;
@@ -49,6 +57,9 @@ export class FakePiHost {
       registerTool: (registration: ToolRegistration) => {
         this.registrations.push({ kind: "tool", name: registration.name });
         this.tools.set(registration.name, registration);
+      },
+      registerMessageRenderer: (customType: string, renderer: unknown) => {
+        this.messageRenderers.set(customType, { customType, renderer });
       },
       sendMessage: (...args: unknown[]) => {
         this.sendMessageAttempts.push(args);
@@ -149,6 +160,7 @@ export class FakePiHost {
       {
         ui,
         cwd: this.cwd,
+        mode: this.mode,
         sessionManager: {
           getEntries: () => [...this.sessionEntries],
         },

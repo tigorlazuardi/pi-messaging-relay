@@ -44,8 +44,21 @@ export function canonicalCompactJSON(value: unknown, maximumBytes: number): stri
   }
 }
 
-/** Produces the exact provenance header and unchanged string or canonical object body. */
-export function renderRelayMessage(message: RelayMessage): string {
+/** Display-safe short sender label: opaque address reduced to cwd@host. */
+export function senderLabel(from: string): string {
+  if (!validOpaqueString(from, MAX_ADDRESS_BYTES)) throw new Error("invalid sender address");
+  const hash = from.lastIndexOf("#");
+  return hash > 0 ? from.slice(0, hash) : from;
+}
+
+/** Validates the wire message and returns the unchanged parts, split for the
+ * two render targets: the model-visible provenance line and the TUI fields. */
+export function inspectRelayMessage(message: RelayMessage): {
+  from: string;
+  messageID: string;
+  re?: string;
+  bodyText: string;
+} {
   try {
     if (!validOpaqueString(message.from, MAX_ADDRESS_BYTES) ||
         !UUID_V7.test(message.messageID) ||
@@ -55,19 +68,30 @@ export function renderRelayMessage(message: RelayMessage): string {
           types.isProxy(message.body) || Array.isArray(message.body)))) {
       throw new Error("invalid relay message");
     }
-    const quotedFrom = JSON.stringify(message.from)?.replace(
-      /[\u0085\u2028\u2029]/g,
-      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
-    );
-    if (quotedFrom === undefined) throw new Error("invalid sender address");
-    const renderedBody = typeof message.body === "string"
+    const bodyText = typeof message.body === "string"
       ? requireValidText(message.body)
       : canonicalCompactJSON(message.body, MAX_FRAME_BYTES);
-    const correlation = message.re === undefined ? "" : `, re=${message.re}`;
-    return `[pi-messaging-relay] message from ${quotedFrom} (id=${message.messageID}${correlation}):\n${renderedBody}`;
+    return {
+      from: message.from,
+      messageID: message.messageID,
+      ...(message.re === undefined ? {} : { re: message.re }),
+      bodyText,
+    };
   } catch {
     throw new Error("Relay message cannot be rendered.");
   }
+}
+
+/** Produces the exact provenance header and unchanged string or canonical object body. */
+export function renderRelayMessage(message: RelayMessage): string {
+  const inspected = inspectRelayMessage(message);
+  const quotedFrom = JSON.stringify(inspected.from)?.replace(
+    /[\u0085\u2028\u2029]/g,
+    (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  if (quotedFrom === undefined) throw new Error("Relay message cannot be rendered.");
+  const correlation = inspected.re === undefined ? "" : `, re=${inspected.re}`;
+  return `[pi-messaging-relay] message from ${quotedFrom} (id=${inspected.messageID}${correlation}):\n${inspected.bodyText}`;
 }
 
 class EncodingBudgetExceeded extends Error {}

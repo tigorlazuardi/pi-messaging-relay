@@ -3,6 +3,7 @@ import { hostname as operatingSystemHostname } from "node:os";
 import WebSocket from "ws";
 
 import { RosterClient, type RosterPage, type SendResult } from "./roster-client.ts";
+import type { RelayCardDetails } from "./message-renderer.ts";
 import { generateUUIDv7 } from "./uuid.ts";
 
 export { generateUUIDv7 } from "./uuid.ts";
@@ -35,7 +36,7 @@ type SessionSocketAttemptOptions = {
   routeID: string;
   cwd: string;
   hostname?: string;
-  deliverUserMessage(body: string): void;
+  deliverUserMessage(body: string, details: RelayCardDetails): void;
   onDisconnected(): void;
 };
 

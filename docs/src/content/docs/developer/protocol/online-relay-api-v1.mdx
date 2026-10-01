@@ -379,7 +379,7 @@ sequenceDiagram
     SA->>SE: agent_send(to, body, re?)
     SE->>R: send(request_id, message_id, to, body, re?)
     R->>RE: message(delivery_id, message_id, from, to, body, re?)
-    RE->>RP: sendUserMessage(..., followUp if busy)
+    RE->>RP: sendMessage card (followUp when busy; user-message fallback)
     RE->>R: received(delivery_id, message_id)
     R->>SE: send_result(received)
     SE->>SA: received

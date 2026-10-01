@@ -3,6 +3,9 @@ import { hostname as operatingSystemHostname } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { senderLabel } from "./internal/message-renderer.ts";
+import { Text, truncateToWidth, type CardTheme } from "./internal/relay-box.ts";
+
 import {
   ClientConfigurationError,
   loadClientConfiguration,
@@ -21,6 +24,8 @@ import {
   RECONNECT_MAX_RETRIES,
   type ReconnectDeadline,
 } from "./internal/reconnect.ts";
+import { RelayCardComponent, type CardTheme } from "./internal/relay-box.ts";
+import type { RelayCardDetails } from "./internal/message-renderer.ts";
 import { RosterRequestError, type SendResult } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
 
@@ -30,6 +35,9 @@ const MAX_CURSOR_CHARACTERS = 5_856;
 const UUID_V7_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const ROUTE_ENTRY_TYPE = "pi-messaging-relay-route-v1";
 const ROUTE_ENTRY_VERSION = 1;
+const RELAY_MESSAGE_TYPE = "pi-messaging-relay-message-v1";
+const RELAY_RESULT_LIST_TYPE = "pi-messaging-relay-roster-v1";
+const RELAY_RESULT_SEND_TYPE = "pi-messaging-relay-send-v1";
 const REDACTED = "<redacted>";
 
 const listPeersParameters = Type.Object(
@@ -64,9 +72,17 @@ const agentSendParameters = Type.Object(
   { additionalProperties: false },
 );
 
+// Set per extension instance in session_start: the interactive TUI gets no
+// stderr diagnostic stream (the footer indicator owns state display there);
+// RPC, print, and json hosts keep it, the nix oracle included. Factory-local
+// stale closures cannot re-enable output after the instance is discarded.
+let diagnosticsMuted = false;
+
 function emitDiagnostic(event: Record<string, unknown>): void {
+  // When the interactive TUI is active the footer indicator already owns
+  // relay state display; console output would only pollute the transcript.
   try {
-    console.error(JSON.stringify(event));
+    if (!diagnosticsMuted) console.error(JSON.stringify(event));
   } catch {
     // Diagnostics must never replace lifecycle, transport, or model-tool ownership.
   }
@@ -154,6 +170,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
     hostname: string;
     sessionIdle(): boolean;
   };
+
+  // Module-level emitDiagnostic mirrors diagnosticsMuted via session_start;
+  // see the module-scope comment there.
 
   const reconnect = reconnectDependencies();
   let sessionStarted = false;
@@ -298,6 +317,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
             pi.sendUserMessage,
             identity.sessionIdle,
             () => activeSessionIdle === identity.sessionIdle,
+            (body, details, deliverWhileIdle) =>
+              injectInbound(body, details, deliverWhileIdle) ||
+              (deliverWhileIdle ? pi.sendUserMessage(body) : pi.sendUserMessage(body, { deliverAs: "followUp" })),
           ),
           onDisconnected: () => {
             if (!retained || !connection) return;
@@ -570,11 +592,67 @@ export default function relayExtension(pi: ExtensionAPI): void {
     sessionCWD = ctx.cwd;
     activeSessionIdle = () => ctx.isIdle();
     activeUI = (ctx as { ui?: unknown }).ui;
+    diagnosticsMuted = (ctx as { mode?: unknown }).mode === "tui";
     startupAttempted = false;
     await connectOnce();
   });
 
   pi.on("session_shutdown", () => stopSession(true));
+
+  // Inbound relay messages are session messages so the host renders them as a
+  // card via the custom renderer below; the plain-text content (protocol v1
+  // provenance line) stays the LLM-visible body exactly as before. UI-less or
+  // forbidding hosts keep the raw sendUserMessage path.
+  const injectInbound = (
+    renderedBody: string,
+    details: RelayCardDetails | undefined,
+    deliverWhileIdle: boolean,
+  ): boolean => {
+    if (details === undefined || typeof pi.sendMessage !== "function") return false;
+    try {
+      void pi.sendMessage({
+        customType: RELAY_MESSAGE_TYPE,
+        content: renderedBody,
+        display: true,
+        details,
+      }, deliverWhileIdle ? { triggerTurn: true } : { deliverAs: "followUp" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  pi.registerMessageRenderer(RELAY_MESSAGE_TYPE, (message, options, theme) => {
+    const details = message.details as RelayCardDetails | undefined;
+    if (details === null || typeof details !== "object") return undefined;
+    const cardTheme = theme && typeof theme === "object" && typeof (theme as CardTheme).fg === "function"
+      ? theme as CardTheme
+      : undefined;
+    return new RelayCardComponent(details, cardTheme, options.expanded === true);
+  });
+
+  const renderResultLine = (
+    label: string,
+    args: Record<string, unknown>,
+    result: Record<string, unknown> | undefined,
+    theme: CardTheme,
+  ): Text => {
+    let left = theme.fg("toolTitle", theme.bold(label));
+    const body = args.body;
+    if (typeof body === "string") left += theme.fg("muted", ` "${truncateToWidth(body.replace(/\s+/g, " ").trim(), 32)}"`);
+    const destination = args.to;
+    if (typeof destination === "string") {
+      left += theme.fg("muted", " → ") + theme.fg("accent", senderLabel(destination));
+    }
+    if (result === undefined) return new Text(left);
+    const status = typeof result.status === "string" ? result.status : undefined;
+    const reason = typeof result.reason === "string" ? result.reason : undefined;
+    const right = status === undefined
+      ? ""
+      : theme.fg(status === "received" ? "success" : "error", ` ${status}${reason ? ` (${reason})` : ""}`);
+    return new Text(`${left}${right}`);
+  };
+
 
   pi.registerTool({
     name: "list_peers",
@@ -598,6 +676,12 @@ export default function relayExtension(pi: ExtensionAPI): void {
         );
         throw error;
       }
+    },
+    renderResult(result, _options, theme) {
+      const details = result.details as { peers?: unknown[] } | undefined;
+      const count = Array.isArray(details?.peers) ? details!.peers.length : 0;
+      return new Text(theme.fg("toolTitle", theme.bold("list_peers")) +
+        theme.fg("muted", ` ${count} online`));
     },
   });
 
@@ -642,6 +726,18 @@ export default function relayExtension(pi: ExtensionAPI): void {
         );
         throw error;
       }
+    },
+    renderCall(args, theme) {
+      return renderResultLine("agent_send", args as Record<string, unknown>, undefined, theme as CardTheme);
+    },
+    renderResult(result, _options, theme, context) {
+      const args = (context as { state?: { args?: unknown } } | undefined)?.state?.args;
+      return renderResultLine(
+        "agent_send",
+        (args ?? {}) as Record<string, unknown>,
+        result.details as Record<string, unknown>,
+        theme as CardTheme,
+      );
     },
   });
 }

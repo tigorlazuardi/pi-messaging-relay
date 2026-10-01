@@ -3,8 +3,11 @@ import WebSocket from "ws";
 import {
   canonicalCompactJSON,
   CanonicalJSONError,
+  inspectRelayMessage,
   renderRelayMessage,
+  senderLabel,
   type JSONObject,
+  type RelayCardDetails,
 } from "./message-renderer.ts";
 import { generateUUIDv7 } from "./uuid.ts";
 
@@ -258,7 +261,7 @@ export class RosterClient {
         const delivery = parseMessage(parsed, this.selfAddress, this.deliverUserMessage);
         const renderedBody = renderRelayMessage(delivery);
         this.inboundProcessing = true;
-        void this.acceptDelivery(delivery, renderedBody);
+        void this.acceptDelivery(delivery, renderedBody, delivery.details as RelayCardDetails);
         return;
       }
 
@@ -318,10 +321,14 @@ export class RosterClient {
     });
   }
 
-  private async acceptDelivery(delivery: InboundDelivery, renderedBody: string): Promise<void> {
+  private async acceptDelivery(
+    delivery: InboundDelivery,
+    renderedBody: string,
+    details: RelayCardDetails,
+  ): Promise<void> {
     try {
       try {
-        this.deliverUserMessage?.(renderedBody);
+        this.deliverUserMessage?.(renderedBody, details);
       } catch {
         // received is attempt-at-extension-boundary only; Pi exposes no stronger receipt.
       }
@@ -418,6 +425,7 @@ type InboundDelivery = {
   from: string;
   re?: string;
   body: string | JSONObject;
+  details: RelayCardDetails;
 };
 
 function parseMessage(
@@ -446,12 +454,24 @@ function parseMessage(
       (typeof payload.body === "string" && !validText(payload.body))) {
     throw new Error("invalid message body");
   }
+  const inspected = inspectRelayMessage({
+    from: payload.from,
+    messageID: payload.message_id,
+    ...("re" in payload ? { re: payload.re as string } : {}),
+    body: payload.body as string | JSONObject,
+  });
   return {
     deliveryID: payload.delivery_id,
     messageID: payload.message_id,
     from: payload.from,
     ...("re" in payload ? { re: payload.re as string } : {}),
     body: payload.body as string | JSONObject,
+    details: {
+      from: senderLabel(inspected.from),
+      messageID: inspected.messageID,
+      ...(inspected.re === undefined ? {} : { re: inspected.re }),
+      bodyText: inspected.bodyText,
+    },
   };
 }
 

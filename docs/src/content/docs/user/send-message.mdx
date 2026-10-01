@@ -22,7 +22,9 @@ import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 10. If the tool throws `Relay agent_send body exceeds 256 KiB.`, reduce the serialized body. This local validation creates no message ID or network request and leaves the connection usable.
 </Steps>
 
-The extension creates the message ID. Do not add `message_id`, delivery options, or steering fields to tool input. Every recipient sees a provenance header containing the complete quoted sender address and generated message ID. The extension treats that address as opaque; copy it whole. Delivery mode comes only from the recipient's current local state: an idle recipient gets `pi.sendUserMessage(rendered)` with no options, while a busy recipient gets `pi.sendUserMessage(rendered, { deliverAs: "followUp" })`. A follow-up waits behind all active recipient work; it does not steer or change the current run.
+The extension creates the message ID. Do not add `message_id`, delivery options, or steering fields to tool input. Every recipient sees a provenance header containing the complete quoted sender address and generated message ID. The extension treats that address as opaque; copy it whole. Delivery mode comes only from the recipient's current local state: an idle recipient gets the message injected with an immediate turn trigger, while a busy recipient gets it queued behind all active recipient work (`deliverAs: "followUp"`). A follow-up does not steer or change the current run.
+
+On the recipient's screen the interactive TUI renders an inbound message as a bordered card showing the sender label (`cwd@hostname`), the body, and a reply hint; expanding it (ctrl+o) reveals the exact provenance line the model reads. UI-less recipients inject the same provenance line as a plain user message.
 
 <Aside type="caution" title="Results are current and best effort">
 `received` does not mean Pi persisted or queued the text, a model read it, work completed, or a reply will arrive. `timeout/offline` means only that the exact opaque destination was not currently published when the relay looked it up; it does not reveal whether that route ever existed. `timeout/recipient_disconnected` means lookup found a recipient but the relay observed that exact session or offer write become unavailable before ACK. `timeout/ack_timeout` means the relay wrote the offer but did not receive matching delivery and message IDs from that exact recipient extension within five seconds. None is a model-read, completion, queue-durability, or message-durability status. Relay restart, extension reload, process termination, or crash can lose downstream work. Reconnect and restart never replay that lost work or any previously settled message.
@@ -73,7 +75,9 @@ The relay retains at most 1,024 settled `received` or `ack_timeout` IDs for each
   </TabItem>
   <TabItem label="Busy recipient effect">
     ```text
-    pi.sendUserMessage("[pi-messaging-relay] message from \"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111\" (id=01993c84-fc2b-7e1c-af99-61b8118ac6df):\nReview the API contract", { deliverAs: "followUp" })
+    recipient screen: bordered card, body queued behind active work
+    model context: [pi-messaging-relay] message from "/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111" (id=01993c84-fc2b-7e1c-af99-61b8118ac6df):
+    Review the API contract
     ```
   </TabItem>
   <TabItem label="Object input">

@@ -278,7 +278,11 @@ async function boundedQuietCheckpoint(
   for (let turn = 0; turn < 3; turn += 1) {
     await within(new Promise<void>((resolve) => setImmediate(resolve)), `${action} quiet turn ${turn + 1}`);
   }
-  assert.equal(recipient.sendUserMessageAttempts.length, expectedInjectionCount, action);
+  assert.equal(
+    recipient.sendUserMessageAttempts.length + recipient.sendMessageAttempts.length,
+    expectedInjectionCount,
+    action,
+  );
 }
 
 function recipientMessages(frames: RecipientFrame[]): RecipientFrame[] {
@@ -286,7 +290,10 @@ function recipientMessages(frames: RecipientFrame[]): RecipientFrame[] {
 }
 
 function injectedText(host: FakePiHost): string[] {
-  return host.sendUserMessageAttempts.map((attempt) => String((attempt as unknown[])[0]));
+  const userInjections = host.sendUserMessageAttempts.map((attempt) => String(attempt[0]));
+  const cardInjections = host.sendMessageAttempts.map((attempt) =>
+    String((attempt[0] as { content?: string })?.content ?? ""));
+  return [...userInjections, ...cardInjections];
 }
 
 test("recipient delivery stream never replays across reconnect and child-process restart", {
@@ -574,8 +581,8 @@ test("recipient delivery stream never replays across reconnect and child-process
         frameMessageID: messageIDs[index],
       })),
     );
-    assert.deepEqual(recipient.sendMessageAttempts, []);
     assert.deepEqual(sender.sendUserMessageAttempts, []);
+    assert.deepEqual(sender.sendMessageAttempts, []);
     assert.deepEqual(sender.sendMessageAttempts, []);
 
     const firstEvents = first.relay.output.lines.map((line) => JSON.parse(line) as Record<string, unknown>);

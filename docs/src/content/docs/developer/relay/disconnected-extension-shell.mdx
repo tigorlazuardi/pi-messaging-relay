@@ -130,7 +130,7 @@ Authentication establishes a live session identity. One retained-socket owner co
 
 ## Fake Pi host seam
 
-The focused Node test loads the real extension factory behind a strict fake Pi host. The fake records command and tool registrations, notifications, hidden custom session entries, `sendMessage` attempts, and `sendUserMessage` attempts. It exposes only controlled session-entry reads plus an idle/busy predicate; unknown Pi or context access fails the test, so model registry and other live capabilities cannot be consulted silently.
+The focused Node test loads the real extension factory behind a strict fake Pi host. The fake records command and tool registrations, notifications, hidden custom session entries, `sendMessage` attempts, `sendUserMessage` attempts, and registered message renderers. It exposes only controlled session-entry reads plus an idle/busy predicate; unknown Pi or context access fails the test, so model registry and other live capabilities cannot be consulted silently.
 
 Handlers execute directly through the recorded registrations. The acceptance assertions cover:
 

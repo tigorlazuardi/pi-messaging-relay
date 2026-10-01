@@ -67,11 +67,12 @@ async function stop(child: ChildProcessWithoutNullStreams): Promise<void> {
 async function waitForAttempt(host: FakePiHost, count: number): Promise<void> {
   await within(new Promise<void>((resolve) => {
     const check = () => {
-      if (host.sendUserMessageAttempts.length >= count) resolve();
+      const total = host.sendUserMessageAttempts.length + host.sendMessageAttempts.length;
+      if (total >= count) resolve();
       else setTimeout(check, 1);
     };
     check();
-  }), "recipient sendUserMessage attempt");
+  }), "recipient inbound injection attempt");
 }
 
 test("agent_send crosses real relay and two real extensions before settling received", { timeout: 60_000, concurrency: false }, async () => {
@@ -217,11 +218,24 @@ test("agent_send crosses real relay and two real extensions before settling rece
       body: atBodyLimit,
     }), "sending exact body limit") as ToolResult;
     assert.equal(atLimitResult.details.status, "received");
-    assert.equal(recipient.sendUserMessageAttempts.length, 1);
-    assert.equal(String(recipient.sendUserMessageAttempts[0][0]).endsWith(atBodyLimit), true);
+    assert.equal(recipient.sendMessageAttempts.length, 1);
+    const cardMessage = recipient.sendMessageAttempts[0]?.[0] as {
+      customType: string;
+      content: string;
+      display: boolean;
+      details: { from: string; messageID: string; bodyText: string };
+    };
+    assert.equal(cardMessage.customType, "pi-messaging-relay-message-v1");
+    assert.equal(cardMessage.content.endsWith(atBodyLimit), true);
+    assert.equal(cardMessage.display, true);
+    assert.deepEqual(cardMessage.details, {
+      from: String(senderAuth.address).split("#")[0],
+      messageID: atLimitResult.details.message_id,
+      bodyText: atBodyLimit,
+    });
     await nextEvent(output, "send_settled", (event) => event.message_id === atLimitResult.details.message_id);
 
-    const attemptsAtBoundary = recipient.sendUserMessageAttempts.length;
+    const attemptsAtBoundary = recipient.sendMessageAttempts.length;
     await assert.rejects(
       sender.executeTool("agent_send", { to: recipientAddress, body: atBodyLimit + "x" }),
       (error: unknown) => error instanceof Error &&
@@ -231,7 +245,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
         !error.message.includes(bodyBoundaryMarker),
     );
     await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(recipient.sendUserMessageAttempts.length, attemptsAtBoundary);
+    assert.equal(recipient.sendMessageAttempts.length, attemptsAtBoundary);
     assert.equal(extensionLogs.some((line) => line.includes(bodyBoundaryMarker)), false);
     assert.equal(output.lines.some((line) => line.includes(bodyBoundaryMarker)), false);
     assert.equal(extensionLogs.some((line) => line.includes('"reason":"body_too_large"')), true);
@@ -240,7 +254,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
       "listing peers after local body denial",
     ) as { details: { peers: Array<{ address: string }> } };
     assert.deepEqual(rosterAfterBodyDenial.details, { peers: [{ address: recipientAddress }] });
-    recipient.sendUserMessageAttempts.length = 0;
+    recipient.sendMessageAttempts.length = 0;
 
     const objectMarker = "local-object-body-crosses-canonically";
     const messageIDs: string[] = [];
@@ -283,12 +297,23 @@ test("agent_send crosses real relay and two real extensions before settling rece
       const result = await within(resultPromise, "sender received result") as ToolResult;
       const rendered = `[pi-messaging-relay] message from ${JSON.stringify(String(senderAuth.address))} ` +
         `(id=${result.details.message_id}${delivery.re === undefined ? "" : `, re=${delivery.re}`}):\n${delivery.renderedBody}`;
+      const delivered = recipient.sendMessageAttempts[index] as [
+        { customType: string; content: string; details: { from: string; bodyText: string; re?: string } },
+        Record<string, unknown>,
+      ];
+      assert.equal(delivered[0].customType, "pi-messaging-relay-message-v1");
+      assert.equal(delivered[0].content, rendered);
+      assert.equal(delivered[0].details.bodyText, delivery.renderedBody);
+      assert.equal(delivered[0].details.from, String(senderAuth.address).split("#")[0]);
+      if (delivery.re === undefined) assert.equal("re" in delivered[0].details, false);
+      else assert.equal(delivered[0].details.re, delivery.re);
       assert.deepEqual(
-        recipient.sendUserMessageAttempts[index],
+        delivered[1],
         delivery.idle && !delivery.throwFromIdleCheck
-          ? [rendered]
-          : [rendered, { deliverAs: "followUp" }],
+          ? { triggerTurn: true }
+          : { deliverAs: "followUp" },
       );
+      assert.equal(recipient.sendUserMessageAttempts.length, 0, "card injection must not leak into user-message seam");
       assert.equal(rendered.includes(`id=${result.details.message_id}`), true);
       assert.deepEqual(Object.keys(result.details).sort(), ["message_id", "status"]);
       assert.match(result.details.message_id, UUID_V7);
@@ -310,9 +335,8 @@ test("agent_send crosses real relay and two real extensions before settling rece
 
     assert.equal(new Set(messageIDs).size, deliveries.length);
     assert.equal(new Set(deliveryIDs).size, deliveries.length);
-    assert.deepEqual(recipient.sendMessageAttempts, []);
     assert.deepEqual(sender.sendMessageAttempts, []);
-    assert.equal(JSON.stringify(recipient.sendUserMessageAttempts).includes("steer"), false);
+    assert.equal(JSON.stringify(recipient.sendMessageAttempts).includes("steer"), false);
     const stringBodies = deliveries.filter((delivery) => typeof delivery.body === "string")
       .map((delivery) => delivery.body as string);
     assert.equal(stringBodies.some((body) =>
