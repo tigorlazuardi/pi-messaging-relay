@@ -3,8 +3,8 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
-	"time"
 )
 
 func openTestStateDirectory(t *testing.T, path string) *stateDirectory {
@@ -24,41 +24,14 @@ func openTestStateDirectory(t *testing.T, path string) *stateDirectory {
 	return state
 }
 
-func newTestPairingService(
-	t *testing.T,
-	statePath string,
-	codeFilePath string,
-	logger *eventLogger,
-	reportFatal func(error),
-) (*pairingService, error) {
+// writeTestSecretFile installs one operator-owned secret child inside the state
+// directory with the guarded 0600 form.
+func writeTestSecretFile(t *testing.T, statePath, name, content string) {
 	t.Helper()
-	return newPairingService(openTestStateDirectory(t, statePath), codeFilePath, logger, reportFatal)
-}
-
-func newTestPairingServiceWithClock(
-	t *testing.T,
-	statePath string,
-	codeFilePath string,
-	logger *eventLogger,
-	reportFatal func(error),
-	now func() time.Time,
-) (*pairingService, error) {
-	t.Helper()
-	return newPairingServiceWithClock(
-		openTestStateDirectory(t, statePath),
-		codeFilePath,
-		logger,
-		reportFatal,
-		now,
-	)
-}
-
-func loadTestAllowlist(t *testing.T, statePath string) (allowlist, error) {
-	t.Helper()
-	return loadAllowlist(openTestStateDirectory(t, statePath))
-}
-
-func persistTestAllowlist(t *testing.T, statePath string, value allowlist) error {
-	t.Helper()
-	return persistAllowlist(openTestStateDirectory(t, statePath), value)
+	if err := os.WriteFile(filepath.Join(statePath, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("write secret fixture: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(statePath, name), 0o600); err != nil {
+		t.Fatalf("secure secret fixture: %v", err)
+	}
 }

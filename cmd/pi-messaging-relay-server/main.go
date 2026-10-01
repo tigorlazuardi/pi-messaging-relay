@@ -18,42 +18,36 @@ import (
 )
 
 const (
-	defaultListenAddress = "127.0.0.1:0"
-	shutdownTimeout      = 5 * time.Second
-	pairingWriteTimeout  = 2 * time.Second
-	eventWriteTimeout    = 1 * time.Second
-	redacted             = "<redacted>"
+	defaultListenAddress     = "127.0.0.1:0"
+	shutdownTimeout          = 5 * time.Second
+	httpResponseWriteTimeout = 2 * time.Second
+	eventWriteTimeout        = 1 * time.Second
+	redacted                 = "<redacted>"
 )
 
 type logEvent struct {
-	Level           string `json:"level"`
-	Event           string `json:"event"`
-	Address         string `json:"address,omitempty"`
-	StateDir        string `json:"state_dir,omitempty"`
-	Result          string `json:"result,omitempty"`
-	Reason          string `json:"reason,omitempty"`
-	Code            string `json:"code,omitempty"`
-	Type            string `json:"type,omitempty"`
-	RequestID       string `json:"request_id,omitempty"`
-	MessageID       string `json:"message_id,omitempty"`
-	DeliveryID      string `json:"delivery_id,omitempty"`
-	SenderRoute     string `json:"sender_route,omitempty"`
-	RecipientRoute  string `json:"recipient_route,omitempty"`
-	Status          string `json:"status,omitempty"`
-	Dedupe          string `json:"dedupe,omitempty"`
-	Body            string `json:"body,omitempty"`
-	PairingCode     string `json:"pairing_code,omitempty"`
-	PrivateKey      string `json:"private_key,omitempty"`
-	ClientPublicKey string `json:"client_public_key,omitempty"`
-	ClientID        string `json:"client_id,omitempty"`
-	RouteID         string `json:"route_id,omitempty"`
-	Hostname        string `json:"hostname,omitempty"`
-	CWD             string `json:"cwd,omitempty"`
-	Nonce           string `json:"nonce,omitempty"`
-	Signature       string `json:"signature,omitempty"`
-	ExpiresAt       string `json:"expires_at,omitempty"`
-	LatencyMS       *int64 `json:"latency_ms,omitempty"`
-	Count           *int   `json:"count,omitempty"`
+	Level          string `json:"level"`
+	Event          string `json:"event"`
+	Address        string `json:"address,omitempty"`
+	StateDir       string `json:"state_dir,omitempty"`
+	Result         string `json:"result,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	Code           string `json:"code,omitempty"`
+	Type           string `json:"type,omitempty"`
+	Auth           string `json:"auth,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	MessageID      string `json:"message_id,omitempty"`
+	DeliveryID     string `json:"delivery_id,omitempty"`
+	SenderRoute    string `json:"sender_route,omitempty"`
+	RecipientRoute string `json:"recipient_route,omitempty"`
+	Status         string `json:"status,omitempty"`
+	Dedupe         string `json:"dedupe,omitempty"`
+	Body           string `json:"body,omitempty"`
+	RouteID        string `json:"route_id,omitempty"`
+	Hostname       string `json:"hostname,omitempty"`
+	CWD            string `json:"cwd,omitempty"`
+	LatencyMS      *int64 `json:"latency_ms,omitempty"`
+	Count          *int   `json:"count,omitempty"`
 }
 
 type eventWriteRequest struct {
@@ -201,7 +195,7 @@ func runWithContext(
 	flags.SetOutput(io.Discard)
 	listenAddress := flags.String("listen", defaultListenAddress, "loopback IP and port to listen on")
 	configuredStateDir := flags.String("state-dir", "", "durable state directory; empty uses temporary process state")
-	pairingCodeFile := flags.String("pairing-code-file", "", "operator-only direct child of state-dir to create with the startup pairing code")
+	secretFile := flags.String("secret-file", "", "operator-owned direct child of state-dir holding the shared secret; empty disables upgrade authentication")
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
@@ -235,15 +229,16 @@ func runWithContext(
 		}
 	}()
 	runtimeFailures := newFatalRuntimeReporter()
-	pairing, err := newPairingService(state, *pairingCodeFile, logger, runtimeFailures.report)
+	// The secret loads once, before any listener exists; a configured but broken
+	// secret file fails startup before server_ready and never degrades to auth-off.
+	secret, err := loadServerSecret(state, *secretFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("load server secret: %w", err)
 	}
-	defer func() {
-		if err := pairing.closeCodeChannel(); err != nil {
-			runErr = errors.Join(runErr, err)
-		}
-	}()
+	authMode := authModeOff
+	if secret != "" {
+		authMode = authModeSecret
+	}
 	connections := newSessionConnectionRegistry()
 	connectionsClosed := false
 	defer func() {
@@ -256,7 +251,7 @@ func runWithContext(
 			runErr = errors.Join(runErr, err)
 		}
 	}()
-	authentication := newSessionAuthService(pairing, connections, logger, runtimeFailures.report)
+	authentication := newSessionAuthService(secret, connections, logger, runtimeFailures.report)
 
 	listener, err := net.Listen("tcp", *listenAddress)
 	if err != nil {
@@ -265,7 +260,6 @@ func runWithContext(
 	defer listener.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/pair", pairing.handlePair)
 	mux.HandleFunc("/v1/connect", authentication.handleConnect)
 	server := newRelayHTTPServer(mux)
 	serveResult := make(chan error, 1)
@@ -283,23 +277,12 @@ func runWithContext(
 		Event:    "server_ready",
 		Address:  selectedAddress,
 		StateDir: state.path,
+		Auth:     authMode,
 		Result:   "ready",
 	}); err != nil {
 		_ = server.Close()
 		<-serveResult
 		return fmt.Errorf("report readiness: %w", err)
-	}
-	if err := logger.write(logEvent{
-		Level:       "info",
-		Event:       "pairing_code_created",
-		Result:      "created",
-		PairingCode: redacted,
-		PrivateKey:  redacted,
-		ExpiresAt:   pairing.expiresAt.UTC().Format(time.RFC3339Nano),
-	}); err != nil {
-		_ = server.Close()
-		<-serveResult
-		return fmt.Errorf("report pairing code creation: %w", err)
 	}
 
 	var terminalErr error
@@ -358,7 +341,7 @@ func newRelayHTTPServer(handler http.Handler) *http.Server {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      pairingWriteTimeout,
+		WriteTimeout:      httpResponseWriteTimeout,
 		IdleTimeout:       30 * time.Second,
 	}
 }

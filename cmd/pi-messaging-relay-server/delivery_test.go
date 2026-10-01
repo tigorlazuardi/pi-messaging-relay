@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,21 +48,9 @@ func TestDeliverySettlesOnlyAfterExactRecipientAcknowledgement(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_delivery", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(4)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	service.dispatchOperation = dispatcher.dispatch
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
@@ -73,7 +58,8 @@ func TestDeliverySettlesOnlyAfterExactRecipientAcknowledgement(t *testing.T) {
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, err := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if err != nil {
 			t.Fatalf("authenticate %s: %v", cwd, err)
 		}
@@ -229,27 +215,16 @@ func TestDeliveryShutdownPreservesFirstPendingOwner(t *testing.T) {
 			logger := newEventLogger(&logs)
 			t.Cleanup(func() { _ = logger.close() })
 			reporter := newFatalRuntimeReporter()
-			pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-			if err != nil {
-				t.Fatalf("create pairing service: %v", err)
-			}
-			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-			if err != nil {
-				t.Fatalf("generate installation key: %v", err)
-			}
-			encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-			pairing.mu.Lock()
-			pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_shutdown_owner", PublicKey: encodedKey}}
-			pairing.mu.Unlock()
 
 			registry := newSessionConnectionRegistryWithLimit(2)
-			service := newSessionAuthService(pairing, registry, logger, reporter.report)
+			service := newSessionAuthService("", registry, logger, reporter.report)
 			server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 			t.Cleanup(server.Close)
 			endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 			open := func(routeID, cwd string) *websocket.Conn {
 				t.Helper()
-				connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+				connection, openErr := openEstablishedTestSession(
+					nil, endpoint, "", routeID, "host", cwd)
 				if openErr != nil {
 					t.Fatalf("authenticate %s: %v", cwd, openErr)
 				}
@@ -401,21 +376,9 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 			logger := newEventLogger(&logs)
 			t.Cleanup(func() { _ = logger.close() })
 			reporter := newFatalRuntimeReporter()
-			pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-			if err != nil {
-				t.Fatalf("create pairing service: %v", err)
-			}
-			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-			if err != nil {
-				t.Fatalf("generate installation key: %v", err)
-			}
-			encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-			pairing.mu.Lock()
-			pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_oversized_offer_owner", PublicKey: encodedKey}}
-			pairing.mu.Unlock()
 
 			registry := newSessionConnectionRegistryWithLimit(2)
-			service := newSessionAuthService(pairing, registry, logger, reporter.report)
+			service := newSessionAuthService("", registry, logger, reporter.report)
 			dispatcher := newDeliveryDispatcher(registry)
 			offerInstalled := make(chan struct{})
 			releaseOffer := make(chan struct{})
@@ -448,7 +411,8 @@ func TestOversizedOfferPreservesPostInstallOwner(t *testing.T) {
 			endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 			open := func(routeID, hostname, cwd string) *websocket.Conn {
 				t.Helper()
-				connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, hostname, cwd)
+				connection, openErr := openEstablishedTestSession(
+					nil, endpoint, "", routeID, hostname, cwd)
 				if openErr != nil {
 					t.Fatalf("authenticate route %s: %v", routeID, openErr)
 				}
@@ -607,21 +571,9 @@ func TestOfflineDestinationSettlesWithoutDeliveryWorkAndKeepsSenderUsable(t *tes
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_offline", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(3)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	service.dispatchOperation = dispatcher.dispatch
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
@@ -629,7 +581,8 @@ func TestOfflineDestinationSettlesWithoutDeliveryWorkAndKeepsSenderUsable(t *tes
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, openErr := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if openErr != nil {
 			t.Fatalf("authenticate %s: %v", cwd, openErr)
 		}
@@ -739,21 +692,9 @@ func TestDeliveryACKDeadlineSettlesTimeoutOnceAndKeepsConnectionsUsable(t *testi
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_ack_timeout", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(3)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	createdDeadlines := make(chan chan time.Time, 2)
 	requestedDurations := make(chan time.Duration, 2)
@@ -776,7 +717,8 @@ func TestDeliveryACKDeadlineSettlesTimeoutOnceAndKeepsConnectionsUsable(t *testi
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, openErr := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if openErr != nil {
 			t.Fatalf("authenticate %s: %v", cwd, openErr)
 		}
@@ -956,18 +898,6 @@ func TestReadyDeadlineCannotRelabelAcknowledgementOrRecipientCancellation(t *tes
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_deadline_boundary", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	type deadlineRequest struct {
 		duration time.Duration
@@ -975,7 +905,7 @@ func TestReadyDeadlineCannotRelabelAcknowledgementOrRecipientCancellation(t *tes
 	}
 	deadlineRequests := make(chan deadlineRequest, 2)
 	registry := newSessionConnectionRegistryWithLimit(3)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	dispatcher.deadlineFactory = func(duration time.Duration) deliveryDeadline {
 		release := make(chan struct{})
@@ -991,7 +921,8 @@ func TestReadyDeadlineCannotRelabelAcknowledgementOrRecipientCancellation(t *tes
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, openErr := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if openErr != nil {
 			t.Fatalf("authenticate %s: %v", cwd, openErr)
 		}
@@ -1173,21 +1104,9 @@ func TestOfferWriteFailureAfterRecipientUnpublishesReturnsRecipientDisconnected(
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_write_failure", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(2)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	writeReached := make(chan struct{})
 	releaseWrite := make(chan struct{})
@@ -1201,7 +1120,8 @@ func TestOfferWriteFailureAfterRecipientUnpublishesReturnsRecipientDisconnected(
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, openErr := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if openErr != nil {
 			t.Fatalf("authenticate %s: %v", cwd, openErr)
 		}
@@ -1294,27 +1214,16 @@ func TestRecipientDisconnectSettlesEverySenderWithoutReplayAndKeepsSocketsUsable
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_recipient_disconnect", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(4)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, openErr := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if openErr != nil {
 			t.Fatalf("authenticate %s: %v", cwd, openErr)
 		}
@@ -1531,18 +1440,6 @@ func TestSenderDisconnectAbandonsOnlyItsPendingOfferAndPreservesRecipientAndOthe
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_sender_disconnect", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	type controlledDeadline struct {
 		expired chan time.Time
@@ -1550,7 +1447,7 @@ func TestSenderDisconnectAbandonsOnlyItsPendingOfferAndPreservesRecipientAndOthe
 	}
 	deadlines := make(chan controlledDeadline, 3)
 	registry := newSessionConnectionRegistryWithLimit(3)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	dispatcher.deadlineFactory = func(duration time.Duration) deliveryDeadline {
 		if duration != deliveryACKCeiling {
@@ -1572,7 +1469,8 @@ func TestSenderDisconnectAbandonsOnlyItsPendingOfferAndPreservesRecipientAndOthe
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	open := func(routeID, cwd string) *websocket.Conn {
 		t.Helper()
-		connection, openErr := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", cwd)
+		connection, openErr := openEstablishedTestSession(
+			nil, endpoint, "", routeID, "host", cwd)
 		if openErr != nil {
 			t.Fatalf("authenticate %s: %v", cwd, openErr)
 		}
@@ -1791,21 +1689,9 @@ func TestSelfSendDisconnectAbandonsSenderOwnedOfferWithoutRecipientResult(t *tes
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_self_disconnect", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(1)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	deadlineStopped := make(chan struct{})
 	dispatcher.deadlineFactory = func(time.Duration) deliveryDeadline {
@@ -1821,7 +1707,8 @@ func TestSelfSendDisconnectAbandonsSenderOwnedOfferWithoutRecipientResult(t *tes
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
-	connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", "/self")
+	connection, err := openEstablishedTestSession(
+		nil, endpoint, "", routeID, "host", "/self")
 	if err != nil {
 		t.Fatalf("authenticate self-send session: %v", err)
 	}
@@ -1884,21 +1771,9 @@ func TestSelfSendAcknowledgementOverlapsSenderOperationWithoutClosing(t *testing
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_self_ack", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(1)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	deadlineStopped := make(chan struct{})
 	dispatcher.deadlineFactory = func(duration time.Duration) deliveryDeadline {
@@ -1917,7 +1792,8 @@ func TestSelfSendAcknowledgementOverlapsSenderOperationWithoutClosing(t *testing
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
-	connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, routeID, "host", "/self-ack")
+	connection, err := openEstablishedTestSession(
+		nil, endpoint, "", routeID, "host", "/self-ack")
 	if err != nil {
 		t.Fatalf("authenticate self-ACK session: %v", err)
 	}
@@ -1975,21 +1851,9 @@ func TestTerminalDispatchFailureJoinsPumpBlockedInReader(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_joined_pump", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 
 	registry := newSessionConnectionRegistryWithLimit(1)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatchStarted := make(chan struct{})
 	releaseDispatch := make(chan struct{})
 	var releaseOnce sync.Once
@@ -2007,10 +1871,10 @@ func TestTerminalDispatchFailureJoinsPumpBlockedInReader(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
-	connection, err := openAuthenticatedTestSession(
+	connection, err := openEstablishedTestSession(
+		nil,
 		endpoint,
-		privateKey,
-		encodedKey,
+		"",
 		"01993ca6-6111-7aaa-8aaa-611111111111",
 		"host",
 		"/joined-pump",

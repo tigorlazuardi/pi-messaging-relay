@@ -3,12 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -152,7 +148,7 @@ func TestSessionAuthAuditFailureReportsFatalRelayRuntimeClassification(t *testin
 	terminationContext, cancelTermination := context.WithCancel(context.Background())
 	defer cancelTermination()
 	output := &failOnceAfterWriter{
-		failWrite: 3,
+		failWrite: 2,
 		failure:   auditFailure,
 		onFailure: cancelTermination,
 		events:    make(chan []byte, 4),
@@ -182,8 +178,8 @@ func TestSessionAuthAuditFailureReportsFatalRelayRuntimeClassification(t *testin
 	if ready.Event != "server_ready" {
 		t.Fatalf("first event = %q, want server_ready", ready.Event)
 	}
-	if created := readEvent(); created.Event != "pairing_code_created" {
-		t.Fatalf("second event = %q, want pairing_code_created", created.Event)
+	if ready.Auth != authModeOff {
+		t.Fatalf("server_ready auth = %q, want off", ready.Auth)
 	}
 
 	dialContext, cancelDial := context.WithTimeout(context.Background(), time.Second)
@@ -193,10 +189,6 @@ func TestSessionAuthAuditFailureReportsFatalRelayRuntimeClassification(t *testin
 		t.Fatalf("dial auth audit fixture: %v", err)
 	}
 	t.Cleanup(func() { _ = connection.CloseNow() })
-	var challenge challengeEnvelope
-	if err := wsjson.Read(dialContext, connection, &challenge); err != nil {
-		t.Fatalf("read auth challenge: %v", err)
-	}
 	if err := wsjson.Write(dialContext, connection, map[string]any{}); err != nil {
 		t.Fatalf("write invalid hello: %v", err)
 	}
@@ -212,8 +204,7 @@ func TestSessionAuthAuditFailureReportsFatalRelayRuntimeClassification(t *testin
 	failureOutput := fallback.String()
 	if !strings.Contains(failureOutput, `"event":"server_failed"`) ||
 		!strings.Contains(failureOutput, "fatal relay runtime failure") ||
-		!strings.Contains(failureOutput, "write auth_rejected session audit event") ||
-		strings.Contains(failureOutput, "fatal pairing runtime failure") {
+		!strings.Contains(failureOutput, "write auth_rejected session audit event") {
 		t.Fatalf("server failure classification is inaccurate: %s", failureOutput)
 	}
 }
@@ -364,8 +355,7 @@ func TestRelayHTTPServerReleasesNonReadingClientAtWriteDeadline(t *testing.T) {
 	tracked := &closeTrackingConn{Conn: serverSide, closed: make(chan struct{})}
 	listener := newSingleConnListener(tracked)
 	server := newRelayHTTPServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("Content-Type", "application/json")
-		_, _ = response.Write([]byte(`{"ok":true}`))
+		writeUpgradeUnauthorized(response)
 	}))
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
@@ -382,7 +372,7 @@ func TestRelayHTTPServerReleasesNonReadingClientAtWriteDeadline(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		_, err := clientSide.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+		_, err := clientSide.Write([]byte("GET /v1/connect HTTP/1.1\r\nHost: localhost\r\n\r\n"))
 		writeDone <- err
 	}()
 	select {
@@ -394,12 +384,12 @@ func TestRelayHTTPServerReleasesNonReadingClientAtWriteDeadline(t *testing.T) {
 		t.Fatal("server did not read request within one second")
 	}
 
-	deadline := time.NewTimer(pairingWriteTimeout + time.Second)
+	deadline := time.NewTimer(httpResponseWriteTimeout + time.Second)
 	defer deadline.Stop()
 	select {
 	case <-tracked.closed:
 	case <-deadline.C:
-		t.Fatalf("server retained a non-reading connection beyond write timeout %s", pairingWriteTimeout)
+		t.Fatalf("server retained a non-reading client beyond the 401 write timeout %s", httpResponseWriteTimeout)
 	}
 }
 
@@ -408,10 +398,8 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 	t.Cleanup(output.unblock)
 	logger := newEventLogger(output)
 	reporter := newFatalRuntimeReporter()
-	service, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
+	registry := newSessionConnectionRegistry()
+	service := newSessionAuthService(testSecret, registry, logger, reporter.report)
 
 	const callers = 4
 	responses := make([]*httptest.ResponseRecorder, callers)
@@ -421,9 +409,8 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 		responses[index] = httptest.NewRecorder()
 		go func(response *httptest.ResponseRecorder) {
 			defer handlers.Done()
-			request := httptest.NewRequest(http.MethodPost, "/v1/pair", strings.NewReader(`{}`))
-			request.Header.Set("Content-Type", "application/json")
-			service.handlePair(response, request)
+			request := httptest.NewRequest(http.MethodGet, "/v1/connect", nil)
+			service.handleConnect(response, request)
 		}(responses[index])
 	}
 
@@ -440,11 +427,14 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 	select {
 	case <-handlersDone:
 	case <-time.After(eventWriteTimeout + eventWriteTimeout/2):
-		t.Fatalf("malformed request handlers remained blocked beyond audit deadline %s", eventWriteTimeout)
+		t.Fatalf("unauthorized handlers remained blocked beyond audit deadline %s", eventWriteTimeout)
 	}
 	for index, response := range responses {
-		if response.Code != http.StatusBadRequest {
-			t.Fatalf("response %d status = %d, want 400", index, response.Code)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("response %d status = %d, want 401", index, response.Code)
+		}
+		if got := response.Header().Get("WWW-Authenticate"); got != "Bearer" {
+			t.Fatalf("response %d www-authenticate = %q", index, got)
 		}
 	}
 	select {
@@ -454,6 +444,9 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 		}
 	default:
 		t.Fatal("blocked audit deadline did not reach fatal runtime latch")
+	}
+	if len(registry.entries) != 0 {
+		t.Fatalf("rejected authorizations consumed tracked capacity: %d entries", len(registry.entries))
 	}
 
 	if err := logger.close(); !errors.Is(err, context.DeadlineExceeded) {
@@ -469,276 +462,6 @@ func TestBlockedRejectionAuditDoesNotRetainRequestHandlersOrLoggerWorker(t *test
 	case <-logger.done:
 	case <-time.After(eventWriteTimeout):
 		t.Fatal("released logger worker was not reaped")
-	}
-}
-
-func TestAcceptedPairBlockedAuditWinsCancellationAndPreservesIdentity(t *testing.T) {
-	stateParent := t.TempDir()
-	stateDir := filepath.Join(stateParent, "durable-state")
-	codeFile := filepath.Join(stateDir, "pairing-code")
-	terminationContext, cancelTermination := context.WithCancel(context.Background())
-	defer cancelTermination()
-	output := newBlockingAfterWriter(2, cancelTermination)
-	t.Cleanup(output.unblock)
-	var fallback bytes.Buffer
-	runDone := make(chan error, 1)
-	go func() {
-		runErr := runWithContext(
-			[]string{
-				"--listen", "127.0.0.1:0",
-				"--state-dir", stateDir,
-				"--pairing-code-file", codeFile,
-			},
-			output,
-			syncOpenedDirectory,
-			terminationContext,
-		)
-		runDone <- reportServerFailure(runErr, &fallback)
-	}()
-
-	readEvent := func() logEvent {
-		t.Helper()
-		select {
-		case data := <-output.events:
-			var event logEvent
-			if err := json.Unmarshal(data, &event); err != nil {
-				t.Fatalf("decode server event %q: %v", data, err)
-			}
-			return event
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for server startup event")
-			return logEvent{}
-		}
-	}
-	ready := readEvent()
-	if ready.Event != "server_ready" {
-		t.Fatalf("first event = %q, want server_ready", ready.Event)
-	}
-	created := readEvent()
-	if created.Event != "pairing_code_created" {
-		t.Fatalf("second event = %q, want pairing_code_created", created.Event)
-	}
-	codeData, err := os.ReadFile(codeFile)
-	if err != nil {
-		t.Fatalf("read pairing code fixture: %v", err)
-	}
-	code := strings.TrimSpace(string(codeData))
-	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate public key fixture: %v", err)
-	}
-	requestBody, err := json.Marshal(map[string]string{
-		"pairing_code":      code,
-		"client_public_key": "ed25519:" + base64.StdEncoding.EncodeToString(publicKey),
-	})
-	if err != nil {
-		t.Fatalf("encode pairing request: %v", err)
-	}
-	type pairResult struct {
-		status int
-		body   []byte
-		err    error
-	}
-	pairDone := make(chan pairResult, 1)
-	go func() {
-		response, err := http.Post(
-			"http://"+ready.Address+"/v1/pair",
-			"application/json",
-			bytes.NewReader(requestBody),
-		)
-		if err != nil {
-			pairDone <- pairResult{err: err}
-			return
-		}
-		responseBody, readErr := io.ReadAll(response.Body)
-		closeErr := response.Body.Close()
-		pairDone <- pairResult{
-			status: response.StatusCode,
-			body:   responseBody,
-			err:    errors.Join(readErr, closeErr),
-		}
-	}()
-	select {
-	case <-output.blocked:
-	case <-time.After(eventWriteTimeout):
-		t.Fatal("accepted audit writer did not enter deterministic blocked state")
-	}
-	var paired pairResult
-	select {
-	case paired = <-pairDone:
-	case <-time.After(eventWriteTimeout + pairingWriteTimeout):
-		t.Fatal("accepted handler did not settle after audit deadline")
-	}
-	if paired.err != nil {
-		t.Fatalf("submit/read accepted response: %v", paired.err)
-	}
-	if paired.status != http.StatusCreated {
-		t.Fatalf("pair status = %d, want 201; body: %s", paired.status, paired.body)
-	}
-	var accepted pairResponse
-	if err := json.Unmarshal(paired.body, &accepted); err != nil {
-		t.Fatalf("decode accepted identity: %v", err)
-	}
-
-	select {
-	case runErr := <-runDone:
-		if !errors.Is(runErr, context.DeadlineExceeded) {
-			t.Fatalf("run error = %v, want blocked audit deadline", runErr)
-		}
-	case <-time.After(shutdownTimeout + 2*eventWriteTimeout):
-		t.Fatal("server did not complete bounded fatal runtime shutdown")
-	}
-	output.unblock()
-	select {
-	case <-output.writeReturned:
-	case <-time.After(eventWriteTimeout):
-		t.Fatal("released accepted-audit writer did not return")
-	}
-
-	allowlistData, err := os.ReadFile(filepath.Join(stateDir, allowlistFilename))
-	if err != nil {
-		t.Fatalf("read durable allowlist after audit failure: %v", err)
-	}
-	var stored allowlist
-	if err := json.Unmarshal(allowlistData, &stored); err != nil {
-		t.Fatalf("decode durable allowlist: %v", err)
-	}
-	if len(stored.Clients) != 1 || stored.Clients[0].ClientID != accepted.ClientID {
-		t.Fatalf("durable identity = %+v, accepted identity = %q", stored.Clients, accepted.ClientID)
-	}
-	if !strings.Contains(fallback.String(), `"event":"server_failed"`) ||
-		!strings.Contains(fallback.String(), "write pair_accepted pairing audit event") {
-		t.Fatalf("stderr fallback lacks fatal audit context: %s", fallback.String())
-	}
-	if _, err := os.Stat(codeFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pairing code channel remains after durable acceptance: %v", err)
-	}
-	connection, err := net.DialTimeout("tcp", ready.Address, 100*time.Millisecond)
-	if err == nil {
-		_ = connection.Close()
-		t.Fatal("server still accepts connections after fatal audit failure")
-	}
-}
-
-func TestOneShotAcceptedAuditFailureCannotBeMaskedByCancellation(t *testing.T) {
-	stateParent := t.TempDir()
-	stateDir := filepath.Join(stateParent, "durable-state")
-	codeFile := filepath.Join(stateDir, "pairing-code")
-	auditFailure := errors.New("one-shot pair_accepted audit failure")
-	terminationContext, cancelTermination := context.WithCancel(context.Background())
-	defer cancelTermination()
-	output := &failOnceAfterWriter{
-		failWrite: 3,
-		failure:   auditFailure,
-		onFailure: cancelTermination,
-		events:    make(chan []byte, 4),
-	}
-	var fallback bytes.Buffer
-	runDone := make(chan error, 1)
-	go func() {
-		runErr := runWithContext(
-			[]string{
-				"--listen", "127.0.0.1:0",
-				"--state-dir", stateDir,
-				"--pairing-code-file", codeFile,
-			},
-			output,
-			syncOpenedDirectory,
-			terminationContext,
-		)
-		runDone <- reportServerFailure(runErr, &fallback)
-	}()
-
-	readEvent := func() logEvent {
-		t.Helper()
-		select {
-		case data := <-output.events:
-			var event logEvent
-			if err := json.Unmarshal(data, &event); err != nil {
-				t.Fatalf("decode server event %q: %v", data, err)
-			}
-			return event
-		case <-time.After(eventWriteTimeout):
-			t.Fatal("timed out waiting for server startup event")
-			return logEvent{}
-		}
-	}
-	ready := readEvent()
-	if ready.Event != "server_ready" {
-		t.Fatalf("first event = %q, want server_ready", ready.Event)
-	}
-	if created := readEvent(); created.Event != "pairing_code_created" {
-		t.Fatalf("second event = %q, want pairing_code_created", created.Event)
-	}
-	codeData, err := os.ReadFile(codeFile)
-	if err != nil {
-		t.Fatalf("read pairing code fixture: %v", err)
-	}
-	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate public key fixture: %v", err)
-	}
-	requestBody, err := json.Marshal(map[string]string{
-		"pairing_code":      strings.TrimSpace(string(codeData)),
-		"client_public_key": "ed25519:" + base64.StdEncoding.EncodeToString(publicKey),
-	})
-	if err != nil {
-		t.Fatalf("encode pairing request: %v", err)
-	}
-	response, err := http.Post(
-		"http://"+ready.Address+"/v1/pair",
-		"application/json",
-		bytes.NewReader(requestBody),
-	)
-	if err != nil {
-		t.Fatalf("submit pairing request: %v", err)
-	}
-	responseBody, readErr := io.ReadAll(response.Body)
-	closeErr := response.Body.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
-		t.Fatalf("read accepted response: %v", err)
-	}
-	if response.StatusCode != http.StatusCreated {
-		t.Fatalf("pair status = %d, want 201; body: %s", response.StatusCode, responseBody)
-	}
-	var accepted pairResponse
-	if err := json.Unmarshal(responseBody, &accepted); err != nil {
-		t.Fatalf("decode accepted identity: %v", err)
-	}
-
-	select {
-	case runErr := <-runDone:
-		if !errors.Is(runErr, auditFailure) {
-			t.Fatalf("cancellation-masked run error = %v, want one-shot audit failure", runErr)
-		}
-	case <-time.After(shutdownTimeout + eventWriteTimeout):
-		t.Fatal("server did not settle one-shot audit/cancellation race")
-	}
-	if !strings.Contains(fallback.String(), `"event":"server_failed"`) ||
-		!strings.Contains(fallback.String(), auditFailure.Error()) {
-		t.Fatalf("stderr fallback lacks one-shot audit failure: %s", fallback.String())
-	}
-	allowlistData, err := os.ReadFile(filepath.Join(stateDir, allowlistFilename))
-	if err != nil {
-		t.Fatalf("read durable allowlist: %v", err)
-	}
-	var stored allowlist
-	if err := json.Unmarshal(allowlistData, &stored); err != nil {
-		t.Fatalf("decode durable allowlist: %v", err)
-	}
-	if len(stored.Clients) != 1 || stored.Clients[0].ClientID != accepted.ClientID {
-		t.Fatalf("durable identity = %+v, accepted identity = %q", stored.Clients, accepted.ClientID)
-	}
-	select {
-	case data := <-output.events:
-		var event logEvent
-		if err := json.Unmarshal(data, &event); err != nil {
-			t.Fatalf("decode unexpected terminal event: %v", err)
-		}
-		if event.Event == "server_stopped" {
-			t.Fatal("one-shot audit failure was masked by successful server_stopped")
-		}
-	default:
 	}
 }
 

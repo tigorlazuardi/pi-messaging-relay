@@ -25,16 +25,8 @@ func prepareStateDirectoryWithSync(string, directorySync) (*stateDirectory, erro
 	return nil, errUnsupportedServerPlatform
 }
 
-func (state *stateDirectory) openAllowlist() (*os.File, int64, error) {
+func (state *stateDirectory) openStateChild(string) (*os.File, int64, error) {
 	return nil, 0, errUnsupportedServerPlatform
-}
-
-func (state *stateDirectory) persistAllowlistData([]byte) error {
-	return errUnsupportedServerPlatform
-}
-
-func (state *stateDirectory) writePairingCodeFile(string, string) (func() error, error) {
-	return nil, errUnsupportedServerPlatform
 }
 
 func (state *stateDirectory) removeTemporaryState() error {

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,14 +22,13 @@ import (
 const acceptanceTimeout = 10 * time.Second
 
 type processEvent struct {
-	Level       string `json:"level"`
-	Event       string `json:"event"`
-	Address     string `json:"address"`
-	StateDir    string `json:"state_dir"`
-	Result      string `json:"result"`
-	Reason      string `json:"reason"`
-	PairingCode string `json:"pairing_code"`
-	PrivateKey  string `json:"private_key"`
+	Level    string `json:"level"`
+	Event    string `json:"event"`
+	Address  string `json:"address"`
+	StateDir string `json:"state_dir"`
+	Auth     string `json:"auth"`
+	Result   string `json:"result"`
+	Reason   string `json:"reason"`
 }
 
 func TestRelayProcessLifecycle(t *testing.T) {
@@ -129,12 +130,22 @@ func assertGracefulLifecycle(t *testing.T, binary string, terminationSignal os.S
 	if ready.Level != "info" || ready.Event != "server_ready" {
 		t.Fatalf("unexpected readiness event: %+v", ready)
 	}
-	pairingCreated := readEvent(t, scanner, acceptanceTimeout)
-	if pairingCreated.Level != "info" || pairingCreated.Event != "pairing_code_created" {
-		t.Fatalf("unexpected pairing-code lifecycle event: %+v", pairingCreated)
+	if ready.Auth != "off" {
+		t.Fatalf("readiness auth mode = %q, want off for the unconfigured server", ready.Auth)
 	}
-	if pairingCreated.PairingCode != "<redacted>" || pairingCreated.PrivateKey != "<redacted>" {
-		t.Fatalf("pairing-code lifecycle event did not redact authentication fields: %+v", pairingCreated)
+	// v2 removed the pairing lifecycle: the process must not emit a pairing
+	// event, expose a pair endpoint, or persist v1 authorization state.
+	if _, err := os.Stat(filepath.Join(ready.StateDir, "allowlist.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("startup persisted removed v1 authorization state: %v", err)
+	}
+	pairResponse, pairErr := http.Post("http://"+ready.Address+"/v1/pair", "application/json", strings.NewReader("{}"))
+	if pairErr != nil {
+		t.Fatalf("probe removed pair endpoint: %v", pairErr)
+	}
+	_, _ = io.Copy(io.Discard, pairResponse.Body)
+	_ = pairResponse.Body.Close()
+	if pairResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /v1/pair status = %d, want ordinary 404", pairResponse.StatusCode)
 	}
 	host, _, err := net.SplitHostPort(ready.Address)
 	if err != nil {

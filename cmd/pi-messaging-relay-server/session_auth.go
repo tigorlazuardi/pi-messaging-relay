@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +17,7 @@ import (
 )
 
 const (
-	authDeadline          = 5 * time.Second
+	establishmentDeadline = 5 * time.Second
 	maxFrameBytes         = 512 * 1024
 	maxHelloFrameBytes    = 16 * 1024
 	maxCWDBytes           = 4096
@@ -29,18 +26,7 @@ const (
 	// ponytail: fixed to v1's 256 KiB serialized body; make configurable when another profile exists.
 	maxBodyBytes          = 262_144
 	maxSessionConnections = 1024
-	authTranscriptDomain  = "pi-messaging-relay-auth-v1\n"
 )
-
-type challengeEnvelope struct {
-	Version int              `json:"v"`
-	Type    string           `json:"type"`
-	Payload challengePayload `json:"payload"`
-}
-
-type challengePayload struct {
-	Nonce string `json:"nonce"`
-}
 
 type helloEnvelope struct {
 	Version   int
@@ -50,11 +36,9 @@ type helloEnvelope struct {
 }
 
 type helloPayload struct {
-	ClientPublicKey string
-	RouteID         string
-	Hostname        string
-	CWD             string
-	Signature       string
+	RouteID  string
+	Hostname string
+	CWD      string
 }
 
 type welcomeEnvelope struct {
@@ -84,12 +68,10 @@ type websocketErrorPayload struct {
 }
 
 type authenticatedSession struct {
-	ClientID        string
-	ClientPublicKey string
-	RouteID         string
-	Hostname        string
-	CWD             string
-	Address         string
+	RouteID  string
+	Hostname string
+	CWD      string
+	Address  string
 }
 
 type trackedSessionConnection struct {
@@ -384,7 +366,10 @@ func (registry *sessionConnectionRegistry) writeToConnection(
 }
 
 type sessionAuthService struct {
-	pairing                           *pairingService
+	// secret is the retained v2 shared secret. Empty means authentication off:
+	// every upgrade is accepted without inspecting headers. The secret itself is
+	// never logged and never leaves process memory after startup.
+	secret                            string
 	connections                       *sessionConnectionRegistry
 	logger                            *eventLogger
 	reportFatal                       func(error)
@@ -398,18 +383,18 @@ type sessionAuthService struct {
 	afterNormalResponseClaim          func(logEvent)
 	afterProtocolTerminalTransition   func()
 	beforeResponseAudit               func(logEvent)
-	authTimeout                       time.Duration
+	establishmentTimeout              time.Duration
 }
 
 func newSessionAuthService(
-	pairing *pairingService,
+	secret string,
 	connections *sessionConnectionRegistry,
 	logger *eventLogger,
 	reportFatal func(error),
 ) *sessionAuthService {
 	delivery := newDeliveryDispatcher(connections)
 	return &sessionAuthService{
-		pairing:           pairing,
+		secret:            secret,
 		connections:       connections,
 		logger:            logger,
 		reportFatal:       reportFatal,
@@ -417,12 +402,26 @@ func newSessionAuthService(
 		writeWelcome: func(ctx context.Context, connection *websocket.Conn, welcome welcomeEnvelope) error {
 			return wsjson.Write(ctx, connection, welcome)
 		},
-		authTimeout: authDeadline,
+		establishmentTimeout: establishmentDeadline,
 	}
 }
 
 func (service *sessionAuthService) handleConnect(response http.ResponseWriter, request *http.Request) {
 	started := time.Now()
+	if service.secret != "" && !service.authorizeUpgrade(request.Header.Get("Authorization")) {
+		// One closed rejection spelling covers missing, malformed, over-limit, and
+		// wrong credentials; a rejected request consumes no tracked capacity slot.
+		// The wire rejection is unconditional; an audit failure reaches the fatal owner.
+		service.writeAudit(logEvent{
+			Level:     "warn",
+			Event:     "auth_rejected",
+			Result:    "rejected",
+			Reason:    "not_authorized",
+			LatencyMS: latencySince(started),
+		})
+		writeUpgradeUnauthorized(response)
+		return
+	}
 	entry, reserved := service.connections.reserve()
 	if !reserved {
 		http.Error(response, "relay session capacity reached", http.StatusServiceUnavailable)
@@ -448,53 +447,23 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		return
 	}
 	connection.SetReadLimit(maxFrameBytes)
-	authContext, cancelAuth := context.WithTimeout(context.Background(), service.authTimeout)
-	defer cancelAuth()
-	nonce, err := randomToken(32)
-	if err != nil {
-		service.reportFatal(fmt.Errorf("generate authentication nonce: %w", err))
-		return
-	}
-	if err := wsjson.Write(authContext, connection, challengeEnvelope{
-		Version: 1,
-		Type:    "challenge",
-		Payload: challengePayload{Nonce: nonce},
-	}); err != nil {
-		service.logRejected("challenge_failed", started, "", "", "")
-		return
-	}
+	// Hello read, validation, and welcome write share one bounded establishment
+	// deadline; the hello is unsigned display metadata, not a credential.
+	establishContext, cancelEstablish := context.WithTimeout(context.Background(), service.establishmentTimeout)
+	defer cancelEstablish()
 
-	hello, err := readHello(authContext, connection)
+	hello, err := readHello(establishContext, connection)
 	if err != nil {
-		service.logRejected("invalid_hello", started, "", "", "")
+		service.logRejected("invalid_hello", started, "", "")
 		_ = connection.CloseNow()
 		return
 	}
-	clientID, publicKey, authorized := service.pairing.authorizedKey(hello.Payload.ClientPublicKey)
-	if !authorized || !verifyHelloSignature(publicKey, nonce, hello) {
-		if !service.logRejected(
-			"not_authorized",
-			started,
-			hello.Payload.ClientPublicKey,
-			hello.Payload.RouteID,
-			hello.RequestID,
-		) {
-			_ = connection.CloseNow()
-			return
-		}
-		_ = writeNotAuthorized(authContext, connection, hello.RequestID)
-		_ = connection.Close(websocket.StatusPolicyViolation, "not authorized")
-		return
-	}
-
 	address := hello.Payload.CWD + "@" + hello.Payload.Hostname + "#" + hello.Payload.RouteID
 	session := &authenticatedSession{
-		ClientID:        clientID,
-		ClientPublicKey: hello.Payload.ClientPublicKey,
-		RouteID:         hello.Payload.RouteID,
-		Hostname:        hello.Payload.Hostname,
-		CWD:             hello.Payload.CWD,
-		Address:         address,
+		RouteID:  hello.Payload.RouteID,
+		Hostname: hello.Payload.Hostname,
+		CWD:      hello.Payload.CWD,
+		Address:  address,
 	}
 	switch service.connections.reserveAuthentication(entry, session) {
 	case sessionRegistryClosing:
@@ -504,7 +473,6 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		service.logRejected(
 			"route_conflict",
 			started,
-			hello.Payload.ClientPublicKey,
 			hello.Payload.RouteID,
 			hello.RequestID,
 		)
@@ -512,7 +480,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		return
 	case sessionAuthenticated:
 	}
-	if err := service.writeWelcome(authContext, connection, welcomeEnvelope{
+	if err := service.writeWelcome(establishContext, connection, welcomeEnvelope{
 		Version:   1,
 		Type:      "welcome",
 		RequestID: hello.RequestID,
@@ -525,7 +493,6 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		service.logRejected(
 			"welcome_failed",
 			started,
-			hello.Payload.ClientPublicKey,
 			hello.Payload.RouteID,
 			hello.RequestID,
 		)
@@ -536,22 +503,17 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		return
 	}
 	service.writeAudit(logEvent{
-		Level:           "info",
-		Event:           "auth_accepted",
-		Result:          "accepted",
-		RequestID:       hello.RequestID,
-		Address:         address,
-		ClientPublicKey: hello.Payload.ClientPublicKey,
-		ClientID:        clientID,
-		RouteID:         hello.Payload.RouteID,
-		Hostname:        hello.Payload.Hostname,
-		CWD:             hello.Payload.CWD,
-		Nonce:           redacted,
-		Signature:       redacted,
-		PrivateKey:      redacted,
-		LatencyMS:       latencySince(started),
+		Level:     "info",
+		Event:     "auth_accepted",
+		Result:    "accepted",
+		RequestID: hello.RequestID,
+		Address:   address,
+		RouteID:   hello.Payload.RouteID,
+		Hostname:  hello.Payload.Hostname,
+		CWD:       hello.Payload.CWD,
+		LatencyMS: latencySince(started),
 	})
-	cancelAuth()
+	cancelEstablish()
 
 	var unavailableOnce sync.Once
 	markUnavailable := func() {
@@ -560,35 +522,42 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	service.serveAuthenticated(connection, session, markUnavailable)
 	markUnavailable()
 	service.writeAudit(logEvent{
-		Level:           "info",
-		Event:           "session_disconnected",
-		Result:          "disconnected",
-		Address:         address,
-		ClientPublicKey: hello.Payload.ClientPublicKey,
-		ClientID:        clientID,
-		RouteID:         hello.Payload.RouteID,
+		Level:   "info",
+		Event:   "session_disconnected",
+		Result:  "disconnected",
+		Address: address,
+		RouteID: hello.Payload.RouteID,
 	})
+}
+
+// authorizeUpgrade validates one Authorization header value against the retained
+// secret. The scheme token compares case-insensitively; the submitted secret bytes
+// compare exactly and in constant time, so only the submitted length is observable.
+func (service *sessionAuthService) authorizeUpgrade(header string) bool {
+	if len(header) > maxAuthorizationHeaderValue {
+		return false
+	}
+	scheme, submitted, found := strings.Cut(header, " ")
+	if !found || !strings.EqualFold(scheme, "bearer") {
+		return false
+	}
+	return equalSecret(service.secret, submitted)
 }
 
 func (service *sessionAuthService) logRejected(
 	reason string,
 	started time.Time,
-	publicKey string,
 	routeID string,
 	requestID string,
 ) bool {
 	return service.writeAudit(logEvent{
-		Level:           "warn",
-		Event:           "auth_rejected",
-		Result:          "rejected",
-		Reason:          reason,
-		RequestID:       requestID,
-		ClientPublicKey: publicKey,
-		RouteID:         routeID,
-		Nonce:           redacted,
-		Signature:       redacted,
-		PrivateKey:      redacted,
-		LatencyMS:       latencySince(started),
+		Level:     "warn",
+		Event:     "auth_rejected",
+		Result:    "rejected",
+		Reason:    reason,
+		RequestID: requestID,
+		RouteID:   routeID,
+		LatencyMS: latencySince(started),
 	})
 }
 
@@ -600,17 +569,11 @@ func (service *sessionAuthService) writeAudit(event logEvent) bool {
 	return true
 }
 
-func writeNotAuthorized(ctx context.Context, connection *websocket.Conn, requestID string) error {
-	return wsjson.Write(ctx, connection, websocketErrorEnvelope{
-		Version:   1,
-		Type:      "error",
-		RequestID: requestID,
-		Payload: websocketErrorPayload{
-			Code:    "not_authorized",
-			Message: "Client key is not authorized",
-			Close:   true,
-		},
-	})
+func writeUpgradeUnauthorized(response http.ResponseWriter) {
+	response.Header().Set("Content-Type", "application/json")
+	response.Header().Set("WWW-Authenticate", "Bearer")
+	response.WriteHeader(http.StatusUnauthorized)
+	_, _ = io.WriteString(response, `{"error":"not_authorized","message":"Authentication is required"}`)
 }
 
 func readHello(ctx context.Context, connection *websocket.Conn) (helloEnvelope, error) {
@@ -687,7 +650,7 @@ func decodeHelloPayload(decoder *json.Decoder) (helloPayload, error) {
 		return helloPayload{}, errors.New("hello payload must be an object")
 	}
 	var payload helloPayload
-	seen := make(map[string]struct{}, 5)
+	seen := make(map[string]struct{}, 3)
 	for decoder.More() {
 		name, err := nextObjectField(decoder, seen)
 		if err != nil {
@@ -695,16 +658,12 @@ func decodeHelloPayload(decoder *json.Decoder) (helloPayload, error) {
 		}
 		var target *string
 		switch name {
-		case "client_public_key":
-			target = &payload.ClientPublicKey
 		case "route_id":
 			target = &payload.RouteID
 		case "hostname":
 			target = &payload.Hostname
 		case "cwd":
 			target = &payload.CWD
-		case "signature":
-			target = &payload.Signature
 		default:
 			return helloPayload{}, fmt.Errorf("unknown hello payload field %q", name)
 		}
@@ -715,7 +674,7 @@ func decodeHelloPayload(decoder *json.Decoder) (helloPayload, error) {
 	if err := closeJSONObject(decoder); err != nil {
 		return helloPayload{}, err
 	}
-	if len(seen) != 5 {
+	if len(seen) != 3 {
 		return helloPayload{}, errors.New("hello payload fields are missing")
 	}
 	return payload, nil
@@ -746,20 +705,12 @@ func closeJSONObject(decoder *json.Decoder) error {
 }
 
 func validateHelloPayload(payload helloPayload) error {
-	if err := validateEd25519PublicKey(payload.ClientPublicKey); err != nil {
-		return errors.New("hello public key is invalid")
-	}
 	if !isUUIDv7(payload.RouteID) {
 		return errors.New("route_id must be UUIDv7")
 	}
 	if !validDisplayMetadata(payload.Hostname, maxHostnameBytes) ||
 		!validDisplayMetadata(payload.CWD, maxCWDBytes) {
 		return errors.New("route display metadata is invalid")
-	}
-	signature, err := base64.StdEncoding.DecodeString(payload.Signature)
-	if err != nil || len(signature) != ed25519.SignatureSize ||
-		base64.StdEncoding.EncodeToString(signature) != payload.Signature {
-		return errors.New("hello signature is invalid")
 	}
 	return nil
 }
@@ -783,42 +734,7 @@ func isUUIDv7(value string) bool {
 	return strings.ContainsRune("89ab", rune(value[19]))
 }
 
-func verifyHelloSignature(publicKey ed25519.PublicKey, nonce string, hello helloEnvelope) bool {
-	signature, err := base64.StdEncoding.DecodeString(hello.Payload.Signature)
-	if err != nil {
-		return false
-	}
-	return ed25519.Verify(publicKey, helloTranscript(nonce, hello), signature)
-}
-
-func helloTranscript(nonce string, hello helloEnvelope) []byte {
-	var transcript strings.Builder
-	transcript.WriteString(authTranscriptDomain)
-	appendTranscriptField(&transcript, "nonce", nonce)
-	appendTranscriptField(&transcript, "request_id", hello.RequestID)
-	appendTranscriptField(&transcript, "client_public_key", hello.Payload.ClientPublicKey)
-	appendTranscriptField(&transcript, "route_id", hello.Payload.RouteID)
-	appendTranscriptField(&transcript, "hostname", hello.Payload.Hostname)
-	appendTranscriptField(&transcript, "cwd", hello.Payload.CWD)
-	return []byte(transcript.String())
-}
-
-func appendTranscriptField(transcript *strings.Builder, name, value string) {
-	transcript.WriteString(name)
-	transcript.WriteByte(':')
-	transcript.WriteString(strconv.Itoa(len([]byte(value))))
-	transcript.WriteByte(':')
-	transcript.WriteString(value)
-	transcript.WriteByte('\n')
-}
-
-func decodeEd25519PublicKey(encoded string) (ed25519.PublicKey, error) {
-	if err := validateEd25519PublicKey(encoded); err != nil {
-		return nil, err
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(encoded, "ed25519:"))
-	if err != nil {
-		return nil, err
-	}
-	return ed25519.PublicKey(decoded), nil
+func latencySince(started time.Time) *int64 {
+	latency := time.Since(started).Milliseconds()
+	return &latency
 }

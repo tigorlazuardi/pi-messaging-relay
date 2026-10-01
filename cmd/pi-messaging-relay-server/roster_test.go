@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -34,9 +32,9 @@ func TestAuthenticatedAddressSnapshotIsLiveAddressOnlyAndOmitsCaller(t *testing.
 	}
 	caller.connection = nil
 	peer.connection = nil
-	caller.session = &authenticatedSession{Address: "caller", ClientID: "secret-caller", CWD: "/private"}
+	caller.session = &authenticatedSession{Address: "caller", CWD: "/private"}
 	caller.visible = true
-	peer.session = &authenticatedSession{Address: "peer", ClientID: "secret-peer", Hostname: "private-host"}
+	peer.session = &authenticatedSession{Address: "peer", Hostname: "private-host"}
 	peer.visible = true
 
 	got := registry.authenticatedAddressSnapshot(caller.session)
@@ -141,21 +139,9 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 			t.Cleanup(func() { _ = logger.close() })
 
 			reporter := newFatalRuntimeReporter()
-			pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-			if err != nil {
-				t.Fatalf("create pairing service: %v", err)
-			}
-			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-			if err != nil {
-				t.Fatalf("generate installation key: %v", err)
-			}
-			encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-			pairing.mu.Lock()
-			pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_roster_visibility", PublicKey: encodedKey}}
-			pairing.mu.Unlock()
 
 			registry := newSessionConnectionRegistryWithLimit(4)
-			service := newSessionAuthService(pairing, registry, logger, reporter.report)
+			service := newSessionAuthService("", registry, logger, reporter.report)
 			welcomeStarted := make(chan struct{})
 			releaseWelcome := make(chan struct{})
 			service.writeWelcome = func(ctx context.Context, connection *websocket.Conn, welcome welcomeEnvelope) error {
@@ -177,7 +163,7 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 			t.Cleanup(server.Close)
 			endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 
-			caller, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, callerRouteID, "host", "/caller")
+			caller, err := openEstablishedTestSession(nil, endpoint, "", callerRouteID, "host", "/caller")
 			if err != nil {
 				t.Fatalf("authenticate roster caller: %v", err)
 			}
@@ -199,10 +185,10 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 			}
 			candidateResult := make(chan authenticationResult, 1)
 			go func() {
-				connection, err := openAuthenticatedTestSession(
+				connection, err := openEstablishedTestSession(
+					nil,
 					endpoint,
-					privateKey,
-					encodedKey,
+					"",
 					candidateRouteID,
 					"host",
 					"/candidate",
@@ -211,10 +197,10 @@ func TestRosterPublishesOnlyAfterSuccessfulWelcome(t *testing.T) {
 			}()
 			await("held candidate welcome", welcomeStarted)
 
-			collision, err := openAuthenticatedTestSession(
+			collision, err := openEstablishedTestSession(
+				nil,
 				endpoint,
-				privateKey,
-				encodedKey,
+				"",
 				candidateRouteID,
 				"other-host",
 				"/other-candidate",

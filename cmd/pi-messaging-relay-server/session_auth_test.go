@@ -3,12 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,7 +20,9 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
-func TestSessionAuthenticationDeadlineClosesSilentPeer(t *testing.T) {
+const testSecret = "unit-test-shared-secret"
+
+func TestSessionEstablishmentDeadlineClosesSilentPeer(t *testing.T) {
 	var logs bytes.Buffer
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() {
@@ -30,13 +31,9 @@ func TestSessionAuthenticationDeadlineClosesSilentPeer(t *testing.T) {
 		}
 	})
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
 	registry := newSessionConnectionRegistry()
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
-	service.authTimeout = 50 * time.Millisecond
+	service := newSessionAuthService("", registry, logger, reporter.report)
+	service.establishmentTimeout = 50 * time.Millisecond
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 
@@ -51,14 +48,10 @@ func TestSessionAuthenticationDeadlineClosesSilentPeer(t *testing.T) {
 		t.Fatalf("dial test WebSocket: %v", err)
 	}
 	t.Cleanup(func() { _ = connection.CloseNow() })
-	var challenge challengeEnvelope
-	if err := wsjson.Read(dialContext, connection, &challenge); err != nil {
-		t.Fatalf("read challenge: %v", err)
-	}
 	started := time.Now()
 	_, _, err = connection.Reader(dialContext)
 	if err == nil {
-		t.Fatal("silent peer remained open after authentication deadline")
+		t.Fatal("silent peer remained open after establishment deadline")
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("silent peer retained beyond bounded test deadline: %s", elapsed)
@@ -69,8 +62,7 @@ func TestSessionAuthenticationDeadlineClosesSilentPeer(t *testing.T) {
 		t.Fatalf("settle timed-out session: %v", err)
 	}
 	if !strings.Contains(logs.String(), `"event":"auth_rejected"`) ||
-		!strings.Contains(logs.String(), `"reason":"invalid_hello"`) ||
-		!strings.Contains(logs.String(), `"nonce":"<redacted>"`) {
+		!strings.Contains(logs.String(), `"reason":"invalid_hello"`) {
 		t.Fatalf("deadline rejection log is incomplete: %s", logs.String())
 	}
 	if strings.Contains(logs.String(), `"request_id"`) {
@@ -113,27 +105,19 @@ func TestSessionCapacityRejectsBeforeUpgradeAndShutdownOwnsReservedPeer(t *testi
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
 	registry := newSessionConnectionRegistryWithLimit(1)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	first, _, err := websocket.Dial(ctx, endpoint, nil)
+	first, err := openEstablishedTestSession(ctx, endpoint, "", "01993ca1-1111-7aaa-8aaa-111111111111", "host", "/first")
 	if err != nil {
-		t.Fatalf("dial capacity-owning connection: %v", err)
+		t.Fatalf("open capacity-owning connection: %v", err)
 	}
 	t.Cleanup(func() { _ = first.CloseNow() })
-	var challenge challengeEnvelope
-	if err := wsjson.Read(ctx, first, &challenge); err != nil {
-		t.Fatalf("read first challenge: %v", err)
-	}
 
 	excess, response, err := websocket.Dial(ctx, endpoint, nil)
 	if excess != nil {
@@ -159,40 +143,224 @@ func TestSessionCapacityRejectsBeforeUpgradeAndShutdownOwnsReservedPeer(t *testi
 	}
 }
 
-func TestConcurrentDuplicateActiveRouteFailsClosedForSameAndDifferentInstallationKeys(t *testing.T) {
+func TestUpgradeAuthorizationUsesOneClosedRejectionSpelling(t *testing.T) {
 	var logs bytes.Buffer
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicOne, privateOne, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate first installation key: %v", err)
-	}
-	publicTwo, privateTwo, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate second installation key: %v", err)
-	}
-	encodedOne := "ed25519:" + base64.StdEncoding.EncodeToString(publicOne)
-	encodedTwo := "ed25519:" + base64.StdEncoding.EncodeToString(publicTwo)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{
-		{ClientID: "cli_first", PublicKey: encodedOne},
-		{ClientID: "cli_second", PublicKey: encodedTwo},
-	}
-	pairing.mu.Unlock()
+	registry := newSessionConnectionRegistry()
+	service := newSessionAuthService(testSecret, registry, logger, reporter.report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
 
+	longWrongValue := strings.Repeat("x", maxAuthorizationHeaderValue+1)
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{name: "missing header", header: ""},
+		{name: "non-bearer scheme", header: "Basic dXNlcjpwYXNz"},
+		{name: "scheme only", header: "Bearer"},
+		{name: "wrong secret", header: "Bearer " + testSecret + "-wrong"},
+		{name: "case-sensitive secret bytes", header: "Bearer " + strings.ToUpper(testSecret)},
+		{name: "over-limit value", header: "Bearer " + longWrongValue},
+		{name: "over-limit value without scheme", header: longWrongValue},
+	}
+	var referenceStatus int
+	var referenceBody string
+	for index, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Fatalf("build upgrade request: %v", err)
+			}
+			if testCase.header != "" {
+				request.Header.Set("Authorization", testCase.header)
+			}
+			request.Header.Set("Upgrade", "websocket")
+			request.Header.Set("Connection", "Upgrade")
+			request.Header.Set("Sec-WebSocket-Version", "13")
+			request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+			response, err := server.Client().Do(request)
+			if err != nil {
+				t.Fatalf("submit upgrade request: %v", err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if err := errors.Join(readErr, closeErr); err != nil {
+				t.Fatalf("read rejection: %v", err)
+			}
+			if response.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", response.StatusCode)
+			}
+			if got := response.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("content type = %q, want application/json", got)
+			}
+			if got := response.Header.Get("WWW-Authenticate"); got != "Bearer" {
+				t.Fatalf("www-authenticate = %q, want Bearer", got)
+			}
+			if index == 0 {
+				referenceStatus = response.StatusCode
+				referenceBody = string(body)
+				if referenceBody != `{"error":"not_authorized","message":"Authentication is required"}` {
+					t.Fatalf("rejection body = %q", referenceBody)
+				}
+				return
+			}
+			if response.StatusCode != referenceStatus || string(body) != referenceBody {
+				t.Fatalf("rejection differs from closed spelling: status %d body %q", response.StatusCode, body)
+			}
+		})
+	}
+	if count := strings.Count(logs.String(), `"event":"auth_rejected"`); count != len(cases) {
+		t.Fatalf("auth_rejected count = %d, want %d; logs: %s", count, len(cases), logs.String())
+	}
+	if strings.Contains(logs.String(), testSecret) {
+		t.Fatalf("rejection log exposed the secret: %s", logs.String())
+	}
+	settleContext, cancelSettle := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSettle()
+	if err := registry.closeAndWait(settleContext); err != nil {
+		t.Fatalf("settle authorization test registry: %v", err)
+	}
+}
+
+func TestUpgradeAuthorizationAcceptsCaseInsensitiveBearerScheme(t *testing.T) {
+	var logs bytes.Buffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	registry := newSessionConnectionRegistry()
+	service := newSessionAuthService(testSecret, registry, logger, reporter.report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	for name, scheme := range map[string]string{
+		"canonical": "Bearer",
+		"lowercase": "bearer",
+		"uppercase": "BEARER",
+		"mixed":     "BeArEr",
+	} {
+		t.Run(name, func(t *testing.T) {
+			connection, err := openEstablishedTestSession(
+				ctx, endpoint, scheme+" "+testSecret,
+				fmt.Sprintf("01993ca1-1111-7aaa-8aaa-%012x", len(scheme)), "host", "/scheme",
+			)
+			if err != nil {
+				t.Fatalf("authenticate with %s scheme: %v", name, err)
+			}
+			_ = connection.CloseNow()
+		})
+	}
+}
+
+func TestAuthOffAcceptsEveryUpgradeRegardlessOfHeaders(t *testing.T) {
+	var logs bytes.Buffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	registry := newSessionConnectionRegistry()
+	service := newSessionAuthService("", registry, logger, reporter.report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for index, header := range []string{
+		"",
+		"Bearer " + testSecret,
+		"Bearer completely-wrong",
+		"Basic dXNlcjpwYXNz",
+	} {
+		connection, err := openEstablishedTestSession(
+			ctx, endpoint, header,
+			fmt.Sprintf("01993ca1-2222-7bbb-9bbb-%012x", index), "host", "/auth-off",
+		)
+		if err != nil {
+			t.Fatalf("auth-off upgrade rejected with header %q: %v", header, err)
+		}
+		_ = connection.CloseNow()
+	}
+	settleContext, cancelSettle := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSettle()
+	if err := registry.closeAndWait(settleContext); err != nil {
+		t.Fatalf("settle auth-off connections: %v", err)
+	}
+	if strings.Contains(logs.String(), `"reason":"not_authorized"`) {
+		t.Fatalf("auth-off server rejected an upgrade: %s", logs.String())
+	}
+}
+
+func TestAuthorizationRunsBeforeCapacityAccounting(t *testing.T) {
+	var logs bytes.Buffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	registry := newSessionConnectionRegistryWithLimit(1)
+	service := newSessionAuthService(testSecret, registry, logger, reporter.report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	occupant, err := openEstablishedTestSession(
+		ctx, endpoint, "Bearer "+testSecret,
+		"01993ca1-3333-7ccc-8ccc-111111111111", "host", "/occupied",
+	)
+	if err != nil {
+		t.Fatalf("occupy the single capacity slot: %v", err)
+	}
+	t.Cleanup(func() { _ = occupant.CloseNow() })
+
+	// A rejected request must not consume the tracked slot: it reports the
+	// authorization failure, never the capacity rejection.
+	_, unauthorized, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer wrong"}},
+	})
+	if unauthorized == nil || err == nil {
+		t.Fatal("unauthorized dial unexpectedly upgraded")
+	}
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want 401 even at full capacity", unauthorized.StatusCode)
+	}
+	_ = unauthorized.Body.Close()
+	if strings.Contains(logs.String(), `"event":"session_capacity_rejected"`) {
+		t.Fatalf("rejected authorization consumed capacity: %s", logs.String())
+	}
+
+	_, saturated, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + testSecret}},
+	})
+	if saturated == nil || err == nil {
+		t.Fatal("authorized dial at full capacity unexpectedly upgraded")
+	}
+	if saturated.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("authorized status = %d, want 503 after authorization", saturated.StatusCode)
+	}
+	_ = saturated.Body.Close()
+	if !strings.Contains(logs.String(), `"event":"session_capacity_rejected"`) {
+		t.Fatalf("authorized capacity rejection missing: %s", logs.String())
+	}
+}
+
+func TestConcurrentDuplicateActiveRouteFailsClosedForSameAndDifferentAddresses(t *testing.T) {
+	var logs bytes.Buffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
 	registry := newSessionConnectionRegistryWithLimit(4)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	const routeID = "01993ca1-1111-7aaa-8aaa-111111111111"
 
-	original, err := openAuthenticatedTestSession(endpoint, privateOne, encodedOne, routeID, "host", "/same")
+	original, err := openEstablishedTestSession(nil, endpoint, "", routeID, "host", "/same")
 	if err != nil {
 		t.Fatalf("authenticate original route owner: %v", err)
 	}
@@ -205,13 +373,15 @@ func TestConcurrentDuplicateActiveRouteFailsClosedForSameAndDifferentInstallatio
 	results := make(chan collision, 2)
 	var started sync.WaitGroup
 	started.Add(2)
-	attempt := func(privateKey ed25519.PrivateKey, publicKey, hostname, cwd string) {
+	attempt := func(hostname, cwd string) {
 		defer started.Done()
-		connection, err := openAuthenticatedTestSession(endpoint, privateKey, publicKey, routeID, hostname, cwd)
+		connection, err := openEstablishedTestSession(nil, endpoint, "", routeID, hostname, cwd)
 		results <- collision{connection: connection, err: err}
 	}
-	go attempt(privateOne, encodedOne, "host", "/same")
-	go attempt(privateTwo, encodedTwo, "other-host", "/different")
+	// Same route UUID with different metadata, and a different route UUID that
+	// composes the same complete address, must both close without a welcome.
+	go attempt("other-host", "/different")
+	go attempt("host", "/same")
 	started.Wait()
 	close(results)
 	for result := range results {
@@ -253,21 +423,8 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_protocol", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
-
 	registry := newSessionConnectionRegistry()
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	var dispatched atomic.Int32
 	listCursors := make(chan string, 2)
 	var receivedDispatched atomic.Bool
@@ -365,7 +522,7 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 
 	for index, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, fmt.Sprintf("01993ca1-1111-7aaa-8aaa-%012x", index+1), "host", "/protocol")
+			connection, err := openEstablishedTestSession(nil, endpoint, "", fmt.Sprintf("01993ca1-1111-7aaa-8aaa-%012x", index+1), "host", "/protocol")
 			if err != nil {
 				t.Fatalf("authenticate protocol client: %v", err)
 			}
@@ -407,7 +564,7 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	}
 
 	t.Run("exact frame ceiling dispatches and denial keeps connection open", func(t *testing.T) {
-		connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, "01993ca1-1111-7aaa-8aaa-999999999999", "host", "/protocol")
+		connection, err := openEstablishedTestSession(nil, endpoint, "", "01993ca1-1111-7aaa-8aaa-999999999999", "host", "/protocol")
 		if err != nil {
 			t.Fatalf("authenticate protocol client: %v", err)
 		}
@@ -461,7 +618,7 @@ func TestAuthenticatedWebSocketProtocolBoundary(t *testing.T) {
 	})
 
 	t.Run("fragmented oversized message closes", func(t *testing.T) {
-		connection, err := openAuthenticatedTestSession(endpoint, privateKey, encodedKey, "01993ca1-1111-7aaa-8aaa-888888888888", "host", "/protocol")
+		connection, err := openEstablishedTestSession(nil, endpoint, "", "01993ca1-1111-7aaa-8aaa-888888888888", "host", "/protocol")
 		if err != nil {
 			t.Fatalf("authenticate protocol client: %v", err)
 		}
@@ -526,21 +683,8 @@ func TestAuthenticatedWebSocketJSONNestingBoundary(t *testing.T) {
 	logger := newEventLogger(&logs)
 	t.Cleanup(func() { _ = logger.close() })
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_depth", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
-
 	registry := newSessionConnectionRegistry()
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	var dispatched atomic.Int32
 	service.dispatchOperation = func(_ context.Context, _ *authenticatedSession, operation clientOperation) (operationResponse, bool, error) {
 		dispatched.Add(1)
@@ -589,10 +733,10 @@ func TestAuthenticatedWebSocketJSONNestingBoundary(t *testing.T) {
 	}
 	for index, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			connection, err := openAuthenticatedTestSession(
+			connection, err := openEstablishedTestSession(
+				nil,
 				endpoint,
-				privateKey,
-				encodedKey,
+				"",
 				fmt.Sprintf("01993ca1-1111-7aaa-8aaa-%012x", index+100),
 				"host",
 				"/depth",
@@ -664,21 +808,8 @@ func TestInvalidDispatcherResponseReachesFatalOwnerWithoutWireOrAuditLeak(t *tes
 		fatalReports.Add(1)
 		reporter.report(err)
 	}
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reportFatal)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_invalid_response", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
-
 	registry := newSessionConnectionRegistry()
-	service := newSessionAuthService(pairing, registry, logger, reportFatal)
+	service := newSessionAuthService("", registry, logger, reportFatal)
 	service.dispatchOperation = func(_ context.Context, _ *authenticatedSession, _ clientOperation) (operationResponse, bool, error) {
 		return operationResponse{
 			Type: "send_result",
@@ -693,13 +824,8 @@ func TestInvalidDispatcherResponseReachesFatalOwnerWithoutWireOrAuditLeak(t *tes
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	t.Cleanup(server.Close)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
-	connection, err := openAuthenticatedTestSession(
-		endpoint,
-		privateKey,
-		encodedKey,
-		"01993ca1-1111-7aaa-8aaa-777777777777",
-		"host",
-		"/invalid-response",
+	connection, err := openEstablishedTestSession(
+		nil, endpoint, "", "01993ca1-1111-7aaa-8aaa-777777777777", "host", "/invalid-response",
 	)
 	if err != nil {
 		t.Fatalf("authenticate invalid-response client: %v", err)
@@ -745,49 +871,137 @@ func TestInvalidDispatcherResponseReachesFatalOwnerWithoutWireOrAuditLeak(t *tes
 	}
 }
 
-func openAuthenticatedTestSession(
+func TestHelloEstablishmentAcceptsOnlyClosedUnsignedPayload(t *testing.T) {
+	const routeID = "01993ca1-4444-7ddd-8ddd-111111111111"
+	var logs bytes.Buffer
+	logger := newEventLogger(&logs)
+	t.Cleanup(func() { _ = logger.close() })
+	reporter := newFatalRuntimeReporter()
+	registry := newSessionConnectionRegistry()
+	service := newSessionAuthService("", registry, logger, reporter.report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	helloFrame := func(payload string) string {
+		return fmt.Sprintf(
+			`{"v":1,"type":"hello","request_id":"01993c79-8ad7-79fa-83e3-9789dcaca168","payload":%s}`,
+			payload,
+		)
+	}
+	validPayload := fmt.Sprintf(`{"route_id":%q,"hostname":"host","cwd":"/establishment"}`, routeID)
+
+	// The unchanged unsigned establishment still completes with exactly the
+	// closed payload and returns the unchanged welcome limits.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	connection, _, err := websocket.Dial(ctx, endpoint, nil)
+	if err != nil {
+		t.Fatalf("dial establishment client: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.CloseNow() })
+	if err := wsjson.Write(ctx, connection, json.RawMessage(helloFrame(validPayload))); err != nil {
+		t.Fatalf("write unsigned hello: %v", err)
+	}
+	var welcome welcomeEnvelope
+	if err := wsjson.Read(ctx, connection, &welcome); err != nil {
+		t.Fatalf("read welcome after unsigned hello: %v", err)
+	}
+	if welcome.Type != "welcome" || welcome.Version != 1 ||
+		welcome.Payload.HeartbeatMS != heartbeatMilliseconds ||
+		welcome.Payload.MaxBodyBytes != maxBodyBytes ||
+		welcome.Payload.SelfAddress != "/establishment@host#"+routeID {
+		t.Fatalf("welcome = %+v", welcome)
+	}
+	_ = connection.CloseNow()
+
+	// v1 authentication fields are now unknown fields; a v1 client fails closed.
+	legacyPayload := fmt.Sprintf(
+		`{"route_id":%q,"hostname":"host","cwd":"/legacy","client_public_key":"ed25519:AAAA","signature":"AAAA"}`,
+		routeID,
+	)
+	invalidHellos := map[string]string{
+		"legacy signed fields":  helloFrame(legacyPayload),
+		"missing cwd":           helloFrame(fmt.Sprintf(`{"route_id":%q,"hostname":"host"}`, routeID)),
+		"unknown field":         helloFrame(fmt.Sprintf(`{"route_id":%q,"hostname":"host","cwd":"/x","extra":1}`, routeID)),
+		"empty hostname":        helloFrame(fmt.Sprintf(`{"route_id":%q,"hostname":"","cwd":"/x"}`, routeID)),
+		"non-UUIDv7 route":      helloFrame(`{"route_id":"01993ca1-4444-4ddd-8ddd-111111111111","hostname":"host","cwd":"/x"}`),
+		"oversized cwd":         helloFrame(fmt.Sprintf(`{"route_id":%q,"hostname":"host","cwd":%q}`, routeID, strings.Repeat("x", maxCWDBytes+1))),
+		"oversized hostname":    helloFrame(fmt.Sprintf(`{"route_id":%q,"hostname":%q,"cwd":"/x"}`, routeID, strings.Repeat("x", maxHostnameBytes+1))),
+		"non-object payload":    helloFrame(`[]`),
+		"envelope wrong type":   `{"v":1,"type":"challenge","request_id":"01993c79-8ad7-79fa-83e3-9789dcaca168","payload":{}}`,
+		"non-UUIDv7 request id": fmt.Sprintf(`{"v":1,"type":"hello","request_id":"nope","payload":%s}`, validPayload),
+	}
+	for name, frame := range invalidHellos {
+		t.Run(name, func(t *testing.T) {
+			dialCtx, cancelDial := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancelDial()
+			attempt, _, dialErr := websocket.Dial(dialCtx, endpoint, nil)
+			if dialErr != nil {
+				t.Fatalf("dial rejected-hello client: %v", dialErr)
+			}
+			defer attempt.CloseNow()
+			if err := wsjson.Write(dialCtx, attempt, json.RawMessage(frame)); err != nil {
+				t.Fatalf("write invalid hello: %v", err)
+			}
+			if _, _, err := attempt.Reader(dialCtx); err == nil {
+				t.Fatal("invalid hello received a welcome or stayed open")
+			}
+		})
+	}
+
+	settleContext, cancelSettle := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelSettle()
+	if err := registry.closeAndWait(settleContext); err != nil {
+		t.Fatalf("settle establishment clients: %v", err)
+	}
+	// Audit writes drain through the logger worker after handler settlement.
+	for count := 0; ; count = strings.Count(logs.String(), `"reason":"invalid_hello"`) {
+		if count == len(invalidHellos) {
+			break
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-settleContext.Done():
+			t.Fatalf("invalid_hello count = %d, want %d; logs: %s", count, len(invalidHellos), logs.String())
+		}
+	}
+	if count := strings.Count(logs.String(), `"event":"auth_accepted"`); count != 1 {
+		t.Fatalf("auth_accepted count = %d, want the one valid establishment; logs: %s", count, logs.String())
+	}
+}
+
+// openEstablishedTestSession dials /v1/connect with an optional Authorization
+// header value, completes the unsigned hello, and requires the welcome.
+func openEstablishedTestSession(
+	ctx context.Context,
 	endpoint string,
-	privateKey ed25519.PrivateKey,
-	publicKey string,
+	authorization string,
 	routeID string,
 	hostname string,
 	cwd string,
 ) (*websocket.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	connection, _, err := websocket.Dial(ctx, endpoint, nil)
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+	}
+	options := &websocket.DialOptions{}
+	if authorization != "" {
+		options.HTTPHeader = http.Header{"Authorization": []string{authorization}}
+	}
+	connection, _, err := websocket.Dial(ctx, endpoint, options)
 	if err != nil {
 		return nil, err
 	}
-	var challenge challengeEnvelope
-	if err := wsjson.Read(ctx, connection, &challenge); err != nil {
-		_ = connection.CloseNow()
-		return nil, fmt.Errorf("read challenge: %w", err)
-	}
-	hello := helloEnvelope{
-		Version:   1,
-		Type:      "hello",
-		RequestID: "01993c79-8ad7-79fa-83e3-9789dcaca168",
-		Payload: helloPayload{
-			ClientPublicKey: publicKey,
-			RouteID:         routeID,
-			Hostname:        hostname,
-			CWD:             cwd,
-		},
-	}
-	hello.Payload.Signature = base64.StdEncoding.EncodeToString(
-		ed25519.Sign(privateKey, helloTranscript(challenge.Payload.Nonce, hello)),
-	)
 	if err := wsjson.Write(ctx, connection, map[string]any{
-		"v":          hello.Version,
-		"type":       hello.Type,
-		"request_id": hello.RequestID,
+		"v":          1,
+		"type":       "hello",
+		"request_id": "01993c79-8ad7-79fa-83e3-9789dcaca168",
 		"payload": map[string]string{
-			"client_public_key": hello.Payload.ClientPublicKey,
-			"route_id":          hello.Payload.RouteID,
-			"hostname":          hello.Payload.Hostname,
-			"cwd":               hello.Payload.CWD,
-			"signature":         hello.Payload.Signature,
+			"route_id": routeID,
+			"hostname": hostname,
+			"cwd":      cwd,
 		},
 	}); err != nil {
 		_ = connection.CloseNow()
@@ -800,93 +1014,16 @@ func openAuthenticatedTestSession(
 	}
 	if welcome.Type != "welcome" {
 		_ = connection.CloseNow()
-		return nil, fmt.Errorf("unexpected auth response %q", welcome.Type)
+		return nil, fmt.Errorf("unexpected establishment response %q", welcome.Type)
 	}
 	return connection, nil
 }
 
-func TestHelloTranscriptIsDomainSeparatedLengthPrefixedAndExcludesSignature(t *testing.T) {
-	hello := helloEnvelope{
-		Version:   1,
-		Type:      "hello",
-		RequestID: "01993c79-8ad7-79fa-83e3-9789dcaca168",
-		Payload: helloPayload{
-			ClientPublicKey: "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-			RouteID:         "01993ca1-1111-7aaa-8aaa-111111111111",
-			Hostname:        "høst",
-			CWD:             "/srv/@#",
-			Signature:       "signature-is-excluded",
-		},
-	}
-	want := "pi-messaging-relay-auth-v1\n" +
-		"nonce:11:nonce-value\n" +
-		"request_id:36:01993c79-8ad7-79fa-83e3-9789dcaca168\n" +
-		"client_public_key:52:ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" +
-		"route_id:36:01993ca1-1111-7aaa-8aaa-111111111111\n" +
-		"hostname:5:høst\n" +
-		"cwd:7:/srv/@#\n"
-
-	got := string(helloTranscript("nonce-value", hello))
-	if got != want {
-		t.Fatalf("transcript = %q, want %q", got, want)
-	}
-	hello.Payload.Signature = "different-signature"
-	if changed := string(helloTranscript("nonce-value", hello)); changed != want {
-		t.Fatalf("signature changed transcript: %q", changed)
-	}
-}
-
-func TestHelloSignatureBindsChallengeAndAllRouteMetadata(t *testing.T) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key fixture: %v", err)
-	}
-	hello := helloEnvelope{
-		Version:   1,
-		Type:      "hello",
-		RequestID: "01993c79-8ad7-79fa-83e3-9789dcaca168",
-		Payload: helloPayload{
-			ClientPublicKey: "ed25519:" + base64.StdEncoding.EncodeToString(publicKey),
-			RouteID:         "01993ca1-1111-7aaa-8aaa-111111111111",
-			Hostname:        "host",
-			CWD:             "/srv/project",
-		},
-	}
-	hello.Payload.Signature = base64.StdEncoding.EncodeToString(
-		ed25519.Sign(privateKey, helloTranscript("fresh-nonce", hello)),
-	)
-	if !verifyHelloSignature(publicKey, "fresh-nonce", hello) {
-		t.Fatal("valid transcript signature was rejected")
-	}
-
-	mutations := map[string]func(*helloEnvelope){
-		"request id": func(value *helloEnvelope) { value.RequestID = "01993c79-8ad8-79fa-83e3-9789dcaca168" },
-		"public key": func(value *helloEnvelope) { value.Payload.ClientPublicKey = "ed25519:" + strings.Repeat("A", 43) + "=" },
-		"route id":   func(value *helloEnvelope) { value.Payload.RouteID = "01993ca1-1112-7aaa-8aaa-111111111111" },
-		"hostname":   func(value *helloEnvelope) { value.Payload.Hostname = "other-host" },
-		"cwd":        func(value *helloEnvelope) { value.Payload.CWD = "/srv/other" },
-	}
-	for name, mutate := range mutations {
-		t.Run(name, func(t *testing.T) {
-			changed := hello
-			mutate(&changed)
-			if verifyHelloSignature(publicKey, "fresh-nonce", changed) {
-				t.Fatal("signature remained valid after transcript metadata mutation")
-			}
-		})
-	}
-	if verifyHelloSignature(publicKey, "other-nonce", hello) {
-		t.Fatal("signature remained valid for a different challenge")
-	}
-}
-
 func TestHelloValidationRequiresUUIDv7AndBoundedDisplayMetadata(t *testing.T) {
 	valid := helloPayload{
-		ClientPublicKey: "ed25519:" + base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
-		RouteID:         "01993ca1-1111-7aaa-8aaa-111111111111",
-		Hostname:        "host",
-		CWD:             "/srv/project",
-		Signature:       base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)),
+		RouteID:  "01993ca1-1111-7aaa-8aaa-111111111111",
+		Hostname: "host",
+		CWD:      "/srv/project",
 	}
 	if err := validateHelloPayload(valid); err != nil {
 		t.Fatalf("valid hello payload rejected: %v", err)
@@ -906,5 +1043,10 @@ func TestHelloValidationRequiresUUIDv7AndBoundedDisplayMetadata(t *testing.T) {
 	overlongHostname.Hostname = strings.Repeat("x", maxHostnameBytes+1)
 	if err := validateHelloPayload(overlongHostname); err == nil {
 		t.Fatal("over-limit hostname was accepted")
+	}
+	emptyHostname := valid
+	emptyHostname.Hostname = ""
+	if err := validateHelloPayload(emptyHostname); err == nil {
+		t.Fatal("empty hostname was accepted")
 	}
 }

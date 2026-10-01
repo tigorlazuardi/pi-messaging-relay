@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -27,8 +24,6 @@ type dedupeTestHarness struct {
 	reporter   *fatalRuntimeReporter
 	service    *sessionAuthService
 	dispatcher *deliveryDispatcher
-	privateKey ed25519.PrivateKey
-	encodedKey string
 }
 
 func newDedupeTestHarness(t *testing.T) *dedupeTestHarness {
@@ -36,27 +31,15 @@ func newDedupeTestHarness(t *testing.T) *dedupeTestHarness {
 	logs := &lockedBuffer{changed: make(chan struct{}, 1)}
 	logger := newEventLogger(logs)
 	reporter := newFatalRuntimeReporter()
-	pairing, err := newTestPairingService(t, t.TempDir(), "", logger, reporter.report)
-	if err != nil {
-		t.Fatalf("create pairing service: %v", err)
-	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate installation key: %v", err)
-	}
-	encodedKey := "ed25519:" + base64.StdEncoding.EncodeToString(publicKey)
-	pairing.mu.Lock()
-	pairing.allowlist.Clients = []allowlistClient{{ClientID: "cli_dedupe", PublicKey: encodedKey}}
-	pairing.mu.Unlock()
 	registry := newSessionConnectionRegistryWithLimit(4)
-	service := newSessionAuthService(pairing, registry, logger, reporter.report)
+	service := newSessionAuthService("", registry, logger, reporter.report)
 	dispatcher := newDeliveryDispatcher(registry)
 	service.dispatchOperation = dispatcher.dispatch
 	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	harness := &dedupeTestHarness{
 		t: t, ctx: ctx, cancel: cancel, server: server, logger: logger, logs: logs,
-		reporter: reporter, service: service, dispatcher: dispatcher, privateKey: privateKey, encodedKey: encodedKey,
+		reporter: reporter, service: service, dispatcher: dispatcher,
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -69,9 +52,7 @@ func newDedupeTestHarness(t *testing.T) *dedupeTestHarness {
 func (h *dedupeTestHarness) open(routeID, cwd string) *websocket.Conn {
 	h.t.Helper()
 	endpoint := "ws" + strings.TrimPrefix(h.server.URL, "http")
-	connection, err := openAuthenticatedTestSession(
-		endpoint, h.privateKey, h.encodedKey, routeID, "host", cwd,
-	)
+	connection, err := openEstablishedTestSession(h.ctx, endpoint, "", routeID, "host", cwd)
 	if err != nil {
 		h.t.Fatalf("authenticate %s: %v", cwd, err)
 	}

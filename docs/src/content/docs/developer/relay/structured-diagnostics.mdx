@@ -1,6 +1,6 @@
 ---
 title: Structured relay diagnostics
-description: Stable server and extension JSONL events, correlation boundaries, severity, redaction, and captured-stream acceptance.
+description: Stable server and extension JSONL events under v2 authentication, correlation boundaries, severity, redaction, and captured-stream acceptance.
 status: accepted
 date: 2026-09-11
 ---
@@ -8,7 +8,7 @@ date: 2026-09-11
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-Relay v1 emits structured logs for operator diagnosis without retaining message content or authentication material. Normal server events go to the server process's stdout. Fatal server startup or runtime failure goes to server stderr as `server_failed`. Extension events go to the Pi process's stderr through `console.error`. Every nonempty line is exactly one JSON object; event values are JSON-escaped and never create a second physical line.
+The relay emits structured logs for operator diagnosis without retaining message content or authentication material. Under protocol v2 ([online relay authentication v2](../../protocol/online-relay-auth-v2/)) the only credential is one optional static shared secret checked at the HTTP upgrade, so no pairing, key, challenge, or signature event exists. Normal server events go to the server process's stdout. Fatal server startup or runtime failure goes to server stderr as `server_failed`. Extension events go to the Pi process's stderr through `console.error`. Every nonempty line is exactly one JSON object; event values are JSON-escaped and never create a second physical line.
 
 <Decision title="Keep diagnostics in two process-owned JSONL streams" status="accepted">
 The server owns authoritative protocol and delivery outcomes on stdout. The extension owns Pi-session, reconnect, and model-tool outcomes on Pi stderr. This preserves settlement authority while allowing operators to correlate both sides without a logger framework, exporter, or new protocol surface.
@@ -22,47 +22,43 @@ The server owns authoritative protocol and delivery outcomes on stdout. The exte
 
 | Event | Level | Stable fields beyond `level` and `event` |
 |---|---|---|
-| `server_ready` | `info` | `result: "ready"`, `address`, `state_dir` |
-| `pairing_code_created` | `info` | `result: "created"`, `expires_at`, `pairing_code`, `private_key` |
-| `pair_accepted` | `info` | `result: "accepted"`, `client_public_key`, `client_id`, `latency_ms`, redaction fields |
-| `pair_rejected` | `warn` | `result: "rejected"`, `reason`, `latency_ms`, available public key, redaction fields |
-| `auth_accepted` | `info` | `result: "accepted"`, validated hello `request_id`, address, route, public-key/client identity, hostname, cwd, `latency_ms`, redaction fields |
-| `auth_rejected` | `warn` | `result: "rejected"`, `reason`, available route/public key and validated hello `request_id`, `latency_ms`, redaction fields |
-| `session_disconnected` | `info` | `result: "disconnected"`, address, route, public-key/client identity |
+| `server_ready` | `info` | `result: "ready"`, `address`, `state_dir`, `auth: "off" \| "secret"` |
+| `auth_accepted` | `info` | `result: "accepted"`, hello `request_id`, address, route, hostname, cwd, `latency_ms` |
+| `auth_rejected` | `warn` | `result: "rejected"`, `reason`, `latency_ms`; post-hello rejections add the available route and hello `request_id` |
+| `session_disconnected` | `info` | `result: "disconnected"`, address, route |
 | `operation_settled` | `info` | `result`, `reason`, `code`, `type`, request correlation and outcome-specific fields, `latency_ms` |
 | `operation_denied` | `warn` | `result: "denied"`, `reason`, `code`, `type`, available correlation and route fields, `latency_ms` |
 | `send_settled` | `info` | `result: "settled"`, `reason`, `code`, request/message correlation, available delivery and routes, `status`, `body`, `latency_ms` |
 | `server_stopped` | `info` | `result: "graceful"`, `address` |
 
-`session_capacity_rejected` and `pairing_code_channel_cleanup_failed` are recoverable server warnings with stable `result` or `reason` as applicable. Protocol rejection is `protocol_rejected` with `result: "rejected"`, stable `reason` and `code`, and only validated correlation safe to publish.
+`session_capacity_rejected` and `protocol_rejected` are recoverable server warnings with stable `result` and stable `reason`/`code` as applicable. An upgrade rejection before any WebSocket exists is `auth_rejected` with `reason: "not_authorized"` and no request or route field; post-hello rejections (`invalid_hello`, `route_conflict`, `welcome_failed`) add the hello request ID when available.
 
 ### Extension stderr
 
 | Event | Level | Stable fields beyond `level` and `event` |
 |---|---|---|
 | `relay_session_started` | `info` | `result: "started"`, normalized lifecycle `reason`, `route_id` |
-| `relay_pair_accepted` | `info` | `operation: "relay-pair"`, `result: "accepted"`, public-key/client identity, `latency_ms`, redaction fields |
-| `relay_pair_rejected` | `warn` | `operation: "relay-pair"`, `result: "rejected"`, `reason`, `latency_ms`, redaction fields |
-| `relay_auth_accepted` | `info` | `result: "accepted"`, address, route, public key, `latency_ms`, redaction fields |
-| `relay_auth_rejected` | `warn` | `result: "rejected"`, `reason`, available route/public key, available `latency_ms`, redaction fields |
-| `relay_session_disconnected` | `info` | `result: "disconnected"`, address, route, public key, redaction fields |
-| `relay_reconnect_scheduled` | `info` | `result: "scheduled"`, bounded `reason`, one-based `retry_index`, `delay_ms`, route, public key |
-| `relay_reconnect_attempted` | `info` | `result: "attempted"`, one-based `retry_index`, route, public key |
-| `relay_reconnect_succeeded` | `info` | `result: "connected"`, one-based `retry_index`, address, route, public key, `latency_ms` |
-| `relay_reconnect_exhausted` | `warn` | `result: "exhausted"`, bounded `reason`, `retry_index: 10`, route, public key |
+| `relay_config_rejected` | `warn` | `result: "rejected"`, `reason`, `secret: "<redacted>"` |
+| `relay_auth_accepted` | `info` | `result: "accepted"`, address, route, `latency_ms` |
+| `relay_auth_rejected` | `warn` | `result: "rejected"`, `reason`, available route, available `latency_ms` |
+| `relay_session_disconnected` | `info` | `result: "disconnected"`, available reason, address, route |
+| `relay_reconnect_scheduled` | `info` | `result: "scheduled"`, bounded `reason`, one-based `retry_index`, `delay_ms`, route |
+| `relay_reconnect_attempted` | `info` | `result: "attempted"`, one-based `retry_index`, route |
+| `relay_reconnect_succeeded` | `info` | `result: "connected"`, one-based `retry_index`, address, route, `latency_ms` |
+| `relay_reconnect_exhausted` | `warn` | `result: "exhausted"`, bounded `reason`, `retry_index: 10`, route |
 | `relay_send_settled` | `info` for `received`; otherwise `warn` | `operation: "agent_send"`, `result: "settled"`, `reason`, `message_id`, authenticated `sender_route`, requested `recipient_route`, `status`, `body`, `latency_ms` |
 | `relay_operation_failed` | `warn` | `operation`, `result: "failed"`, `reason`, plus safe operation-specific route, redaction, and latency fields when available |
-| `relay_session_stopped` | `info` | `result: "graceful"`, available address, route, and public key |
+| `relay_session_stopped` | `info` | `result: "graceful"`, optional address and route |
 
-Initial and pairing-owned authentication success uses `relay_auth_accepted`. A successful automatic retry uses `relay_reconnect_succeeded` instead; emitting both would duplicate one extension-owned state transition. Server `auth_accepted` still records every accepted WebSocket because the server owns that authentication boundary.
+Startup-owned connection success uses `relay_auth_accepted`. A successful automatic retry uses `relay_reconnect_succeeded` instead; emitting both would duplicate one extension-owned state transition. Server `auth_accepted` still records every accepted WebSocket because the server owns that authentication boundary.
 
 ## Redaction and availability
 
-The literal marker is `<redacted>`. Whenever these fields are emitted, `pairing_code`, `nonce`, `signature`, `private_key`, and `body` contain only that marker. This applies to successful and rejected operations. String bodies, object members, rendered provenance text, and semantic fingerprints never enter logs. Hostile body objects are validated and encoded before transport. Failure diagnostics snapshot operation inputs once, admit only a primitive string as optional recipient metadata, and never pass a body or cast parameter object into event serialization. A `toJSON` method, proxy trap, circular value, or line break therefore cannot make diagnostic encoding expose object-derived content or replace operation ownership.
+The literal marker is `<redacted>`. Whenever these fields are emitted, `secret` and `body` contain only that marker. This applies to successful and rejected operations. The shared secret exists only in the server's secret file and the client's config file, both mode `0600`, and never enters any event beyond the redacted `secret` field. String bodies, object members, rendered provenance text, and semantic fingerprints never enter logs. Hostile body objects are validated and encoded before transport. Failure diagnostics snapshot operation inputs once, admit only a primitive string as optional recipient metadata, and never pass a body or cast parameter object into event serialization. A `toJSON` method, proxy trap, circular value, or line break therefore cannot make diagnostic encoding expose object-derived content or replace operation ownership.
 
-Public Ed25519 keys, client IDs, complete opaque route addresses, cwd, hostname, and request/message/delivery IDs remain visible. They are support correlation values, not authorization evidence. The server authenticates from its allowlist and verified signature, never from visible route metadata.
+Complete opaque route addresses, cwd, hostname, and request/message/delivery IDs remain visible. They are support correlation values, not authorization evidence. The server authenticates from the configured upgrade secret, never from visible route metadata.
 
-The extension's retained authenticated connection owns its local `sender_route`; the model-tool boundary owns the generated logical `message_id` and validated requested `recipient_route`. `relay_send_settled` publishes all three. It does not receive the server-generated `delivery_id`, and its public tool wrapper does not own the transport's per-frame `request_id`; it therefore publishes neither. The authoritative server `send_settled` publishes request and delivery IDs when that outcome has them. Server authentication publishes the validated hello `request_id` after a complete hello is available; challenge-write and incomplete-hello failures omit it. No identifier is lifted through an internal abstraction solely for logging.
+The extension's retained authenticated connection owns its local `sender_route`; the model-tool boundary owns the generated logical `message_id` and validated requested `recipient_route`. `relay_send_settled` publishes all three. It does not receive the server-generated `delivery_id`, and its public tool wrapper does not own the transport's per-frame `request_id`; it therefore publishes neither. The authoritative server `send_settled` publishes request and delivery IDs when that outcome has them. Server authentication publishes the hello `request_id` after a complete hello is available; upgrade rejections happen before any hello and publish none. No identifier is lifted through an internal abstraction solely for logging.
 
 <Aside type="note" title="Heartbeat control traffic stays quiet">
 The welcome value `heartbeat_ms: 30000` is transport metadata. WebSocket ping/pong control traffic produces no normal-level heartbeat, ping, or pong event. Disconnect and reconnect transitions provide actionable evidence without one log per control tick.
@@ -72,9 +68,9 @@ The welcome value `heartbeat_ms: 30000` is transport metadata. WebSocket ping/po
 
 1. Start with the extension's `relay_send_settled.message_id`, authenticated `sender_route`, and requested `recipient_route`.
 2. Find the server `send_settled` with the same `message_id` and sender/recipient route. Use its `request_id` and, when present, `delivery_id` to inspect transport-side outcomes.
-3. Match route and public key across `relay_auth_accepted` or `relay_reconnect_succeeded` and server `auth_accepted`.
+3. Match route across `relay_auth_accepted` or `relay_reconnect_succeeded` and server `auth_accepted`.
 4. For an interruption, follow `relay_session_disconnected` to `relay_reconnect_scheduled`, `relay_reconnect_attempted`, and `relay_reconnect_succeeded`. `retry_index` is one-based and `delay_ms` is the actual jittered wait.
-5. Share identifiers only with a trusted support channel. Never share pairing codes, the installation PEM, nonce, signature, or message content.
+5. Share identifiers only with a trusted support channel. Never share the server secret file, the client config file, or message content.
 
 ### I/O examples
 
@@ -89,9 +85,19 @@ The welcome value `heartbeat_ms: 30000` is transport metadata. WebSocket ping/po
     {"level":"info","event":"send_settled","result":"settled","reason":"received","code":"received","type":"send","request_id":"01993c7a-7d2c-7699-b159-851da079f09f","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","delivery_id":"01993c85-d827-7cd9-966c-07aa3ee42e47","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","recipient_route":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222","status":"received","body":"<redacted>","latency_ms":12}
     ```
   </TabItem>
+  <TabItem label="Upgrade rejection">
+    ```json
+    {"level":"warn","event":"auth_rejected","result":"rejected","reason":"not_authorized","latency_ms":0}
+    ```
+  </TabItem>
   <TabItem label="Reconnect schedule">
     ```json
-    {"level":"info","event":"relay_reconnect_scheduled","result":"scheduled","reason":"session_disconnected","retry_index":1,"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111","client_public_key":"ed25519:PUBLIC_KEY_FOR_CORRELATION="}
+    {"level":"info","event":"relay_reconnect_scheduled","result":"scheduled","reason":"session_disconnected","retry_index":1,"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111"}
+    ```
+  </TabItem>
+  <TabItem label="Config rejection">
+    ```json
+    {"level":"warn","event":"relay_config_rejected","result":"rejected","reason":"unsafe_config_permissions","secret":"<redacted>"}
     ```
   </TabItem>
   <TabItem label="Fatal stderr">
@@ -103,12 +109,10 @@ The welcome value `heartbeat_ms: 30000` is transport metadata. WebSocket ping/po
 
 ## Captured-stream acceptance
 
-The primary diagnostics case in `extension/test/reconnect.acceptance.test.ts` builds and starts the real Go child, captures its stdout JSONL and stderr, and runs two extension instances behind `FakePiHost`. Native production `console.error` remains installed. The serial test temporarily captures the actual byte chunks passed to `process.stderr.write`, concatenates them before UTF-8 decoding, splits physical CR/LF framing, requires a final line terminator, then restores the exact write function. Any unrelated stderr output would fail the exact JSON-object parser rather than being relabelled as an extension event. The case crosses public pairing, authenticated WebSocket, model-tool, recipient Pi-injection, reconnect, heartbeat-control, and process shutdown boundaries.
+The primary diagnostics case in `extension/test/connect.acceptance.test.ts` builds and starts the real Go child and captures its stdout JSONL and the extension's actual stderr bytes. One variant starts the server with `--secret-file`, loads the extension with a mode-`0600` client config file carrying the same secret, and proves the full boundary: `server_ready` reports `"auth":"secret"`, the configured session upgrades and authenticates, and every wrong credential spelling — missing header, wrong scheme, wrong secret — receives the identical closed HTTP 401 without an upgrade or tracked slot. A second variant boots the server without a secret and proves `"auth":"off"` accepts header-less and credentialed clients identically with no rejection event.
 
-The case extracts the raw startup pairing code and installation PEM from their private files. Its serial WebSocket observer pairs every real server challenge nonce with every hello signature from both subject and observer sockets before applying subject-specific retry controls. It requires one corresponding nonempty nonce/signature fixture for every observed hello. The same seam settles private string and object bodies as `received`, settles another private body as `timeout/offline`, rejects a hostile malformed destination without invoking its `toJSON`, forces two failed automatic attempts before a successful third retry under the existing fake clock, observes a real WebSocket pong as the heartbeat-control barrier, and then stops both Pi sessions and the server gracefully.
+The case requires the exact four-event connected session lifecycle (`relay_session_started`, `relay_auth_accepted`, `relay_session_disconnected`, `relay_session_stopped`), the reconnect event order under the fake-clock retry controls, message correlation between `relay_send_settled` and server `send_settled`, and the severity split between informational settlements and warning tool outcomes. Every captured nonempty line must parse as one non-array JSON object with no embedded physical newline; extension lines come from actual stderr bytes, not captured console arguments. No captured server or extension line may contain the secret value, and any `secret` field must carry the literal `<redacted>` marker. No `client_public_key`, `nonce`, `signature`, or `client_id` field may appear in any v2 event. Sibling acceptance cases (`delivery.acceptance.test.ts`, `roster.acceptance.test.ts`, `reconnect.acceptance.test.ts`, `restart.acceptance.test.ts`) prove settlement, roster, bounded reconnect, and process-replacement behavior over the same captured streams, including one warning-level `relay_reconnect_exhausted` after ten failed retries and no eleventh retry.
 
-After child exit and `server_stopped`, the seam drains the server stdout readline iterator through confirmed EOF before parsing or scanning. Every captured nonempty normal line must parse as one non-array JSON object with no embedded physical newline; extension lines come from actual stderr bytes, not captured console arguments. Expected event schemas, available authentication request and sender-route correlation, severity, reconnect order, public-key visibility, message correlation, and literal redaction markers are asserted. No raw pairing code, PEM material, nonce, signature, hostile trap output, or body marker may be a substring of any server or extension line. The positive pong, settlement, reconnect success, session-stop, server-stop, and stream-EOF barriers make heartbeat silence and lifecycle completeness deterministic rather than timing-only negatives. A subordinate focused case proves ten failed retries emit one warning-level `relay_reconnect_exhausted` and create no eleventh retry.
-
-<Decision title="Use logs only for relay v1 observability" status="accepted">
-The operator-run relay has no demonstrated SLO, throughput, or cross-process complexity requiring OpenTelemetry. Relay v1 adds no metrics, traces, exporter, collector, health API, or dependency. Revisit only when measured operational needs cannot be answered from bounded structured events.
+<Decision title="Use logs only for relay observability" status="accepted">
+The operator-run relay has no demonstrated SLO, throughput, or cross-process complexity requiring OpenTelemetry. The relay adds no metrics, traces, exporter, collector, health API, or dependency. Revisit only when measured operational needs cannot be answered from bounded structured events.
 </Decision>

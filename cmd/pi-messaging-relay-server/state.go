@@ -9,22 +9,12 @@ import (
 
 type directorySync func(*os.File) error
 
-type stateDirectoryOperations struct {
-	write     func(*os.File, []byte) (int, error)
-	syncFile  func(*os.File) error
-	closeFile func(*os.File) error
-	rename    func(string, string) error
-	unlink    func(string, int) error
-	syncDir   func(*os.File) error
-}
-
 type stateDirectory struct {
 	path       string
 	directory  *os.File
 	parent     *os.File
 	base       string
 	temporary  bool
-	operations stateDirectoryOperations
 	closeOnce  sync.Once
 	closeErr   error
 	removeOnce sync.Once
