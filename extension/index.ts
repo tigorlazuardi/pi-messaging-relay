@@ -24,7 +24,7 @@ import {
   RECONNECT_MAX_RETRIES,
   type ReconnectDeadline,
 } from "./internal/reconnect.ts";
-import { RelayCardComponent, type CardTheme } from "./internal/relay-box.ts";
+import { RelayCardComponent } from "./internal/relay-box.ts";
 import type { RelayCardDetails } from "./internal/message-renderer.ts";
 import { RosterRequestError, type SendResult } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
