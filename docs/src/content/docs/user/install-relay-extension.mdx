@@ -1,14 +1,14 @@
 ---
-title: Install and pair the relay extension
-description: Load the Pi extension, configure its loopback endpoint and private key directory, and pair one installation safely.
+title: Install and configure the relay extension
+description: Load the Pi extension and deliver its loopback endpoint and optional shared secret through one mode-0600 config file.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The extension exposes `/relay-pair`, `list_peers`, and `agent_send`. A paired Pi session authenticates one WebSocket automatically and receives its opaque route address. `list_peers` reads bounded live address-only roster pages; `agent_send` can deliver a provenance-labelled string or JSON object to an online idle or busy recipient and return extension-boundary `received`.
+The extension exposes `list_peers` and `agent_send`. A connected Pi session authenticates one WebSocket automatically and receives its opaque route address. `list_peers` reads bounded live address-only roster pages; `agent_send` can deliver a provenance-labelled string or JSON object to an online idle or busy recipient and return extension-boundary `received`.
 
 <Aside type="caution" title="Best-effort online delivery only">
-An `auth_accepted` event means the session proved possession of an allowlisted installation key and can use discovery plus successful idle and busy string/object delivery. Automatic reconnect can restore only that live capability. It does not enable offline delivery, replay, durable Pi acceptance, model completion, or guaranteed replies.
+A `relay_auth_accepted` diagnostic means the session connected and can use discovery plus successful idle and busy string/object delivery. Automatic reconnect can restore only that live capability. It does not enable offline delivery, replay, durable Pi acceptance, model completion, or guaranteed replies.
 </Aside>
 
 ## Requirements
@@ -17,9 +17,10 @@ An `auth_accepted` event means the session proved possession of an allowlisted i
 - Node.js 24 or newer
 - npm
 - A trusted checkout of this repository
-- A running Linux relay server and its current operator-only pairing code
+- A running Linux relay server
+- One configuration file at `~/.config/pi/pi-messaging-relay.json`
 
-The TypeScript extension remains a platform-neutral Node component; the Linux-only support boundary applies to the Go relay server because its durable authorization store depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and `typebox` v1.3.7 (MIT) for tool schemas.
+The TypeScript extension remains a platform-neutral Node component; the Linux-only support boundary applies to the Go relay server because its state-directory safety depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and `typebox` v1.3.7 (MIT) for tool schemas.
 
 ## Install from a checkout
 
@@ -30,45 +31,75 @@ The TypeScript extension remains a platform-neutral Node component; the Linux-on
    $ npm --prefix extension ci
    ```
 
-2. Load only this extension for one Pi invocation, replacing the example address with the relay's `server_ready.address`:
+2. Write the client configuration file with mode `0600`. The path is fixed under your home directory — `XDG_CONFIG_HOME` is not honored:
 
    ```console
-   $ PI_MESSAGING_RELAY_URL=http://127.0.0.1:43127 \
-       pi --no-extensions -e ./extension/index.ts
+   $ install -m 0600 /dev/null ~/.config/pi/pi-messaging-relay.json
+   $ vi ~/.config/pi/pi-messaging-relay.json
    ```
 
-3. In Pi, enter the current 32-character URL-safe code obtained from the server's private operator channel:
+   Minimum content for an authentication-off server:
 
-   ```text
-   /relay-pair CODE
+   ```json
+   {"url":"http://127.0.0.1:8080"}
    ```
 
-4. Confirm Pi reports the accepted public client identity. Do not copy the raw code into diagnostics. The code is consumed by that success and cannot pair a second installation.
+   With a secret-protected server, include the same secret the server reads from its secret file:
+
+   ```json
+   {"url":"http://127.0.0.1:8080","secret":"<REDACTED>"}
+   ```
+
+3. Load only this extension for one Pi invocation:
+
+   ```console
+   $ pi --no-extensions -e ./extension/index.ts
+   ```
+
+4. Confirm the connected address in the `relay_auth_accepted` diagnostic. A `relay_config_rejected` warning instead means the file was unreadable, unsafe, or rejected; the session stays disconnected.
 </Steps>
 
 ## Configuration
 
-| Environment variable | Required | Meaning |
+The extension reads one closed JSON object from `~/.config/pi/pi-messaging-relay.json`:
+
+| Member | Required | Meaning |
 |---|---|---|
-| `PI_MESSAGING_RELAY_URL` | For pairing and connection | HTTP loopback origin, for example `http://127.0.0.1:43127`. The extension selects `/v1/pair` or the `/v1/connect` WebSocket. |
-| `PI_MESSAGING_RELAY_STATE_DIR` | No | Installation-key directory. Default: `~/.pi/agent/pi-messaging-relay`. |
+| `url` | Yes | HTTP loopback origin, for example `http://127.0.0.1:8080`. The extension connects to the `/v1/connect` WebSocket path. |
+| `secret` | No | Shared secret sent as `Authorization: Bearer <secret>` at the upgrade. Used verbatim with no trimming, 1–512 UTF-8 bytes. |
 
-The endpoint must be an HTTP origin using a numeric loopback IP. Credentials, extra paths, query strings, fragments, HTTPS, hostnames, and non-loopback addresses fail closed. Use the localhost end of a trusted VPN or SSH forward for cross-machine operation.
+The file must be a current-user-owned regular non-symlink file with mode exactly `0600`. It holds at most 4,096 bytes of valid UTF-8. Duplicate keys, unknown keys, wrong types, trailing JSON, malformed UTF-8, and over-limit content reject the whole file.
 
-The state directory must be owned by the current user with mode `0700`. The extension durably publishes `installation-ed25519.pem` with mode `0600` before contacting the relay, or safely loads an existing Ed25519 PKCS#8 key. The key is installation-wide and independent from per-session route IDs. Two paths can start an immediate connection: pairing successfully during an already-started session causes one pairing-owned attempt, while pairing before lifecycle begins stores the key and the later `session_start` causes one startup-owned attempt. A missing key leaves startup disconnected without creating state.
+`PI_MESSAGING_RELAY_URL` remains an optional override for the url only and is validated the same way. There is deliberately no secret environment variable: environment values are readable through `/proc` by same-user processes.
+
+An absent config file with no environment override leaves the relay disconnected with no connection attempts. An invalid file — unreadable, unsafe form, wrong mode, or rejected JSON — is equivalent to absent: the extension never falls back to an unauthenticated default origin and never crashes the Pi session over it.
+
+<Aside type="caution" title="Treat the config file as authentication material">
+The optional `secret` is the only credential, exactly like a password. Never paste it into logs, shell history, chat, issue text, or screenshots, and never copy the file outside the owning user's home.
+</Aside>
+
+## Authentication modes
+
+**Authentication off (default).** A server started without `--secret-file` accepts every upgrade regardless of headers. A config file with only `url` connects straight away. The relay still binds loopback only, which remains the primary boundary for this single-user scope; other local users and processes on the same machine can still reach the port.
+
+**Secret mode.** A server started with `--secret-file` requires `Authorization: Bearer <secret>` on every `GET /v1/connect` upgrade. A missing header, wrong scheme, wrong secret, and over-limit value all receive the identical closed HTTP 401 with no upgrade. The extension then retries under the bounded reconnect policy until the configuration is corrected.
+
+Rotating a secret means writing a new value into the server's secret file and restarting the server, then updating the client config file. There is no runtime rotation endpoint; a changed secret is one server restart plus one file edit.
+
+To isolate a test configuration from your real home, point `HOME` at a scratch directory that also contains its own `~/.config/pi/pi-messaging-relay.json`.
 
 After an attempt fails or an authenticated socket closes, automatic retries use a nominal 500 ms initial delay, multiplier 2, uniform ±25% jitter, a 30-second maximum actual delay, and at most ten retries for that uninterrupted failure sequence. Authentication success resets the progression. The active Pi session keeps its exact route UUID, cwd, hostname, and complete address throughout those attempts. A new or forked Pi session always gets a fresh route UUID. Reload and resume restore the current session route from hidden non-model session state when valid.
 
-Extension JSONL diagnostics are written to the Pi process's stderr. Follow `relay_session_disconnected` with `relay_reconnect_scheduled`, `relay_reconnect_attempted`, and `relay_reconnect_succeeded`; `retry_index` is one-based and `delay_ms` is the actual jittered delay. Ten failed retries end with warning-level `relay_reconnect_exhausted`. Initial or pairing-owned success remains `relay_auth_accepted`; automatic retry success uses only `relay_reconnect_succeeded`, avoiding a duplicate transition.
+Extension JSONL diagnostics are written to the Pi process's stderr. Follow `relay_session_started`, `relay_auth_accepted`, and `relay_session_disconnected` with `relay_reconnect_scheduled`, `relay_reconnect_attempted`, and `relay_reconnect_succeeded`; `retry_index` is one-based and `delay_ms` is the actual jittered delay. Ten failed retries end with warning-level `relay_reconnect_exhausted`. Initial success remains `relay_auth_accepted`; automatic retry success uses only `relay_reconnect_succeeded`, avoiding a duplicate transition.
 
-To isolate a temporary test installation:
+## Footer connection indicator
 
-```console
-$ install -d -m 700 /tmp/my-relay-extension-state
-$ PI_MESSAGING_RELAY_STATE_DIR=/tmp/my-relay-extension-state \
-    PI_MESSAGING_RELAY_URL=http://127.0.0.1:43127 \
-    pi --no-extensions -e ./extension/index.ts
-```
+When an endpoint is configured, the extension renders one footer status line so you can see the connection state at a glance:
+
+- **● relay (green circle)** — connected. The session can list peers and send messages.
+- **● relay (red circle)** — not connected. This covers the initial connect attempt, reconnect retries under the bounded reconnect policy, an authentication rejection (closed HTTP 401), and a rejected configuration file.
+
+The line shows a fixed `relay` label beside the circle, so the indicator never needs interpretation. When no endpoint is configured at all — no config file at all and no `PI_MESSAGING_RELAY_URL` override — the indicator is hidden entirely: nothing renders, not even a placeholder. An invalid or unsafe config file is a rejected configuration, not an absent one: it keeps the red indicator.
 
 ## Install as a local Pi package
 
@@ -78,96 +109,64 @@ For a self-contained store package, follow [Deploy with Nix](../nix-deployment/#
 $ pi install "$PWD/extension"
 ```
 
-Pi reads the package manifest and loads `extension/index.ts` in future sessions. Set `PI_MESSAGING_RELAY_URL` in the environment that launches Pi. The local-path installation references this checkout rather than copying it, so keep the checkout and its installed dependency available.
+Pi reads the package manifest and loads `extension/index.ts` in future sessions. Deliver the config file at `~/.config/pi/pi-messaging-relay.json` the same way as above. The local-path installation references this checkout rather than copying it, so keep the checkout and its installed dependency available.
 
 ### I/O examples
 
 <Tabs>
-  <TabItem label="Pair input">
-    ```text
-    /relay-pair <REDACTED>
-    ```
-  </TabItem>
-  <TabItem label="Success notification">
-    ```text
-    Relay pairing accepted client identity cli_tkPj7VgbR2HdLQyH.
-    ```
-  </TabItem>
-  <TabItem label="Missing config">
-    ```text
-    Pairing failed: set PI_MESSAGING_RELAY_URL to the relay loopback origin, then retry /relay-pair CODE.
-    ```
-  </TabItem>
-  <TabItem label="Malformed code">
-    ```text
-    Pairing failed: code must contain exactly 32 URL-safe characters.
-    ```
-  </TabItem>
-  <TabItem label="Invalid, expired, or reused code">
-    ```text
-    Pairing failed (pairing_code_invalid): Pairing code is invalid or expired.
-    ```
-  </TabItem>
-</Tabs>
-
-<Tabs>
-  <TabItem label="Authenticated session log">
+  <TabItem label="Config file">
     ```json
-    {"level":"info","event":"relay_auth_accepted","result":"accepted","address":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","route_id":"01993ca1-1111-7aaa-8aaa-111111111111","client_public_key":"ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E=","nonce":"<redacted>","signature":"<redacted>","private_key":"<redacted>","latency_ms":18}
+    {"url":"http://127.0.0.1:8080","secret":"<REDACTED>"}
+    ```
+  </TabItem>
+  <TabItem label="Environment url override">
+    ```console
+    $ PI_MESSAGING_RELAY_URL=http://127.0.0.1:9999 pi
+    ```
+  </TabItem>
+  <TabItem label="Rejected file diagnostic">
+    ```json
+    {"level":"warn","event":"relay_config_rejected","result":"rejected","reason":"unsafe_config_permissions","secret":"<redacted>"}
+    ```
+  </TabItem>
+  <TabItem label="Connected session log">
+    ```json
+    {"level":"info","event":"relay_auth_accepted","result":"accepted","address":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","route_id":"01993ca1-1111-7aaa-8aaa-111111111111","latency_ms":18}
     ```
   </TabItem>
   <TabItem label="Reconnect schedule log">
     ```json
-    {"level":"info","event":"relay_reconnect_scheduled","result":"scheduled","reason":"session_disconnected","retry_index":1,"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111","client_public_key":"ed25519:11qYAYdk9Jgqgfdm2r7wIfdHyE5gq5sI1sS0l7l2a9E="}
+    {"level":"info","event":"relay_reconnect_scheduled","result":"scheduled","reason":"session_disconnected","retry_index":1,"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111"}
     ```
   </TabItem>
-  <TabItem label="First-page model tool input">
-    ```json
-    {}
-    ```
-  </TabItem>
-  <TabItem label="Next-page model tool input">
-    ```json
-    {"cursor":"cur_L3Nydi9iYWNrZW5kQHdvcmtzdGF0aW9uLWIjMDE5OTNjYTItMjIyMi03YmJiLTliYmItMjIyMjIyMjIyMjIy"}
-    ```
-  </TabItem>
-  <TabItem label="list_peers output">
-    ```json
-    {"peers":[{"address":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"}]}
+  <TabItem label="Disconnected tool error">
+    ```text
+    Relay is disconnected. Write ~/.config/pi/pi-messaging-relay.json with mode 0600 (url required, secret optional) or set PI_MESSAGING_RELAY_URL, then restart the session.
     ```
   </TabItem>
 </Tabs>
 
 ## Security
 
-- The installation private key never leaves the extension directory and never appears in a notification or structured log. WebSocket authentication signs a fresh server nonce; nonce, signature, and private-key log fields always contain `<redacted>`.
-- Pairing-code and private-key log fields retain their names but always contain `<redacted>`.
-- Public key and accepted client ID may appear in logs for support correlation.
-- The extension accepts only an exact 32-character URL-safe code. It rejects malformed or oversized command input locally before creating key state or contacting the relay; an accepted request is 126 bytes, below the 4,096-byte server limit.
-- A syntactically valid code is usable only before its ten-minute deadline and only until its first successful pairing. The exact deadline is expired. Incorrect, expired, and reused codes all receive the same rejection and add no relay allowlist entry.
-- The raw code is present in the localhost request because the relay must verify it. Pairing failure output omits the code entirely, and structured logs use `<redacted>` authentication fields rather than echoing the submitted or current value.
-- The extension reads at most 4,096 pairing-response bytes, requires the JSON media type, rejects ambiguous response shapes, and accepts only `cli_` plus a 16-character URL-safe token as the client identity.
-- Its pinned WebSocket client enforces a 512 KiB socket-wide ceiling before complete message delivery. During authentication, complete challenge and welcome messages still have a 16 KiB semantic ceiling. Shutdown requests graceful close for at most one second, then destroys and settles an unresponsive transport.
+- The optional shared secret exists only in the config file and in process memory. It never appears in a notification, command output, or structured log; config diagnostics keep the `secret` field with the literal `<redacted>` value.
+- Complete opaque route addresses, cwd, hostname, and correlation IDs remain visible for support correlation. They are not authorization evidence; the server authenticates only the configured upgrade secret.
 - Message destinations are complete opaque addresses, never authorization components. A successful `received` means only that the intended extension attempted `pi.sendUserMessage`; message bodies are neither persisted nor logged. `relay_send_settled` describes the `agent_send` tool result with authenticated sender route, message ID, requested recipient route, status, reason, latency, and `body: "<redacted>"`; it does not claim stronger Pi receipt.
 - A `list_peers` cursor is navigation only, not authorization. Copy only `next_cursor` returned by the relay; accepted cursors are at most 5,856 characters, and omitting one starts a fresh traversal. Roster pages are capped at 48 KiB for the complete WebSocket frame and contain only opaque addresses.
-- Pairing failures do not invoke a model, inject a Pi message, or silently claim success.
-- Never copy `installation-ed25519.pem`, the raw startup code, or their contents into an issue or chat.
-- Public keys, complete routes, and opaque message IDs remain visible for support correlation. Pairing code, nonce, signature, private-key, and body fields use literal `<redacted>`. Heartbeat ping/pong ticks are not logged at normal levels.
+- Configuration failures do not invoke a model, inject a Pi message, or silently claim success. A rejected config file produces one closed warning and a disconnected session.
+- The extension accepts only an HTTP loopback origin. Credentials, extra paths, query strings, fragments, HTTPS, hostnames, and non-loopback addresses fail closed. Use the localhost end of a trusted VPN or SSH forward for cross-machine operation.
+- Its pinned WebSocket client enforces a 512 KiB socket-wide ceiling before complete message delivery; hello and welcome messages keep a 16 KiB semantic ceiling. Shutdown requests graceful close for at most one second, then destroys and settles an unresponsive transport.
 - The extension does not expose send transport request IDs or server-generated delivery IDs in its settlement event because the model-tool boundary does not own them. Match `message_id` and both routes to the server's authoritative `send_settled` when deeper transport correlation is needed.
-- Relay v1 emits logs only. It has no OpenTelemetry exporter, metrics endpoint, or traces. See [Structured relay diagnostics](../../developer/relay/structured-diagnostics/) for complete event schemas and support workflow.
+- The relay emits logs only. It has no OpenTelemetry exporter, metrics endpoint, or traces. See [Structured relay diagnostics](../../developer/relay/structured-diagnostics/) for complete event schemas and support workflow.
 
 ## Troubleshooting
 
 - **`Cannot find module 'typebox'` or `Cannot find module 'ws'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`. This local package resolution is required for Nix-installed Pi too.
 - **Command or tools absent** — confirm Pi loaded `extension/index.ts`; retry with the temporary `-e` command above and inspect Pi's extension issues.
-- **Endpoint not configured or invalid** — set `PI_MESSAGING_RELAY_URL` to the exact numeric loopback origin printed in `server_ready`, with no `/v1/pair` suffix.
-- **Unsafe state permissions** — verify the configured path is the intended dedicated key directory, then set its mode to `0700`; set the key file to `0600` only after verifying ownership.
-- **Relay could not be reached** — verify the server is still running at the configured address and the ten-second request deadline was not exceeded.
-- **Pairing code format rejected locally** — paste the exact 32-character URL-safe value with no surrounding whitespace. The extension has not created key state or contacted the relay.
-- **Pairing code rejected by the relay** — the code was incorrect, reached its ten-minute deadline, or was already accepted once; the relay deliberately returns the same message for all three. Obtain a fresh code by restarting the server with a new unused private code-file path.
-- **Authentication rejected after pairing or relay restart** — confirm Pi still uses the extension state directory that owns the paired key and the server restarted with the exact durable `--state-dir` used for pairing. Restarting without that explicit directory uses empty temporary authorization state and requires deliberate re-pairing.
-- **Connection drops after authentication** — the route disappears from live presence immediately. Wait for bounded automatic reconnect; the same complete address returns only after authentication succeeds. Ten exhausted retries leave the session disconnected until another session lifecycle or permitted pairing-owned path starts a new sequence.
-- **Pairing and authentication succeeded but `list_peers` says disconnected** — the retained socket closed or no retry has authenticated yet. Wait through the bounded retry sequence. Failed attempts do not expose stale presence.
+- **`relay_config_rejected` at startup** — verify the file is the exact fixed path `~/.config/pi/pi-messaging-relay.json`, is a regular non-symlink file owned by the current user with mode exactly `0600`, holds at most 4,096 bytes of valid UTF-8, and contains only `url` plus optional `secret` with no duplicate or unknown keys. Fix the file and restart the Pi session; the extension never retries a rejected file mid-session.
+- **`Relay is disconnected` despite a config file** — the rejected or absent file is equivalent to no configuration. Correct it and restart the session; the diagnostic `reason` distinguishes unreadable, unsafe-form, wrong-mode, and JSON rejections.
+- **`url` rejected** — use the exact numeric loopback origin printed in `server_ready`, for example `http://127.0.0.1:8080`. No paths, query strings, HTTPS, hostnames, or non-loopback IPs.
+- **`relay_auth_rejected` or bounded retries never succeed** — the server runs with a secret and the config file's `secret` is missing or wrong, or the server was restarted with a rotated secret while the client still has the old value. Write the matching current secret into the config file and restart the session. The relay deliberately returns the same closed 401 for every wrong credential spelling.
+- **Connection drops after authentication** — the route disappears from live presence immediately. Wait for bounded automatic reconnect; the same complete address returns only after authentication succeeds. Ten exhausted retries leave the session disconnected until another session lifecycle starts a new sequence.
 - **`list_peers` or `agent_send` reports a concurrent request** — wait for the existing outgoing operation to settle. The extension deliberately sends no second operation and creates no operation queue.
 - **`agent_send` returns `timeout/offline`** — the exact destination is not currently published. The retained socket remains usable; refresh `list_peers` or send elsewhere.
 - **`agent_send` returns `timeout/recipient_disconnected`** — lookup found the recipient, but the relay observed that exact session or offer write disappear before ACK. Every affected pending slot is released, the sender socket remains usable, and recipient reauthentication does not replay the interrupted offer.

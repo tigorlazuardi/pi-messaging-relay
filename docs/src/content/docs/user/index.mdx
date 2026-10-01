@@ -6,11 +6,11 @@ sidebar:
   order: -1000000000000000
 ---
 
-This namespace documents the service from an operator's and user's perspective.
+This namespace documents the service from an operator's and user's perspective. Protocol v2 replaced v1 pairing with one optional static shared secret and one client config file; v1 pairing, installation keys, and allowlists no longer exist and there is no automatic migration.
 
-Use **[Start and configure the relay server](./start-relay-server/)** to build the Go process, select a loopback port, choose temporary or durable allowlist state, and obtain a startup code through a private operator file.
+Use **[Start and configure the relay server](./start-relay-server/)** to build the Go process, select a loopback port, choose authentication-off or shared-secret mode through one mode-`0600` secret file, and migrate a v1 deployment.
 
-Use **[Install and pair the relay extension](./install-relay-extension/)** to configure the loopback endpoint and establish one Ed25519 installation identity with `/relay-pair CODE`.
+Use **[Install and configure the relay extension](./install-relay-extension/)** to deliver the loopback endpoint and optional shared secret through one mode-`0600` client config file.
 
 Use **[List online relay peers](./list-peers/)** to read bounded live address-only pages, continue with an opaque cursor, and refresh after presence changes.
 

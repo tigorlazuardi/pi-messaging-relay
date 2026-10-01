@@ -12,6 +12,10 @@ import Decision from '../../../../components/Decision.astro';
 This document defines the accepted v1 external contract. It does not select Go packages, synchronization primitives, or persistence formats beyond the stated trust and durability boundaries.
 </Aside>
 
+<Aside type="caution" title="Authentication superseded by protocol v2">
+Protocol v2 ([online relay authentication v2](../online-relay-auth-v2/)) removed pairing, the nonce challenge, the signed hello, installation keys, and the allowlist; authentication is now one optional static shared secret checked at the HTTP upgrade. The pairing and signed-hello material below is retained v1 history and no longer describes shipped behavior. The envelope, roster, delivery, settlement, and framing semantics in this page remain authoritative and unchanged in v2.
+</Aside>
+
 ## Contract boundary
 
 The Pi extension exposes two model tools:

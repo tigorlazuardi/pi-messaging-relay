@@ -33,7 +33,7 @@ stateDiagram-v2
     ErrorWrite --> Closed: bounded best-effort error, then hard close
 ```
 
-Server authentication keeps its narrower 16 KiB client-hello limit and `not_authorized` behavior. The extension's receive transport uses a socket-wide 512 KiB pre-materialization ceiling and, during challenge and welcome, rejects complete authentication messages above a separate 16 KiB semantic ceiling. After welcome, each complete client-to-server WebSocket message must be one JSON object. Fragmentation does not create multiple application messages: the parser streams and accounts for all fragments as one message. The coder/websocket read limit and an application-side bounded reader cap keep input buffering to at most 512 KiB plus the single over-limit detection byte. Compression is disabled, so accounting is the reassembled text message's UTF-8 byte count.
+Server establishment keeps its narrower 16 KiB client-hello limit; authentication happens at the HTTP upgrade before any WebSocket exists under [online relay authentication v2](../online-relay-auth-v2/), so post-upgrade protocol events never carry credentials. The extension's receive transport uses a socket-wide 512 KiB pre-materialization ceiling and, during hello and welcome, rejects complete establishment messages above a separate 16 KiB semantic ceiling. After welcome, each complete client-to-server WebSocket message must be one JSON object. Fragmentation does not create multiple application messages: the parser streams and accounts for all fragments as one message. The coder/websocket read limit and an application-side bounded reader cap keep input buffering to at most 512 KiB plus the single over-limit detection byte. Compression is disabled, so accounting is the reassembled text message's UTF-8 byte count.
 
 The complete bytes must be valid UTF-8 and contain exactly one JSON value with no trailing JSON. A token pass detects duplicate object names before typed decoding. It descends through every object and array, including application-owned `body` objects, so decoding never normalizes duplicate names away. The pass accepts at most 64 nested object or array containers, counting the outer envelope as depth 1, and rejects before descending into depth 65. Duplicate-name checks still run in every object through depth 64. Arrays do not allocate object-key maps.
 
@@ -83,7 +83,7 @@ The boundary owns framing, syntax, shape, and stable terminal errors. Operation 
 
 `protocol_rejected` is a warning with `result: "rejected"`, stable `code` and `reason`, and validated request/type correlation when safe. Unknown submitted types, raw frames, parser diagnostics, addresses embedded in malformed operations, and bodies are omitted. Nesting beyond 64 containers is `invalid_frame`. `operation_denied` is a warning; `operation_settled` is informational. Body-limit and sender-capacity denials include request ID, message ID, authenticated sender route, `status: "denied"`, their exact reason/code, and `body: "<redacted>"`. Both omit recipient route and delivery ID because rejection precedes recipient lookup. Invalid dispatcher responses emit neither operation event; fatal diagnostics omit payload values and encoder details that could contain body data.
 
-The event sink remains part of settlement correctness. A failed event write reaches the fatal runtime latch, closes the affected socket, prevents a successful `server_stopped` report, and causes non-zero process termination. No protocol event contains authentication secrets, nonce, signature, private key, or message body.
+The event sink remains part of settlement correctness. A failed event write reaches the fatal runtime latch, closes the affected socket, prevents a successful `server_stopped` report, and causes non-zero process termination. No protocol event contains the shared secret or message body.
 
 ### I/O examples
 
@@ -131,12 +131,12 @@ The event sink remains part of settlement correctness. A failed event write reac
   </TabItem>
   <TabItem label="Injected denial result">
     ```json
-    {"v":1,"type":"send_result","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","payload":{"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"not_authorized"}}
+    {"v":1,"type":"send_result","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","payload":{"message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","status":"denied","reason":"message_id_conflict"}}
     ```
   </TabItem>
   <TabItem label="Denial event">
     ```json
-    {"level":"warn","event":"operation_denied","result":"denied","reason":"not_authorized","code":"not_authorized","type":"send","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf"}
+    {"level":"warn","event":"operation_denied","result":"denied","reason":"message_id_conflict","code":"message_id_conflict","type":"send","request_id":"01993c84-5d38-7d75-8bc1-f945bfa42cdf","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","status":"denied","body":"<redacted>","latency_ms":0}
     ```
   </TabItem>
 </Tabs>

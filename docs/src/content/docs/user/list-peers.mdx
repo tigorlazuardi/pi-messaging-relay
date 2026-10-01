@@ -35,7 +35,7 @@ Only one outgoing `list_peers` or `agent_send` operation can be in flight on one
 
 | Condition | Error |
 |---|---|
-| No authenticated connection | `Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.` |
+| No authenticated connection | `Relay is disconnected. Write ~/.config/pi/pi-messaging-relay.json with mode 0600 (url required, secret optional) or set PI_MESSAGING_RELAY_URL, then restart the session.` |
 | Another list is in flight | `Relay list_peers already has one request in flight.` |
 | Request aborted | `Relay list_peers request was aborted.` |
 | Response deadline | `Relay list_peers response timed out.` |

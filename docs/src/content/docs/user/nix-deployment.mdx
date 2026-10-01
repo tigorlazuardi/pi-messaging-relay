@@ -1,6 +1,6 @@
 ---
 title: Deploy with Nix
-description: Consume the pinned relay flake, run its system or user service, recover stale pairing credentials, and upgrade or roll back safely.
+description: Consume the pinned relay flake, run its system or user service, provision optional shared-secret authentication, recover a broken secret file, and upgrade or roll back safely.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -35,7 +35,7 @@ Add the complete store root to the Pi package list owned by your configuration:
 }
 ```
 
-The package root contains production `typebox` and `ws` dependencies. It needs no activation-time `npm install`. Set `PI_MESSAGING_RELAY_URL` where Pi starts, using the service's numeric loopback origin, for example `http://127.0.0.1:43127`.
+The package root contains production `typebox` and `ws` dependencies. It needs no activation-time `npm install`. Deliver the client config file at the fixed `~/.config/pi/pi-messaging-relay.json` path with mode `0600`, outside the store: one closed JSON object with the service's numeric loopback origin as `url` and the optional shared `secret` matching the server's secret file. The path is operator-owned runtime input, exactly like the server secret file.
 
 ## Choose one service scope
 
@@ -70,30 +70,37 @@ The package root contains production `typebox` and `ws` dependencies. It needs n
   </TabItem>
 </Tabs>
 
-Both modules expose only `enable`, `package`, `host`, `port`, and `pairingCodeFile`. The pairing filename is either `null` or one safe direct-child basename. It cannot be `.`, `..`, `allowlist.json`, begin with `-`, or contain whitespace, `%`, quotes, control characters, or path separators.
+Both modules expose only `enable`, `package`, `host`, `port`, and `secretFile`. `secretFile` is `null` (authentication off) or one absolute host path outside `/nix/store`, passed verbatim to the server's `--secret-file`; the module never copies, reads, or embeds the secret. A relative path, an empty value, or a Nix-store path — including any derivation-produced string — fails evaluation.
 
-## Pair one extension
+## Enable authentication (secret file)
 
-`pairingCodeFile = null` is the safe default. Pairing requires one temporary deployment generation.
+`secretFile = null` is the safe default: the server starts with authentication off and accepts every upgrade on loopback. To enable authentication, provision one operator-owned secret file.
 
 <Steps>
-1. Choose a unique basename, such as `pairing-2026-09-13-a`, and set `pairingCodeFile` to it.
-2. Activate the NixOS or Home Manager generation.
-3. In a trusted local terminal, read only the selected file:
+1. Generate a secret and write it into a new direct child of the service's state directory with mode `0600` owned by the service identity. System scope:
 
    ```console
-   $ sudo cat /var/lib/pi-messaging-relay/pairing-2026-09-13-a
+   $ sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /var/lib/pi-messaging-relay/relay-secret; chown pi-messaging-relay:pi-messaging-relay /var/lib/pi-messaging-relay/relay-secret'
    ```
 
    For Home Manager:
 
    ```console
-   $ cat "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/pairing-2026-09-13-a"
+   $ sh -c 'umask 077; head -c 32 /dev/urandom | base64 > "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/relay-secret"'
    ```
 
-4. Enter the value directly into `/relay-pair` in Pi. Never paste it into logs, chat, screenshots, or shell arguments.
-5. Return `pairingCodeFile` to `null` and activate again. Successful pairing or clean shutdown removes the server-owned current file; the allowlist remains.
+2. Set `secretFile` to that absolute host path and activate the generation. The server then requires `Authorization: Bearer <secret>` on every upgrade and reports `"auth":"secret"` in `server_ready`.
+3. Write the same secret into the client config file at `~/.config/pi/pi-messaging-relay.json` with mode `0600`.
+4. Verify the active mode from the scope's journal, not from connection probes:
+
+   ```console
+   $ sudo journalctl -u pi-messaging-relay.service -o cat | grep '"event":"server_ready"'
+   ```
 </Steps>
+
+<Aside type="danger" title="Secrets never enter the Nix store">
+The store is world-readable. The secret value may exist only in the mode-`0600` server secret file and the mode-`0600` client config file, both outside `/nix/store`. A secret found in a Nix option, module argument, unit text, build output, or journal is a defect. Rotating the secret means rewriting the file and restarting the service; there is no runtime rotation endpoint.
+</Aside>
 
 ## Read journals
 
@@ -111,35 +118,35 @@ $ journalctl --user -u pi-messaging-relay.service
 $ journalctl --user -u pi-messaging-relay.service -o cat | grep '"event":"server_ready"'
 ```
 
-The daemon emits one JSON object per line. Normal lifecycle events include `server_ready` and `server_stopped`; fatal startup failures use `server_failed`. Pairing codes, private keys, nonces, signatures, and bodies remain `<redacted>`.
+The daemon emits one JSON object per line. Normal lifecycle events include `server_ready` (with the active `auth` mode, `"off"` or `"secret"`) and `server_stopped`; fatal startup failures use `server_failed`. The shared secret and message bodies remain `<redacted>`.
 
-## Recover a stale pairing file
+## Recover a broken secret file
 
-A crash can leave the selected file in place. The server refuses to overwrite or delete it, retries at most three starts in 30 seconds, and can reach `start-limit-hit`. Merely reactivating does not clear that counter.
+A set-but-broken secret — missing file, wrong mode, wrong owner, symlink, empty or over-limit value — fails startup before `server_ready` and never degrades to authentication off. The bounded start policy retries at most three starts in 30 seconds and can reach `start-limit-hit`. Merely reactivating does not clear that counter.
 
-<Aside type="danger" title="Credential deletion is deliberate and irreversible">
-First stop the correct service scope. Inspect the exact path, regular-file type, owner, and mode. Preserve it when evidence is needed. If deleting, target only the verified stale pairing basename—never the state directory or `allowlist.json`. Deletion destroys that undisclosed pairing code but does not revoke already paired keys.
+<Aside type="danger" title="Credential changes are deliberate and irreversible">
+First stop the correct service scope. Inspect the exact path, regular-file type, owner, and mode. Preserve the file when evidence is needed. If changing or removing, target only the verified `secretFile` path — never the state directory. Removing the secret returns the service to authentication off; rewriting it rotates the credential every configured client must match.
 </Aside>
 
 ### System service recovery
 
 <Steps>
-1. Stop and inspect the exact failed unit and entry:
+1. Stop and inspect the exact failed unit and configured secret path:
 
    ```console
    $ sudo systemctl stop pi-messaging-relay.service
    $ sudo systemctl status pi-messaging-relay.service
    $ sudo stat --format='path=%n type=%F owner=%U:%G mode=%a' \
-       /var/lib/pi-messaging-relay/pairing-2026-09-13-a
+       /var/lib/pi-messaging-relay/relay-secret
    ```
 
    Continue only if the path is the intended regular file, owner is `pi-messaging-relay:pi-messaging-relay`, and mode is `600`.
-2. Either preserve the entry and select a new unique basename, or deliberately remove only that verified entry:
+2. Repair the file (mode, owner, or content) or deliberately remove it and set `secretFile` to `null` to return to authentication off:
 
    ```console
-   $ sudo unlink -- /var/lib/pi-messaging-relay/pairing-2026-09-13-a
+   $ sudo unlink -- /var/lib/pi-messaging-relay/relay-secret
    ```
-3. Set `pairingCodeFile` to the new basename, or to `null` when no new pairing is needed.
+3. Set `secretFile` to the corrected absolute path, or to `null` when authentication off is intended.
 4. Reset the system-scope failure counter:
 
    ```console
@@ -180,22 +187,22 @@ First stop the correct service scope. Inspect the exact path, regular-file type,
 ### User service recovery
 
 <Steps>
-1. Stop and inspect the user unit and exact entry. If `XDG_STATE_HOME` is unset, use `$HOME/.local/state`:
+1. Stop and inspect the user unit and exact configured secret path. If `XDG_STATE_HOME` is unset, use `$HOME/.local/state`:
 
    ```console
    $ systemctl --user stop pi-messaging-relay.service
    $ systemctl --user status pi-messaging-relay.service
    $ stat --format='path=%n type=%F owner=%U:%G mode=%a' \
-       "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/pairing-2026-09-13-a"
+       "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/relay-secret"
    ```
 
    Continue only if it is the intended regular file, owned by the user-manager owner and mode `600`.
-2. Preserve it and choose a new basename, or deliberately remove only the verified entry:
+2. Repair the file (mode, owner, or content) or deliberately remove it and set `secretFile` to `null`:
 
    ```console
-   $ unlink -- "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/pairing-2026-09-13-a"
+   $ unlink -- "${XDG_STATE_HOME:-$HOME/.local/state}/pi-messaging-relay/relay-secret"
    ```
-3. Set a new unique `pairingCodeFile`, or `null` when pairing is unnecessary.
+3. Set `secretFile` to the corrected absolute path, or `null` when authentication off is intended.
 4. Reset the user-scope failure counter:
 
    ```console
@@ -330,11 +337,11 @@ This remains a loopback origin. It is not a proxy recipe and does not make publi
      const fs = require("node:fs");
      const response = JSON.parse(fs.readFileSync(0, "utf8"));
      const command = response.data?.commands?.find((item) =>
-       item.name === "relay-pair" && item.source === "extension");
+       item.name === "list_peers" && item.source === "extension");
      if (response.id !== "commands" || response.command !== "get_commands" ||
          response.success !== true || typeof command?.sourceInfo?.path !== "string") process.exit(1);
      process.stdout.write(command.sourceInfo.path);
-   ')" || { printf '%s\n' 'Pi get_commands response lacked relay-pair provenance.' >&2; exit 1; }
+   ')" || { printf '%s\n' 'Pi get_commands response lacked list_peers provenance.' >&2; exit 1; }
 
    case "$source_path" in
      "$new_extension"/*)
@@ -348,7 +355,7 @@ This remains a loopback origin. It is not a proxy recipe and does not make publi
    esac
    ```
 
-   Success requires `relay-pair`'s nested `sourceInfo.path` to begin with the complete `new pinned extension root` printed in step 2 plus `/`; compare the hash-bearing `/nix/store/...-pi-messaging-relay-extension` path, not only its package name. The probe's private stderr is Pi-side extension lifecycle evidence; keep it local because operational diagnostics can contain public identity and route metadata.
+   Success requires `list_peers`'s nested `sourceInfo.path` to begin with the complete `new pinned extension root` printed in step 2 plus `/`; compare the hash-bearing `/nix/store/...-pi-messaging-relay-extension` path, not only its package name. The probe must also confirm the response contains no `relay-pair` command: protocol v2 removed pairing. The probe's private stderr is Pi-side extension lifecycle evidence; keep it local because operational diagnostics can contain public identity and route metadata.
 5. In a journal terminal, capture a second cursor and begin the matching 30-second watcher. Immediately afterward, run normal configured Pi as `pi` in another trusted terminal. Do not use the isolated probe environment from step 4.
 
    <Tabs>
@@ -392,17 +399,17 @@ This remains a loopback origin. It is not a proxy recipe and does not make publi
    ```
 
    For Home Manager, inspect `home-manager generations`, verify the selected previous store path, then run its `activate` executable. Re-run steps 2–5 after rollback: `new_extension` must now be the known-good pinned store root, and Pi's nested `sourceInfo.path` must be beneath that rollback root.
-7. Re-pin the known-good relay lock revision before normal activation. Package rollback does not erase or roll back the retained allowlist.
+7. Re-pin the known-good relay lock revision before normal activation. Package rollback does not change the operator-owned secret file or the client config file; the matched pair keeps working across the rollback.
 </Steps>
 
 ## Limits and troubleshooting
 
 - One service instance and fixed scope-owned state are supported. Arbitrary state roots, public listeners, socket activation, containers, and multiple instances are outside this contract.
-- **`pairingCodeFile` evaluation failure** — use one safe basename, not a path.
+- **`secretFile` evaluation failure** — use one absolute host path outside `/nix/store`; relative and store paths fail evaluation.
 - **Unit reaches `start-limit-hit`** — follow the matching scope procedure; resetting the other scope has no effect.
-- **`file exists` in `server_failed`** — preserve the stale entry or verify and unlink exactly it, then select a new basename or `null`.
+- **`server_failed` names the secret file** — a missing, wrong-mode, wrong-owner, symlinked, empty, or over-limit secret file fails startup; repair it per the recovery procedure above.
 - **No user service after logout** — decide whether operator policy permits lingering. The module does not mutate it.
-- **Pi cannot connect** — ensure `PI_MESSAGING_RELAY_URL` uses configured numeric loopback host and port. For IPv6, use `http://[::1]:43127`.
+- **Pi cannot connect** — ensure the config file's `url` uses the configured numeric loopback host and port. For IPv6, use `http://[::1]:43127`. Verify the file's mode is `0600`; a rejected file behaves as absent. When `secretFile` is set, the config file's `secret` must match the server file's current content.
 - **State permission failure** — do not weaken mode `0700` or casually change ownership. Verify service scope and restore its owner.
 
 ### I/O examples
@@ -414,22 +421,23 @@ This remains a loopback origin. It is not a proxy recipe and does not make publi
       enable = true;
       host = "::1";
       port = 43127;
-      pairingCodeFile = "pairing-2026-09-13-a";
+      secretFile = "/var/lib/pi-messaging-relay/relay-secret";
     };
     ```
   </TabItem>
   <TabItem label="Runtime result">
     ```text
     unit: pi-messaging-relay.service (system scope)
-    argv: --listen [::1]:43127 --state-dir /var/lib/pi-messaging-relay
+    argv: --listen [::1]:43127 --state-dir /var/lib/pi-messaging-relay --secret-file /var/lib/pi-messaging-relay/relay-secret
     state mode: 0700
-    journal: {"level":"info","event":"server_ready",...}
+    journal: {"level":"info","event":"server_ready","auth":"secret",...}
     ```
   </TabItem>
   <TabItem label="Invalid input">
     ```text
-    pairingCodeFile = "../code"
-    evaluation fails before activation
+    secretFile = "relay-secret"            # relative path
+    secretFile = "/nix/store/<hash>-secret" # store path — forbidden
+    evaluation error: secretFile must be an absolute host path outside /nix/store
     ```
   </TabItem>
 </Tabs>
