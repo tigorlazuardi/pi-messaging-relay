@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   RelayCardComponent,
   Text,
+  truncateStyledToWidth,
   truncateToWidth,
   visibleWidth,
   wrapText,
@@ -103,5 +104,38 @@ test("narrow card degrades to one truncated line without a frame", () => {
 test("Text renders one line regardless of width", () => {
   const component = new Text("hello");
   assert.deepEqual(component.render(10), ["hello"]);
-  assert.deepEqual(component.render(2), ["hello"]);
+  assert.deepEqual(component.render(2), ["h…"]); // width-1 chars + ellipsis
+});
+
+test("Text truncates styled tool lines to terminal width", () => {
+  // Shape of the crashing line: label + quoted body + → + full address.
+  const theme = {
+    fg: (color: string, s: string) => `\u001B[${color === "accent" ? 34 : color === "muted" ? 90 : 1}m${s}\u001B[22m`,
+    bold: (s: string) => s,
+  };
+  const styled = theme.fg("toolTitle", theme.bold("agent_send")) +
+    theme.fg("muted", ` "${"x".repeat(60)}"`) +
+    " → " +
+    theme.fg("accent", "/home/homeserver/homelab@Config-Management");
+  const component = new Text(styled);
+  for (const width of [91, 55, 40, 20]) {
+    const [line] = component.render(width);
+    assert.ok(line, `line for width ${width}`);
+    assert.equal(visibleWidth(line), width, `width ${width}`);
+  }
+  assert.match(component.render(20)[0]!, /\u001B\[0m$/); // style closed
+});
+
+test("truncateStyledToWidth preserves styles and closes open SGR", () => {
+  const styled = "\u001B[1mbold-label\u001B[22m\u001B[2m \"body text\"\u001B[22m → \u001B[34m/path@host\u001B[22m";
+  const out = truncateStyledToWidth(styled, 30);
+  assert.equal(visibleWidth(out), 30);
+  assert.match(out, /\u001B\[0m$/); // style closed so color cannot bleed
+  assert.match(out, /bold-label/);
+  // Untouched input is returned as-is (no ellipsis/reset appended).
+  const untouched = truncateStyledToWidth("\u001B[1mshort\u001B[22m", 50);
+  assert.equal(untouched, "\u001B[1mshort\u001B[22m");
+  // Pi-style nested wraps (intermediate resets) still measured correctly.
+  const wrapped = "\u001B[4murl\u001B[24m\u001B[24mrest\u001B[24m";
+  assert.equal(visibleWidth(truncateStyledToWidth(wrapped, 4)), 4);
 });

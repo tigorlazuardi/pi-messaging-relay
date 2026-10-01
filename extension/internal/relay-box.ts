@@ -23,6 +23,45 @@ export function visibleWidth(text: string): number {
   return width;
 }
 
+/* Zero-width exclusions shared by the width helpers. */
+function isZeroWidth(code: number): boolean {
+  // Combining marks and zero-width joiners add no columns.
+  return (code >= 0x0300 && code <= 0x036f) || code === 0x200d || code === 0xfe0f;
+}
+
+/** Hard-truncates to at most width visible columns while preserving ANSI SGR
+ * sequences, keeping a trailing ellipsis within the budget when characters
+ * drop, and closing any open style so color cannot bleed past the line. */
+export function truncateStyledToWidth(text: string, width: number): string {
+  if (width <= 0) return "";
+  const totalVisible = visibleWidth(text);
+  if (totalVisible <= width) return text;
+  let out = "";
+  let column = 0;
+  let sawStyle = false;
+  const budget = width - 1; // reserve one column for the ellipsis
+  for (let index = 0; index < text.length;) {
+    const sgr = /^\u001B\[[0-9;]*m/.exec(text.slice(index));
+    if (sgr) {
+      out += sgr[0];
+      sawStyle = true;
+      index += sgr[0].length;
+      continue;
+    }
+    const code = text.codePointAt(index) ?? 0;
+    const character = String.fromCodePoint(code);
+    if (!isZeroWidth(code)) {
+      if (column >= budget) break;
+      column += 1;
+    }
+    out += character;
+    index += character.length;
+  }
+  out += "…";
+  if (sawStyle) out += "\u001B[0m";
+  return out;
+}
+
 /** Hard-truncates to at most width visible columns, keeping a trailing
  * ellipsis within the budget when characters drop. */
 export function truncateToWidth(text: string, width: number): string {
@@ -79,8 +118,8 @@ export class Text {
     this.value = value;
   }
 
-  render(_width: number): string[] {
-    return [this.value];
+  render(width: number): string[] {
+    return [truncateStyledToWidth(this.value, width)];
   }
 
   invalidate(): void {}
