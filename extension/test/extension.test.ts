@@ -1,21 +1,55 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
 
+import { clientConfigurationPath, ENDPOINT_ENV } from "../internal/client-config.ts";
+import { installReconnectDependenciesForTest } from "../internal/reconnect.ts";
 import { FakePiHost } from "./fake-pi-host.ts";
 
 const EXPECTED_DISCONNECTED_ERROR =
-  "Relay is disconnected. Pair this installation with /relay-pair CODE, then wait for a relay-enabled connection release.";
-const EXPECTED_PAIRING_UNCONFIGURED =
-  "Pairing failed: set PI_MESSAGING_RELAY_URL to the relay loopback origin, then retry /relay-pair CODE.";
-const VALID_PAIRING_CODE = "0123456789abcdefghijklmnopqrstuv";
+  "Relay is disconnected. Write ~/.config/pi/pi-messaging-relay.json with mode 0600 (url required, secret optional) or set PI_MESSAGING_RELAY_URL, then restart the session.";
 
 async function loadRelayExtension() {
   return (await import("../index.ts")).default;
+}
+
+async function loadIsolatedRelayExtension(marker: string) {
+  return (await import(`../index.ts?${marker}=${randomUUID()}`)).default;
+}
+
+async function createHome(context: { after(callback: () => Promise<void>): void }): Promise<string> {
+  const home = await mkdtemp(join(tmpdir(), "pi-relay-extension-"));
+  context.after(async () => rm(home, { recursive: true, force: true }));
+  return home;
+}
+
+async function writeConfig(home: string, text: string, mode: number): Promise<void> {
+  await mkdir(join(home, ".config", "pi"), { recursive: true, mode: 0o700 });
+  await writeFile(clientConfigurationPath(home), text, { mode: 0o600 });
+  await chmod(clientConfigurationPath(home), mode);
+}
+
+function installIsolatedHome(home: string): { restore(): void } {
+  const previousHome = process.env.HOME;
+  const previousXDG = process.env.XDG_CONFIG_HOME;
+  const previousEndpoint = process.env[ENDPOINT_ENV];
+  process.env.HOME = home;
+  delete process.env.XDG_CONFIG_HOME;
+  delete process.env[ENDPOINT_ENV];
+  return {
+    restore: () => {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousXDG === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousXDG;
+      if (previousEndpoint === undefined) delete process.env[ENDPOINT_ENV];
+      else process.env[ENDPOINT_ENV] = previousEndpoint;
+    },
+  };
 }
 
 function installResourceGuards(resourceAttempts: string[]): () => void {
@@ -31,7 +65,7 @@ function installResourceGuards(resourceAttempts: string[]): () => void {
       "setInterval",
       (..._args: unknown[]) => {
         resourceAttempts.push("setInterval");
-        throw new Error("Timer creation forbidden while disconnected");
+        throw new Error("Interval creation forbidden while disconnected");
       },
     ],
     [
@@ -90,23 +124,20 @@ function captureStructuredErrors(): {
   };
 }
 
-test("loads and runs disconnected handlers without starting resources", { concurrency: false }, async () => {
+test("loads and runs disconnected handlers without starting resources", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
   const host = new FakePiHost();
   const resourceAttempts: string[] = [];
   const restoreResources = installResourceGuards(resourceAttempts);
   const logs = captureStructuredErrors();
-  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
-  delete process.env.PI_MESSAGING_RELAY_URL;
 
   try {
-    const extensionUrl = new URL("../index.ts", import.meta.url);
-    extensionUrl.searchParams.set("resource-guard", randomUUID());
-    const relayExtension = (await import(extensionUrl.href)).default;
+    const relayExtension = await loadIsolatedRelayExtension("resource-guard");
     assert.equal(relayExtension.length, 1);
 
     const result = relayExtension(host.api as never);
     assert.equal(result, undefined);
-    await host.executeCommand("relay-pair", VALID_PAIRING_CODE);
     await assert.rejects(host.executeTool("list_peers", {}), {
       name: "Error",
       message: EXPECTED_DISCONNECTED_ERROR,
@@ -127,37 +158,26 @@ test("loads and runs disconnected handlers without starting resources", { concur
       logs.restore();
     } finally {
       restoreResources();
-      if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
-      else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
+      environment.restore();
     }
   }
 
   assert.deepEqual(host.registrations, [
-    { kind: "command", name: "relay-pair" },
     { kind: "tool", name: "list_peers" },
     { kind: "tool", name: "agent_send" },
   ]);
-  assert.deepEqual([...host.commands.keys()], ["relay-pair"]);
+  assert.deepEqual([...host.commands.keys()], []);
   assert.deepEqual([...host.tools.keys()], ["list_peers", "agent_send"]);
-  assert.deepEqual(host.notifications, [
-    { message: EXPECTED_PAIRING_UNCONFIGURED, level: "error" },
-  ]);
   assert.deepEqual(resourceAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);
   assert.deepEqual(host.sendMessageAttempts, []);
   assert.deepEqual(host.sendUserMessageAttempts, []);
-  assert.equal(logs.lines.some((line) => line.includes(VALID_PAIRING_CODE)), false);
   assert.equal(logs.lines.some((line) => line.includes("sensitive-message-body")), false);
 });
 
-test("unpaired session lifecycle stays disconnected without opening resources", { concurrency: false }, async (context) => {
-  const root = await mkdtemp(join(tmpdir(), "pi-relay-unpaired-session-"));
-  context.after(async () => rm(root, { recursive: true, force: true }));
-  const stateDirectory = join(root, "missing-state");
-  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
-  process.env.PI_MESSAGING_RELAY_URL = "http://127.0.0.1:31415";
-  process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
+test("unconfigured session lifecycle stays disconnected without opening resources", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
   const resourceAttempts: string[] = [];
   const restoreResources = installResourceGuards(resourceAttempts);
   const host = new FakePiHost();
@@ -170,30 +190,65 @@ test("unpaired session lifecycle stays disconnected without opening resources", 
     await host.emit("session_shutdown");
   } finally {
     restoreResources();
-    if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
-    else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
+    environment.restore();
   }
 
   assert.deepEqual(resourceAttempts, []);
-  await assert.rejects(stat(stateDirectory), { code: "ENOENT" });
+  await assert.rejects(stat(join(home, ".config")), { code: "ENOENT" });
   assert.deepEqual(host.sendMessageAttempts, []);
   assert.deepEqual(host.sendUserMessageAttempts, []);
 });
 
-test("configured key with missing endpoint rejects startup before WebSocket creation", { concurrency: false }, async (context) => {
-  const root = await mkdtemp(join(tmpdir(), "pi-relay-unconfigured-session-"));
-  context.after(async () => rm(root, { recursive: true, force: true }));
-  const stateDirectory = join(root, "state");
-  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
-  const originalFetch = globalThis.fetch;
-  process.env.PI_MESSAGING_RELAY_URL = "http://127.0.0.1:31415";
-  process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
-  globalThis.fetch = async () => new Response('{"client_id":"cli_0123456789abcdef"}', {
-    status: 201,
-    headers: { "Content-Type": "application/json" },
+test("invalid configuration file stays disconnected with one closed diagnostic and no fallback", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  await writeConfig(home, JSON.stringify({ url: "http://127.0.0.1:31415", secret: "config-secret" }), 0o644);
+  const environment = installIsolatedHome(home);
+  const resourceAttempts: string[] = [];
+  const restoreResources = installResourceGuards(resourceAttempts);
+  const host = new FakePiHost();
+  const logs = captureStructuredErrors();
+
+  try {
+    const relayExtension = await loadRelayExtension();
+    relayExtension(host.api as never);
+    await host.emit("session_start");
+    await host.emit("session_shutdown");
+  } finally {
+    logs.restore();
+    restoreResources();
+    environment.restore();
+  }
+
+  assert.deepEqual(resourceAttempts, []);
+  const events = logs.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  const rejected = events.filter((event) => event.event === "relay_config_rejected");
+  assert.equal(rejected.length, 1);
+  assert.deepEqual(
+    { level: rejected[0].level, result: rejected[0].result, reason: rejected[0].reason, secret: rejected[0].secret },
+    { level: "warn", result: "rejected", reason: "unsafe_config_permissions", secret: "<redacted>" },
+  );
+  assert.equal(events.some((event) => event.event === "relay_auth_rejected"), false);
+  await assert.rejects(host.executeTool("list_peers", {}), {
+    name: "Error",
+    message: EXPECTED_DISCONNECTED_ERROR,
+  });
+  assert.equal(logs.lines.some((line) => line.includes("config-secret")), false);
+  assert.deepEqual(host.sendMessageAttempts, []);
+  assert.deepEqual(host.sendUserMessageAttempts, []);
+});
+
+test("environment endpoint alone attempts one bounded connection", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
+  process.env[ENDPOINT_ENV] = "http://127.0.0.1:31415";
+  const scheduledDelays: number[] = [];
+  const restoreDependencies = installReconnectDependenciesForTest({
+    now: () => 1_800_000_000_000,
+    randomUnit: () => 0.5,
+    schedule: (_callback, delayMS) => {
+      scheduledDelays.push(delayMS);
+      return { cancel: () => undefined };
+    },
   });
   const host = new FakePiHost();
   const logs = captureStructuredErrors();
@@ -201,29 +256,25 @@ test("configured key with missing endpoint rejects startup before WebSocket crea
   try {
     const relayExtension = await loadRelayExtension();
     relayExtension(host.api as never);
-    await host.executeCommand("relay-pair", VALID_PAIRING_CODE);
-    delete process.env.PI_MESSAGING_RELAY_URL;
-    const resourceAttempts: string[] = [];
-    const restoreResources = installResourceGuards(resourceAttempts);
-    try {
-      await host.emit("session_start");
-      await host.emit("session_shutdown");
-    } finally {
-      restoreResources();
-    }
-    assert.deepEqual(resourceAttempts, []);
+    await host.emit("session_start");
+    await host.emit("session_shutdown");
   } finally {
     logs.restore();
-    globalThis.fetch = originalFetch;
-    if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
-    else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
+    restoreDependencies();
+    environment.restore();
   }
 
+  assert.deepEqual(scheduledDelays, [500]);
   const events = logs.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-  assert.equal(events.some((event) =>
-    event.event === "relay_auth_rejected" && event.reason === "endpoint_not_configured"), true);
+  const rejected = events.filter((event) => event.event === "relay_auth_rejected");
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason, "connection_failed");
+  const scheduled = events.filter((event) => event.event === "relay_reconnect_scheduled");
+  assert.deepEqual(
+    scheduled.map((event) => ({ result: event.result, reason: event.reason, delay_ms: event.delay_ms })),
+    [{ result: "scheduled", reason: "connection_failed", delay_ms: 500 }],
+  );
+  await assert.rejects(stat(join(home, ".config")), { code: "ENOENT" });
   assert.deepEqual(host.sendMessageAttempts, []);
   assert.deepEqual(host.sendUserMessageAttempts, []);
 });
@@ -298,45 +349,9 @@ test("publishes only to, body, and optional canonical reply correlation for agen
   assert.equal(Value.Check(sendSchema as never, { to: stringSend.to, body: null }), false);
 });
 
-test("relay-pair fails closed when endpoint configuration is absent", { concurrency: false }, async () => {
-  const previousEndpoint = process.env.PI_MESSAGING_RELAY_URL;
-  delete process.env.PI_MESSAGING_RELAY_URL;
-  const host = new FakePiHost();
-  const relayExtension = await loadRelayExtension();
-  relayExtension(host.api as never);
-  const logs = captureStructuredErrors();
-
-  try {
-    await host.executeCommand("relay-pair", VALID_PAIRING_CODE);
-  } finally {
-    logs.restore();
-    if (previousEndpoint === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
-    else process.env.PI_MESSAGING_RELAY_URL = previousEndpoint;
-  }
-
-  assert.deepEqual(host.notifications, [
-    { message: EXPECTED_PAIRING_UNCONFIGURED, level: "error" },
-  ]);
-  assert.deepEqual(host.sendMessageAttempts, []);
-  assert.deepEqual(host.sendUserMessageAttempts, []);
-  assert.deepEqual(host.liveAccessAttempts, []);
-  assert.equal(logs.lines.length, 1);
-  const event = JSON.parse(logs.lines[0]);
-  assert.deepEqual({ ...event, latency_ms: 0 }, {
-    level: "warn",
-    event: "relay_pair_rejected",
-    operation: "relay-pair",
-    result: "rejected",
-    reason: "endpoint_not_configured",
-    pairing_code: "<redacted>",
-    private_key: "<redacted>",
-    latency_ms: 0,
-  });
-  assert.equal(typeof event.latency_ms, "number");
-  assert.equal(logs.lines[0].includes(VALID_PAIRING_CODE), false);
-});
-
-test("diagnostic sink failure never replaces lifecycle or disconnected tool ownership", { concurrency: false }, async () => {
+test("diagnostic sink failure never replaces lifecycle or disconnected tool ownership", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
   relayExtension(host.api as never);
@@ -355,10 +370,13 @@ test("diagnostic sink failure never replaces lifecycle or disconnected tool owne
     await host.emit("session_shutdown");
   } finally {
     console.error = originalError;
+    environment.restore();
   }
 });
 
-test("both tools fail through Pi's thrown-error path while disconnected", { concurrency: false }, async () => {
+test("both tools fail through Pi's thrown-error path while disconnected", { concurrency: false }, async (context) => {
+  const home = await createHome(context);
+  const environment = installIsolatedHome(home);
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
   relayExtension(host.api as never);
@@ -379,6 +397,7 @@ test("both tools fail through Pi's thrown-error path while disconnected", { conc
     );
   } finally {
     logs.restore();
+    environment.restore();
   }
 
   assert.deepEqual(

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,12 @@ import test from "node:test";
 import WebSocket from "ws";
 
 import { FakePiHost } from "./fake-pi-host.ts";
+import {
+  installIsolatedHome,
+  SHARED_RELAY_SECRET,
+  writeClientConfig,
+  writeServerSecretFile,
+} from "./secret-relay.ts";
 
 const TEST_TIMEOUT_MS = 15_000;
 const UUID_V7_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -191,17 +197,17 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
   let ackGate: ReturnType<typeof installReceivedACKGate> | undefined;
   let primaryError: unknown;
   const oldURL = process.env.PI_MESSAGING_RELAY_URL;
-  const oldState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   const extensionLogs: string[] = [];
   const hosts: FakePiHost[] = [];
+  let environment: { restore(): void } | undefined;
 
   try {
     await chmod(root, 0o700);
     const binary = join(root, "relay-server");
     const state = join(root, "server-state");
-    const extensionState = join(root, "extension-state");
-    const codeFile = join(state, "pairing-code");
+    const extensionHome = join(root, "extension-home");
+    const secretFile = await writeServerSecretFile(state);
     execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
       cwd: repositoryRoot,
       stdio: "pipe",
@@ -211,7 +217,7 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     child = spawn(binary, [
       "--listen", "127.0.0.1:0",
       "--state-dir", state,
-      "--pairing-code-file", codeFile,
+      "--secret-file", secretFile,
     ], { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] });
     const stderr: Buffer[] = [];
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
@@ -219,10 +225,11 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     const output: Output = { iterator: lines[Symbol.asyncIterator](), lines: [] };
     console.error = (...values: unknown[]) => extensionLogs.push(values.map(String).join(" "));
     const ready = await nextEvent(output, "server_ready");
-    await nextEvent(output, "pairing_code_created");
-    process.env.PI_MESSAGING_RELAY_URL = `http://${String(ready.address)}`;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = extensionState;
-    const pairingCode = (await readFile(codeFile, "utf8")).trim();
+    environment = installIsolatedHome(extensionHome);
+    await writeClientConfig(extensionHome, {
+      url: `http://${String(ready.address)}`,
+      secret: SHARED_RELAY_SECRET,
+    });
     const relayExtension = (await import(`../index.ts?reply=${Date.now()}`)).default;
 
     const sender = new FakePiHost();
@@ -230,8 +237,6 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     relayExtension(sender.api as never);
     hosts.push(sender);
     await sender.emit("session_start");
-    await sender.executeCommand("relay-pair", pairingCode);
-    await nextEvent(output, "pair_accepted");
     const senderAuth = await nextEvent(output, "auth_accepted");
 
     const recipient = new FakePiHost();
@@ -397,10 +402,9 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
       }
     }
     console.error = originalError;
+    environment?.restore();
     if (oldURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = oldURL;
-    if (oldState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = oldState;
     if (child) {
       try {
         await stop(child);

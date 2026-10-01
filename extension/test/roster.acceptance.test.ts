@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,12 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 
 import { FakePiHost } from "./fake-pi-host.ts";
+import {
+  installIsolatedHome,
+  SHARED_RELAY_SECRET,
+  writeClientConfig,
+  writeServerSecretFile,
+} from "./secret-relay.ts";
 
 const TEST_TIMEOUT_MS = 15_000;
 
@@ -72,17 +78,17 @@ test("real extensions list live authenticated peers with strict address-only con
   let lines: ReturnType<typeof createInterface> | undefined;
   let primaryError: unknown;
   const oldURL = process.env.PI_MESSAGING_RELAY_URL;
-  const oldState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   const extensionLogs: string[] = [];
   const hosts: FakePiHost[] = [];
+  let environment: { restore(): void } | undefined;
 
   try {
     await chmod(root, 0o700);
     const binary = join(root, "relay-server");
     const state = join(root, "server-state");
-    const extensionState = join(root, "extension-state");
-    const codeFile = join(state, "pairing-code");
+    const extensionHome = join(root, "extension-home");
+    const secretFile = await writeServerSecretFile(state);
     execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
       cwd: repositoryRoot,
       stdio: "pipe",
@@ -90,7 +96,7 @@ test("real extensions list live authenticated peers with strict address-only con
     child = spawn(binary, [
       "--listen", "127.0.0.1:0",
       "--state-dir", state,
-      "--pairing-code-file", codeFile,
+      "--secret-file", secretFile,
     ], { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] });
     const stderr: Buffer[] = [];
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
@@ -98,10 +104,11 @@ test("real extensions list live authenticated peers with strict address-only con
     const output: Output = { iterator: lines[Symbol.asyncIterator](), lines: [] };
     console.error = (...values: unknown[]) => extensionLogs.push(values.map(String).join(" "));
     const ready = await nextEvent(output, "server_ready");
-    await nextEvent(output, "pairing_code_created");
-    process.env.PI_MESSAGING_RELAY_URL = `http://${String(ready.address)}`;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = extensionState;
-    const pairingCode = (await readFile(codeFile, "utf8")).trim();
+    environment = installIsolatedHome(extensionHome);
+    await writeClientConfig(extensionHome, {
+      url: `http://${String(ready.address)}`,
+      secret: SHARED_RELAY_SECRET,
+    });
     const relayExtension = (await import(`../index.ts?roster=${Date.now()}`)).default;
     const addresses: string[] = [];
 
@@ -111,10 +118,6 @@ test("real extensions list live authenticated peers with strict address-only con
       relayExtension(host.api as never);
       hosts.push(host);
       await host.emit("session_start");
-      if (hosts.length === 1) {
-        await host.executeCommand("relay-pair", pairingCode);
-        await nextEvent(output, "pair_accepted");
-      }
       const accepted = await nextEvent(output, "auth_accepted");
       addresses.push(String(accepted.address));
     }
@@ -166,10 +169,9 @@ test("real extensions list live authenticated peers with strict address-only con
       }
     }
     console.error = originalError;
+    environment?.restore();
     if (oldURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = oldURL;
-    if (oldState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = oldState;
     if (child) {
       try {
         await stop(child);

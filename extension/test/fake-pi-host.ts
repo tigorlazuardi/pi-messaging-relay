@@ -28,6 +28,7 @@ export class FakePiHost {
   readonly appendEntryAttempts: Array<{ customType: string; data: unknown }> = [];
   readonly sessionEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
   readonly liveAccessAttempts: string[] = [];
+  readonly statusMessages: Array<{ key: string; text: string | undefined }> = [];
   readonly events = new Map<string, EventHandler[]>();
   cwd = "/tmp/fake-pi-session";
   private idle = true;
@@ -76,6 +77,13 @@ export class FakePiHost {
     },
   );
 
+  statusFor(key: string): string | undefined {
+    for (let index = this.statusMessages.length - 1; index >= 0; index -= 1) {
+      if (this.statusMessages[index].key === key) return this.statusMessages[index].text;
+    }
+    return undefined;
+  }
+
   setIdle(idle: boolean): void {
     this.idle = idle;
   }
@@ -117,6 +125,12 @@ export class FakePiHost {
       {
         notify: (message: string, level?: string) => {
           this.notifications.push({ message, level });
+        },
+        setStatus: (key: string, text?: string) => {
+          this.statusMessages.push({ key, text });
+        },
+        theme: {
+          fg: (color: string, text: string) => `${color}:${text}`,
         },
       },
       {

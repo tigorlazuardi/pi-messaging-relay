@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
-import { createHash, createPublicKey, generateKeyPairSync, type KeyObject } from "node:crypto";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { SessionSocketAttempt } from "../internal/session-auth.ts";
+import { clientConfigurationPath } from "../internal/client-config.ts";
 import { FakePiHost } from "./fake-pi-host.ts";
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const ROUTE_ID = "01993ca1-1111-7aaa-8aaa-111111111111";
+const SECRET = "transport-shared-secret";
 
 type RawFrame = { opcode: number; payload: Buffer };
 
@@ -98,7 +101,12 @@ function serverFrame(payload: Buffer, fin: boolean, opcode: number): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-async function startRawEndpoint(onUpgrade: (peer: RawPeer) => void): Promise<{
+type RawUpgrade = { peer: RawPeer; authorization: string | undefined };
+
+async function startRawEndpoint(
+  onUpgrade: (upgrade: RawUpgrade) => void,
+  options: { respond?: "unauthorized" } = {},
+): Promise<{
   endpoint: URL;
   server: Server;
 }> {
@@ -115,6 +123,17 @@ async function startRawEndpoint(onUpgrade: (peer: RawPeer) => void): Promise<{
         socket.destroy();
         return;
       }
+      if (options.respond === "unauthorized") {
+        socket.write(
+          "HTTP/1.1 401 Unauthorized\r\n" +
+          "Content-Type: application/json\r\n" +
+          "WWW-Authenticate: Bearer\r\n" +
+          'Content-Length: 51\r\n' +
+          "\r\n" +
+          '{"error":"not_authorized","message":"Authentication is required"}',
+        );
+        return;
+      }
       const accept = createHash("sha1").update(key + WEBSOCKET_GUID).digest("base64");
       socket.write(
         "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -122,7 +141,10 @@ async function startRawEndpoint(onUpgrade: (peer: RawPeer) => void): Promise<{
         "Connection: Upgrade\r\n" +
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
       );
-      onUpgrade(new RawPeer(socket, request.subarray(boundary + 4)));
+      onUpgrade({
+        peer: new RawPeer(socket, request.subarray(boundary + 4)),
+        authorization: /^Authorization:\s*(.+)$/im.exec(headers)?.[1]?.trim(),
+      });
     };
     socket.on("data", onData);
   });
@@ -135,13 +157,19 @@ async function startRawEndpoint(onUpgrade: (peer: RawPeer) => void): Promise<{
   return { endpoint: new URL(`ws://127.0.0.1:${address.port}`), server };
 }
 
-function installationFixture(): { privateKey: KeyObject; publicKey: string } {
-  const privateKey = generateKeyPairSync("ed25519").privateKey;
-  const jwk = createPublicKey(privateKey).export({ format: "jwk" });
-  assert.equal(typeof jwk.x, "string");
+function attemptOptions(
+  endpoint: URL,
+  overrides: Partial<ConstructorParameters<typeof SessionSocketAttempt>[0]> = {},
+): ConstructorParameters<typeof SessionSocketAttempt>[0] {
   return {
-    privateKey,
-    publicKey: `ed25519:${Buffer.from(jwk.x as string, "base64url").toString("base64")}`,
+    endpoint,
+    secret: undefined,
+    routeID: ROUTE_ID,
+    cwd: "/srv/transport",
+    hostname: "transport-host",
+    deliverUserMessage: () => {},
+    onDisconnected: () => {},
+    ...overrides,
   };
 }
 
@@ -165,56 +193,140 @@ async function closeServer(server: Server): Promise<void> {
   });
 }
 
+async function readHello(peer: RawPeer): Promise<Record<string, unknown>> {
+  const frame = await peer.readFrame();
+  assert.equal(frame.opcode, 0x1);
+  return JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
+}
+
+function sendWelcome(peer: RawPeer, hello: Record<string, unknown>): void {
+  const payload = hello.payload as Record<string, unknown>;
+  peer.sendText(JSON.stringify({
+    v: 1,
+    type: "welcome",
+    request_id: hello.request_id,
+    payload: {
+      self_address: `${String(payload.cwd)}@${String(payload.hostname)}#${String(payload.route_id)}`,
+      heartbeat_ms: 30_000,
+      max_body_bytes: 262_144,
+    },
+  }));
+}
+
+test("upgrade sends the Bearer header exactly when a secret is configured", async (context) => {
+  const seen: Array<string | undefined> = [];
+  const endpoint = await startRawEndpoint(({ authorization, peer }) => {
+    seen.push(authorization);
+    void peer.readFrame().then((frame) => {
+      const parsed = JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
+      sendWelcome(peer, parsed);
+    });
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  const withSecret = new SessionSocketAttempt(attemptOptions(endpoint.endpoint, { secret: SECRET }));
+  const authorized = await within(withSecret.result);
+  context.after(() => authorized.closeAndWait());
+  assert.equal(authorized.address, `/srv/transport@transport-host#${ROUTE_ID}`);
+  await authorized.closeAndWait();
+
+  const withoutSecret = new SessionSocketAttempt(attemptOptions(endpoint.endpoint));
+  const anonymous = await within(withoutSecret.result);
+  context.after(() => anonymous.closeAndWait());
+  await anonymous.closeAndWait();
+
+  assert.deepEqual(seen, [`Bearer ${SECRET}`, undefined]);
+});
+
+test("post-upgrade hello is unsigned establishment with exactly route, hostname, and cwd", async (context) => {
+  let peerClosed: Promise<void> | undefined;
+  const endpoint = await startRawEndpoint(({ peer }) => {
+    peerClosed = peer.closed;
+    void peer.readFrame().then((frame) => {
+      assert.equal(frame.opcode, 0x1);
+      const hello = JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(hello).sort(), ["payload", "request_id", "type", "v"]);
+      assert.equal(hello.v, 1);
+      assert.equal(hello.type, "hello");
+      assert.match(String(hello.request_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      const payload = hello.payload as Record<string, unknown>;
+      assert.deepEqual(
+        { keys: Object.keys(payload).sort(), route: payload.route_id, hostname: payload.hostname, cwd: payload.cwd },
+        { keys: ["cwd", "hostname", "route_id"], route: ROUTE_ID, hostname: "transport-host", cwd: "/srv/transport" },
+      );
+      sendWelcome(peer, hello);
+    });
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  const attempt = new SessionSocketAttempt(attemptOptions(endpoint.endpoint, { secret: SECRET }));
+  const connection = await within(attempt.result);
+  context.after(() => connection.closeAndWait());
+  assert.equal(connection.address, `/srv/transport@transport-host#${ROUTE_ID}`);
+  await connection.closeAndWait();
+  assert.ok(peerClosed);
+});
+
+test("a v1 challenge frame before welcome fails the v2 establishment closed", async (context) => {
+  let peerClosed: Promise<void> | undefined;
+  const endpoint = await startRawEndpoint(({ peer }) => {
+    peerClosed = peer.closed;
+    peer.sendText(JSON.stringify({
+      v: 1,
+      type: "challenge",
+      payload: { nonce: "A".repeat(43) },
+    }));
+  });
+  context.after(async () => closeServer(endpoint.server));
+
+  const attempt = new SessionSocketAttempt(attemptOptions(endpoint.endpoint));
+  await assert.rejects(within(attempt.result), (error: unknown) =>
+    error !== null && typeof error === "object" &&
+    "reason" in error && error.reason === "invalid_welcome");
+  assert.ok(peerClosed);
+  await within(peerClosed);
+});
+
 async function expectRejectedAttempt(
   endpoint: URL,
   expectedMessage: string,
 ): Promise<void> {
-  const installation = installationFixture();
-  const attempt = new SessionSocketAttempt({
-    endpoint,
-    privateKey: installation.privateKey,
-    clientPublicKey: installation.publicKey,
-    routeID: ROUTE_ID,
-    cwd: "/oversized",
-    hostname: "malicious-endpoint",
-    deliverUserMessage: () => {},
-    onDisconnected: () => {},
-  });
+  const attempt = new SessionSocketAttempt(attemptOptions(endpoint, { cwd: "/oversized" }));
   await assert.rejects(within(attempt.result), (error: unknown) =>
     error !== null && typeof error === "object" &&
     "reason" in error && error.reason === "invalid_frame" &&
     "message" in error && error.message === expectedMessage);
 }
 
-const SEMANTIC_LIMIT_MESSAGE = "Relay authentication frame exceeds 16 KiB.";
-
-test("complete valid JSON authentication payload over 16 KiB is semantically rejected and force-settled", async (context) => {
+test("complete valid JSON establishment payload over 16 KiB is semantically rejected and force-settled", async (context) => {
   let peerClosed: Promise<void> | undefined;
-  const endpoint = await startRawEndpoint((peer) => {
+  const endpoint = await startRawEndpoint(({ peer }) => {
     peerClosed = peer.closed;
     peer.sendText(JSON.stringify({
       v: 1,
-      type: "challenge",
-      payload: { nonce: "A".repeat(43) },
+      type: "welcome",
+      request_id: "01993c79-8ad7-79fa-83e3-9789dcaca168",
+      payload: { self_address: "unused", heartbeat_ms: 30_000, max_body_bytes: 262_144 },
       padding: "x".repeat(16 * 1_024),
     }));
     // Deliberately ignore the client's close frame.
   });
   context.after(async () => closeServer(endpoint.server));
 
-  await expectRejectedAttempt(endpoint.endpoint, SEMANTIC_LIMIT_MESSAGE);
+  await expectRejectedAttempt(endpoint.endpoint, "Relay session establishment frame exceeds 16 KiB.");
   assert.ok(peerClosed);
   await within(peerClosed);
 });
 
-test("fragmented valid JSON authentication payload over 16 KiB is semantically rejected and force-settled", async (context) => {
+test("fragmented valid JSON establishment payload over 16 KiB is semantically rejected and force-settled", async (context) => {
   let peerClosed: Promise<void> | undefined;
-  const endpoint = await startRawEndpoint((peer) => {
+  const endpoint = await startRawEndpoint(({ peer }) => {
     peerClosed = peer.closed;
     const payload = JSON.stringify({
       v: 1,
-      type: "challenge",
-      payload: { nonce: "A".repeat(43) },
+      type: "welcome",
+      request_id: "01993c79-8ad7-79fa-83e3-9789dcaca168",
+      payload: { self_address: "unused", heartbeat_ms: 30_000, max_body_bytes: 262_144 },
       padding: "x".repeat(16 * 1_024),
     });
     const boundaries = [0, 4_096, 8_192, 12_288, 16_384, payload.length];
@@ -228,46 +340,14 @@ test("fragmented valid JSON authentication payload over 16 KiB is semantically r
   });
   context.after(async () => closeServer(endpoint.server));
 
-  await expectRejectedAttempt(endpoint.endpoint, SEMANTIC_LIMIT_MESSAGE);
+  await expectRejectedAttempt(endpoint.endpoint, "Relay session establishment frame exceeds 16 KiB.");
   assert.ok(peerClosed);
   await within(peerClosed);
 });
 
-test("welcome-phase valid JSON payload over 16 KiB is semantically rejected and force-settled", async (context) => {
+test("establishment payload over 512 KiB is transport-rejected and force-settled before use", async (context) => {
   let peerClosed: Promise<void> | undefined;
-  const endpoint = await startRawEndpoint((peer) => {
-    peerClosed = peer.closed;
-    peer.sendText(JSON.stringify({
-      v: 1,
-      type: "challenge",
-      payload: { nonce: "A".repeat(43) },
-    }));
-    void peer.readFrame().then((frame) => {
-      const hello = JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
-      peer.sendText(JSON.stringify({
-        v: 1,
-        type: "welcome",
-        request_id: hello.request_id,
-        payload: {
-          self_address: "unused",
-          heartbeat_ms: 30_000,
-          max_body_bytes: 262_144,
-        },
-        padding: "x".repeat(16 * 1_024),
-      }));
-      // Deliberately ignore the client's close frame.
-    });
-  });
-  context.after(async () => closeServer(endpoint.server));
-
-  await expectRejectedAttempt(endpoint.endpoint, SEMANTIC_LIMIT_MESSAGE);
-  assert.ok(peerClosed);
-  await within(peerClosed);
-});
-
-test("authentication payload over 512 KiB is transport-rejected and force-settled before use", async (context) => {
-  let peerClosed: Promise<void> | undefined;
-  const endpoint = await startRawEndpoint((peer) => {
+  const endpoint = await startRawEndpoint(({ peer }) => {
     peerClosed = peer.closed;
     peer.sendText("x".repeat(512 * 1_024 + 1));
     // Deliberately ignore the client's close frame.
@@ -276,21 +356,27 @@ test("authentication payload over 512 KiB is transport-rejected and force-settle
 
   await expectRejectedAttempt(
     endpoint.endpoint,
-    "Relay authentication transport payload exceeds 512 KiB.",
+    "Relay session establishment transport payload exceeds 512 KiB.",
   );
   assert.ok(peerClosed);
   await within(peerClosed);
 });
 
+test("closed HTTP 401 upgrade settles as one not_authorized failure", async (context) => {
+  const endpoint = await startRawEndpoint(() => {}, { respond: "unauthorized" });
+  context.after(async () => closeServer(endpoint.server));
+
+  const attempt = new SessionSocketAttempt(attemptOptions(endpoint.endpoint, { secret: "wrong-secret" }));
+  await assert.rejects(within(attempt.result), (error: unknown) =>
+    error !== null && typeof error === "object" &&
+    "reason" in error && error.reason === "not_authorized" &&
+    "message" in error && error.message === "Relay rejected the upgrade credentials.");
+});
+
 test("production session_shutdown force-settles retained socket when peer ignores close", async (context) => {
   let peerClosed: Promise<void> | undefined;
-  const endpoint = await startRawEndpoint((peer) => {
+  const endpoint = await startRawEndpoint(({ peer }) => {
     peerClosed = peer.closed;
-    peer.sendText(JSON.stringify({
-      v: 1,
-      type: "challenge",
-      payload: { nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
-    }));
     void peer.readFrame().then((frame) => {
       assert.equal(frame.opcode, 0x1);
       const hello = JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
@@ -311,20 +397,23 @@ test("production session_shutdown force-settles retained socket when peer ignore
   context.after(async () => closeServer(endpoint.server));
 
   const root = await mkdtemp(join(tmpdir(), "pi-relay-hostile-shutdown-"));
-  const stateDirectory = join(root, "state");
-  await mkdir(stateDirectory, { mode: 0o700 });
-  await chmod(stateDirectory, 0o700);
-  const installation = installationFixture();
-  const privatePEM = installation.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-  await writeFile(join(stateDirectory, "installation-ed25519.pem"), privatePEM, { mode: 0o600 });
   context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, ".config", "pi"), { recursive: true, mode: 0o700 });
+  await writeFile(
+    clientConfigurationPath(root),
+    JSON.stringify({
+      url: endpoint.endpoint.href.replace(/^ws:/, "http:"),
+      secret: SECRET,
+    }),
+    { mode: 0o600 },
+  );
 
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
+  const previousHome = process.env.HOME;
   const originalConsoleError = console.error;
   const logs: string[] = [];
-  process.env.PI_MESSAGING_RELAY_URL = endpoint.endpoint.href.replace(/^ws:/, "http:");
-  process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
+  process.env.PI_MESSAGING_RELAY_URL = "";
+  process.env.HOME = root;
   console.error = (...values: unknown[]) => logs.push(values.map(String).join(" "));
   try {
     const host = new FakePiHost();
@@ -337,12 +426,12 @@ test("production session_shutdown force-settles retained socket when peer ignore
     assert.ok(peerClosed);
     await within(peerClosed);
     assert.equal(logs.filter((line) => JSON.parse(line).event === "relay_session_disconnected").length, 1);
-    assert.equal(logs.some((line) => line.includes(privatePEM.trim())), false);
+    assert.equal(logs.some((line) => line.includes(SECRET)), false);
   } finally {
     console.error = originalConsoleError;
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = previousURL;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
   }
 });

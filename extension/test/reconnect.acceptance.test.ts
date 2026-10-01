@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +14,12 @@ import {
   type ReconnectDeadline,
 } from "../internal/reconnect.ts";
 import { FakePiHost } from "./fake-pi-host.ts";
+import {
+  installIsolatedHome,
+  SHARED_RELAY_SECRET,
+  writeClientConfig,
+  writeServerSecretFile,
+} from "./secret-relay.ts";
 
 const TEST_TIMEOUT_MS = 15_000;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -25,12 +30,6 @@ type HelloAttempt = {
   routeID: string;
   cwd: string;
   socket: WebSocket;
-};
-type AuthenticationFixture = {
-  nonce: string;
-  signature: string;
-  routeID: string;
-  cwd: string;
 };
 type ToolPage = { details: { peers: Array<{ address: string }> } };
 type ToolSendResult = { details: { message_id: string; status: string; reason?: string } };
@@ -194,8 +193,6 @@ function installSubjectSocketControl(
   now: () => number,
 ): {
   attempts: HelloAttempt[];
-  authenticationFixtures: AuthenticationFixture[];
-  challengeNonces: string[];
   holdNextAttempt(): void;
   restore(): void;
 } {
@@ -205,9 +202,6 @@ function installSubjectSocketControl(
   const originalSend = prototype.send;
   const originalEmit = prototype.emit;
   const attempts: HelloAttempt[] = [];
-  const authenticationFixtures: AuthenticationFixture[] = [];
-  const challengeNonces: string[] = [];
-  const challengeBySocket = new Map<WebSocket, string>();
   let holdNext = false;
 
   prototype.emit = function controlledEmit(
@@ -215,18 +209,6 @@ function installSubjectSocketControl(
     event: string | symbol,
     ...args: unknown[]
   ): boolean {
-    if (event === "message" && Buffer.isBuffer(args[0])) {
-      try {
-        const frame = JSON.parse(args[0].toString("utf8")) as Record<string, unknown>;
-        const payload = frame.payload as Record<string, unknown> | undefined;
-        if (frame.type === "challenge" && typeof payload?.nonce === "string") {
-          challengeNonces.push(payload.nonce);
-          challengeBySocket.set(this, payload.nonce);
-        }
-      } catch {
-        // Non-JSON transport events remain owned by the real WebSocket implementation.
-      }
-    }
     return Reflect.apply(originalEmit, this, [event, ...args]);
   };
 
@@ -236,13 +218,7 @@ function installSubjectSocketControl(
         const frame = JSON.parse(data) as Record<string, unknown>;
         const payload = frame.payload as Record<string, unknown> | undefined;
         if (frame.type === "hello" && typeof payload?.cwd === "string" &&
-            typeof payload.route_id === "string" && typeof payload.signature === "string") {
-          authenticationFixtures.push({
-            nonce: challengeBySocket.get(this) ?? "",
-            signature: payload.signature,
-            routeID: payload.route_id,
-            cwd: payload.cwd,
-          });
+            typeof payload.route_id === "string") {
           if (payload.cwd === subjectCWD) {
             attempts.push({
               at: now(),
@@ -269,19 +245,12 @@ function installSubjectSocketControl(
 
   return {
     attempts,
-    authenticationFixtures,
-    challengeNonces,
     holdNextAttempt: () => { holdNext = true; },
     restore: () => {
       prototype.send = originalSend;
       prototype.emit = originalEmit;
     },
   };
-}
-
-async function listedAddresses(host: FakePiHost): Promise<string[]> {
-  const result = await host.executeTool("list_peers", {}) as ToolPage;
-  return result.details.peers.map((peer) => peer.address);
 }
 
 async function startControllableAuthEndpoint(
@@ -297,11 +266,7 @@ async function startControllableAuthEndpoint(
   listener.on("connection", (socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    socket.send(JSON.stringify({
-      v: 1,
-      type: "challenge",
-      payload: { nonce: "A".repeat(43) },
-    }));
+    // v2 establishment is unsigned: the welcome follows the first hello directly.
     socket.once("message", (data) => {
       const hello = JSON.parse(data.toString("utf8")) as Record<string, unknown>;
       hellos.push(hello);
@@ -338,23 +303,15 @@ async function startControllableAuthEndpoint(
   };
 }
 
-async function writeInstallationKey(stateDirectory: string): Promise<void> {
-  await mkdir(stateDirectory, { mode: 0o700 });
-  await chmod(stateDirectory, 0o700);
-  const privateKey = generateKeyPairSync("ed25519").privateKey;
-  await writeFile(
-    join(stateDirectory, "installation-ed25519.pem"),
-    privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-    { mode: 0o600 },
-  );
+async function listedAddresses(host: FakePiHost): Promise<string[]> {
+  const result = await host.executeTool("list_peers", {}) as ToolPage;
+  return result.details.peers.map((peer) => peer.address);
 }
 
 test("inline reconnect deadline preserves one failed-authentication retry intent", { concurrency: false }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "pi-relay-inline-reconnect-"));
-  const stateDirectory = join(root, "state");
   const endpoint = await startControllableAuthEndpoint((attempt) => attempt === 1);
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   const logs: string[] = [];
   let scheduleCalls = 0;
@@ -370,10 +327,9 @@ test("inline reconnect deadline preserves one failed-authentication retry intent
   const host = new FakePiHost();
   context.after(async () => rm(root, { recursive: true, force: true }));
 
+  const environment = installIsolatedHome(join(root, "home"));
   try {
-    await writeInstallationKey(stateDirectory);
     process.env.PI_MESSAGING_RELAY_URL = endpoint.origin;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
     console.error = (...values: unknown[]) => logs.push(values.map(String).join(" "));
     const relayExtension = (await import(`../index.ts?inline-reconnect=${Date.now()}`)).default;
     relayExtension(host.api as never);
@@ -396,12 +352,11 @@ test("inline reconnect deadline preserves one failed-authentication retry intent
     assert.equal(endpoint.hellos.length, 2, "inline retry intent launched a duplicate attempt");
   } finally {
     await host.emit("session_shutdown");
+    environment.restore();
     restoreDependencies();
     console.error = originalError;
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = previousURL;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
     await endpoint.close();
     await rm(root, { recursive: true, force: true });
   }
@@ -409,10 +364,8 @@ test("inline reconnect deadline preserves one failed-authentication retry intent
 
 test("inline reconnect intent is discarded when session shutdown invalidates its generation", { concurrency: false }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "pi-relay-inline-cancel-"));
-  const stateDirectory = join(root, "state");
   const endpoint = await startControllableAuthEndpoint(() => true);
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   let scheduleCalls = 0;
   let shutdown: Promise<void> | undefined;
@@ -429,10 +382,9 @@ test("inline reconnect intent is discarded when session shutdown invalidates its
   });
   context.after(async () => rm(root, { recursive: true, force: true }));
 
+  const environment = installIsolatedHome(join(root, "home"));
   try {
-    await writeInstallationKey(stateDirectory);
     process.env.PI_MESSAGING_RELAY_URL = endpoint.origin;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
     console.error = () => undefined;
     const relayExtension = (await import(`../index.ts?inline-cancel=${Date.now()}`)).default;
     relayExtension(host.api as never);
@@ -445,12 +397,11 @@ test("inline reconnect intent is discarded when session shutdown invalidates its
     assert.equal(endpoint.hellos.length, 1);
   } finally {
     await host.emit("session_shutdown");
+    environment.restore();
     restoreDependencies();
     console.error = originalError;
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = previousURL;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
     await endpoint.close();
     await rm(root, { recursive: true, force: true });
   }
@@ -458,10 +409,8 @@ test("inline reconnect intent is discarded when session shutdown invalidates its
 
 test("inline reconnect deadlines consume exactly the finite retry budget", { concurrency: false }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "pi-relay-inline-bound-"));
-  const stateDirectory = join(root, "state");
   const endpoint = await startControllableAuthEndpoint(() => true);
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   const logs: string[] = [];
   let scheduleCalls = 0;
@@ -477,10 +426,9 @@ test("inline reconnect deadlines consume exactly the finite retry budget", { con
   const host = new FakePiHost();
   context.after(async () => rm(root, { recursive: true, force: true }));
 
+  const environment = installIsolatedHome(join(root, "home"));
   try {
-    await writeInstallationKey(stateDirectory);
     process.env.PI_MESSAGING_RELAY_URL = endpoint.origin;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = stateDirectory;
     console.error = (...values: unknown[]) => logs.push(values.map(String).join(" "));
     const relayExtension = (await import(`../index.ts?inline-bound=${Date.now()}`)).default;
     relayExtension(host.api as never);
@@ -499,16 +447,14 @@ test("inline reconnect deadlines consume exactly the finite retry budget", { con
       reason: "connection_closed",
       retry_index: 10,
       route_id: (endpoint.hellos[0].payload as Record<string, unknown>).route_id,
-      client_public_key: (endpoint.hellos[0].payload as Record<string, unknown>).client_public_key,
     }]);
   } finally {
     await host.emit("session_shutdown");
+    environment.restore();
     restoreDependencies();
     console.error = originalError;
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = previousURL;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
     await endpoint.close();
     await rm(root, { recursive: true, force: true });
   }
@@ -520,8 +466,8 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
   await chmod(root, 0o700);
   const binary = join(root, "relay-server");
   const serverState = join(root, "server-state");
-  const extensionState = join(root, "extension-state");
-  const codeFile = join(serverState, "pairing-code");
+  const secretFile = await writeServerSecretFile(serverState);
+  const extensionHome = join(root, "extension-home");
   execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
     cwd: repositoryRoot,
     stdio: "pipe",
@@ -530,14 +476,13 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
   const child = spawn(binary, [
     "--listen", "127.0.0.1:0",
     "--state-dir", serverState,
-    "--pairing-code-file", codeFile,
+    "--secret-file", secretFile,
   ], { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] });
   const stderr: Buffer[] = [];
   child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const output: Output = { iterator: lines[Symbol.asyncIterator](), lines: [] };
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const extensionStderr = capturePhysicalStderr();
   const clock = new FakeReconnectClock([0, 0.5, 0.75, 0.5]);
   const restoreDependencies = installReconnectDependenciesForTest(clock.dependencies);
@@ -545,17 +490,17 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
   const socketControl = installSubjectSocketControl(subjectCWD, () => clock.nowMS);
   const hosts: FakePiHost[] = [];
   let primaryError: unknown;
+  let environment: { restore(): void } | undefined;
 
   try {
     const ready = await nextEvent(output, "server_ready");
     assert.equal(ready.result, "ready");
-    const pairingCreated = await nextEvent(output, "pairing_code_created");
-    assert.equal(pairingCreated.result, "created");
-    assert.equal(pairingCreated.pairing_code, "<redacted>");
-    assert.equal(pairingCreated.private_key, "<redacted>");
-    process.env.PI_MESSAGING_RELAY_URL = `http://${String(ready.address)}`;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = extensionState;
-    const pairingCode = (await readFile(codeFile, "utf8")).trim();
+    assert.equal(ready.auth, "secret");
+    environment = installIsolatedHome(extensionHome);
+    await writeClientConfig(extensionHome, {
+      url: `http://${String(ready.address)}`,
+      secret: SHARED_RELAY_SECRET,
+    });
     const relayExtension = (await import(`../index.ts?reconnect=${Date.now()}`)).default;
 
     const subject = new FakePiHost();
@@ -563,9 +508,6 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
     relayExtension(subject.api as never);
     hosts.push(subject);
     await subject.emit("session_start", { type: "session_start", reason: "startup" });
-    await subject.executeCommand("relay-pair", pairingCode);
-    const pairAccepted = await nextEvent(output, "pair_accepted");
-    const privatePEM = await readFile(join(extensionState, "installation-ed25519.pem"), "utf8");
     const initialAuth = await nextEvent(output, "auth_accepted", (event) => event.cwd === subjectCWD);
     const originalRouteID = String(initialAuth.route_id);
     const originalAddress = String(initialAuth.address);
@@ -756,18 +698,9 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
     const serverEvents = parseNormalLines("server stdout", output.lines);
     const extensionEvents = parseNormalLines("extension stderr", extensionLogs);
 
-    assert.deepEqual(Object.keys(ready).sort(), ["address", "event", "level", "result", "state_dir"]);
-    assert.deepEqual(
-      Object.keys(pairingCreated).sort(),
-      ["event", "expires_at", "level", "pairing_code", "private_key", "result"],
-    );
-    assert.equal(pairAccepted.client_public_key, initialAuth.client_public_key);
-    assert.equal(pairAccepted.pairing_code, "<redacted>");
-    assert.equal(pairAccepted.private_key, "<redacted>");
+    assert.deepEqual(Object.keys(ready).sort(), ["address", "auth", "event", "level", "result", "state_dir"]);
+    assert.equal(ready.auth, "secret");
     assert.match(String(initialAuth.request_id), UUID_V7);
-    assert.equal(initialAuth.nonce, "<redacted>");
-    assert.equal(initialAuth.signature, "<redacted>");
-    assert.equal(initialAuth.private_key, "<redacted>");
     for (const settlement of [stringSettlement, objectSettlement]) {
       assert.equal(settlement.level, "info");
       assert.equal(settlement.result, "settled");
@@ -787,17 +720,9 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
     assert.equal(offlineSettlement.recipient_route, offlineAddress);
     assert.equal(offlineSettlement.body, "<redacted>");
 
-    const extensionPair = extensionEvents.find((event) => event.event === "relay_pair_accepted");
-    assert.ok(extensionPair);
-    assert.equal(extensionPair.client_public_key, initialAuth.client_public_key);
-    assert.equal(extensionPair.pairing_code, "<redacted>");
-    assert.equal(extensionPair.private_key, "<redacted>");
     const initialExtensionAuth = extensionEvents.find((event) =>
       event.event === "relay_auth_accepted" && event.address === originalAddress);
     assert.ok(initialExtensionAuth);
-    assert.equal(initialExtensionAuth.nonce, "<redacted>");
-    assert.equal(initialExtensionAuth.signature, "<redacted>");
-    assert.equal(initialExtensionAuth.private_key, "<redacted>");
 
     const sendEvents = extensionEvents.filter((event) => event.event === "relay_send_settled");
     assert.deepEqual(
@@ -895,42 +820,23 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
       event.event === "relay_session_stopped" && event.result === "graceful"));
 
     for (const event of [...serverEvents, ...extensionEvents]) {
-      for (const field of ["pairing_code", "nonce", "signature", "private_key", "body"]) {
+      for (const field of ["body", "secret"]) {
         if (field in event) assert.equal(event[field], "<redacted>", `${String(event.event)}.${field}`);
       }
     }
     const sensitiveFixtures = [
-      pairingCode,
-      privatePEM.trim(),
-      ...privatePEM.split(/\r?\n/).filter((line) => line.length > 40),
-      ...socketControl.authenticationFixtures.flatMap((fixture) => [fixture.nonce, fixture.signature]),
+      SHARED_RELAY_SECRET,
       privateStringBody,
       privateObjectMarker,
       privateOfflineBody,
       hostileDestinationSecret,
       hostileBodySecret,
     ];
-    assert.equal(socketControl.authenticationFixtures.length, socketControl.challengeNonces.length);
-    assert.deepEqual(
-      socketControl.authenticationFixtures.map((fixture) => fixture.nonce).sort(),
-      [...socketControl.challengeNonces].sort(),
-    );
-    assert.equal(
-      socketControl.authenticationFixtures.filter((fixture) => fixture.cwd === subjectCWD).length,
-      socketControl.attempts.length,
-    );
-    assert.ok(socketControl.authenticationFixtures.some((fixture) => fixture.cwd === observer.cwd));
-    assert.equal(
-      new Set(socketControl.authenticationFixtures.map((fixture) => fixture.signature)).size,
-      socketControl.authenticationFixtures.length,
-    );
     assert.ok(sensitiveFixtures.every((fixture) => fixture.length > 0));
     for (const fixture of sensitiveFixtures) {
       assert.equal(serverEvents.some((_event, index) => output.lines[index]?.includes(fixture)), false);
       assert.equal(extensionLogs.some((line) => line.includes(fixture)), false);
     }
-    assert.ok(serverEvents.some((event) => event.client_public_key === pairAccepted.client_public_key));
-    assert.ok(extensionEvents.some((event) => event.client_public_key === pairAccepted.client_public_key));
     assert.ok(serverEvents.some((event) => event.message_id === stringSend.details.message_id));
     assert.ok(extensionEvents.some((event) => event.message_id === stringSend.details.message_id));
     assert.equal([...serverEvents, ...extensionEvents].some((event) =>
@@ -950,10 +856,9 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
     socketControl.restore();
     restoreDependencies();
     extensionStderr.restore();
+    environment?.restore();
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = previousURL;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
     try {
       await stop(child);
     } catch (error: unknown) {

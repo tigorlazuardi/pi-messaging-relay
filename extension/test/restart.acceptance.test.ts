@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +15,12 @@ import {
   type ReconnectDeadline,
 } from "../internal/reconnect.ts";
 import { FakePiHost } from "./fake-pi-host.ts";
+import {
+  installIsolatedHome,
+  SHARED_RELAY_SECRET,
+  writeClientConfig,
+  writeServerSecretFile,
+} from "./secret-relay.ts";
 
 const TEST_TIMEOUT_MS = 15_000;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -49,15 +54,6 @@ type RecipientFrame = {
 };
 type RecipientAttempt = { socket: WebSocket };
 type HeldACK = { messageID: string; deliveryID: string };
-
-type DurableAllowlist = {
-  version: number;
-  clients: Array<{
-    client_id: string;
-    client_public_key: string;
-    paired_at: string;
-  }>;
-};
 
 class RestartClock {
   nowMS = 1_800_000_000_000;
@@ -138,11 +134,11 @@ async function startRelay(
   binary: string,
   repositoryRoot: string,
   stateDirectory: string,
-  codeFile: string | undefined,
+  secretFile: string | undefined,
   listen: string,
 ): Promise<{ relay: RelayProcess; ready: Record<string, unknown> }> {
   const args = ["--listen", listen, "--state-dir", stateDirectory];
-  if (codeFile !== undefined) args.push("--pairing-code-file", codeFile);
+  if (secretFile !== undefined) args.push("--secret-file", secretFile);
   const child = spawn(binary, args, { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] });
   const stderr: Buffer[] = [];
   child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
@@ -154,7 +150,6 @@ async function startRelay(
     closeOutput: () => lines.close(),
   };
   const ready = await nextEvent(relay.output, "server_ready");
-  await nextEvent(relay.output, "pairing_code_created");
   return { relay, ready };
 }
 
@@ -187,57 +182,6 @@ async function reserveLoopbackAddress(): Promise<string> {
   assert.ok(address && typeof address === "object");
   await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
   return `127.0.0.1:${address.port}`;
-}
-
-async function writeInstallationKey(stateDirectory: string): Promise<string> {
-  await mkdir(stateDirectory, { mode: 0o700 });
-  await chmod(stateDirectory, 0o700);
-  const privateKey = generateKeyPairSync("ed25519").privateKey;
-  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-  await writeFile(join(stateDirectory, "installation-ed25519.pem"), pem, { mode: 0o600 });
-  return pem;
-}
-
-function assertClosedAllowlist(text: string, forbiddenValues: string[]): DurableAllowlist {
-  const parsed = JSON.parse(text) as DurableAllowlist;
-  assert.deepEqual(Object.keys(parsed).sort(), ["clients", "version"]);
-  assert.equal(parsed.version, 1);
-  assert.equal(parsed.clients.length, 1);
-  assert.deepEqual(Object.keys(parsed.clients[0]).sort(), [
-    "client_id",
-    "client_public_key",
-    "paired_at",
-  ]);
-  assert.match(parsed.clients[0].client_id, /^cli_[A-Za-z0-9_-]{16}$/);
-  assert.match(parsed.clients[0].client_public_key, /^ed25519:[A-Za-z0-9+/]{43}=$/);
-  assert.match(parsed.clients[0].paired_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/);
-
-  const forbiddenKeys = new Set([
-    "body",
-    "pending",
-    "pending_sends",
-    "dedupe",
-    "offline_inbox",
-    "inbox",
-    "request_id",
-    "message_id",
-    "delivery_id",
-    "route_id",
-  ]);
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) {
-      value.forEach(visit);
-      return;
-    }
-    if (value === null || typeof value !== "object") return;
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      assert.equal(forbiddenKeys.has(key), false, `durable allowlist contains forbidden key ${key}`);
-      visit(child);
-    }
-  };
-  visit(parsed);
-  for (const value of forbiddenValues) assert.equal(text.includes(value), false);
-  return parsed;
 }
 
 async function listedAddresses(host: FakePiHost): Promise<string[]> {
@@ -355,9 +299,8 @@ test("recipient delivery stream never replays across reconnect and child-process
   await chmod(root, 0o700);
   const binary = join(root, "relay-server");
   const serverState = join(root, "server-state");
-  const pairedExtensionState = join(root, "paired-extension-state");
-  const unknownExtensionState = join(root, "unknown-extension-state");
-  const codeFile = join(serverState, "pairing-code");
+  const extensionHome = join(root, "extension-home");
+  const secretFile = await writeServerSecretFile(serverState);
   execFileSync("go", ["build", "-o", binary, "./cmd/pi-messaging-relay-server"], {
     cwd: repositoryRoot,
     stdio: "pipe",
@@ -369,7 +312,6 @@ test("recipient delivery stream never replays across reconnect and child-process
   const recipientCWD = "/srv/lifecycle-recipient";
   const socketControl = installRecipientSocketControl(recipientCWD);
   const previousURL = process.env.PI_MESSAGING_RELAY_URL;
-  const previousState = process.env.PI_MESSAGING_RELAY_STATE_DIR;
   const originalError = console.error;
   const extensionLogs: string[] = [];
   const hosts: FakePiHost[] = [];
@@ -384,15 +326,17 @@ test("recipient delivery stream never replays across reconnect and child-process
   const allBodies = Object.values(bodies);
   const messageIDs: string[] = [];
   let primaryError: unknown;
+  let environment: ReturnType<typeof installIsolatedHome> | undefined;
 
   try {
     console.error = (...values: unknown[]) => extensionLogs.push(values.map(String).join(" "));
-    const first = await startRelay(binary, repositoryRoot, serverState, codeFile, listen);
+    const first = await startRelay(binary, repositoryRoot, serverState, secretFile, listen);
     relays.push(first.relay);
     assert.equal(first.ready.address, listen);
+    assert.equal(first.ready.auth, "secret");
     assert.equal(first.ready.state_dir, serverState);
-    process.env.PI_MESSAGING_RELAY_URL = `http://${listen}`;
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = pairedExtensionState;
+    environment = installIsolatedHome(extensionHome);
+    await writeClientConfig(extensionHome, { url: `http://${listen}`, secret: SHARED_RELAY_SECRET });
 
     const relayExtension = (await import(`../index.ts?lifecycle-delivery=${Date.now()}`)).default;
     const sender = new FakePiHost();
@@ -400,15 +344,11 @@ test("recipient delivery stream never replays across reconnect and child-process
     relayExtension(sender.api as never);
     hosts.push(sender);
     await sender.emit("session_start", { type: "session_start", reason: "startup" });
-    const pairingCode = (await readFile(codeFile, "utf8")).trim();
-    await sender.executeCommand("relay-pair", pairingCode);
-    const acceptedPair = await nextEvent(first.relay.output, "pair_accepted");
     const senderAuth = await nextEvent(
       first.relay.output,
       "auth_accepted",
       (event) => event.cwd === sender.cwd,
     );
-    assert.equal(acceptedPair.client_public_key, senderAuth.client_public_key);
     const senderAddress = String(senderAuth.address);
 
     const recipient = new FakePiHost();
@@ -512,27 +452,16 @@ test("recipient delivery stream never replays across reconnect and child-process
     assert.match(restartACK.deliveryID, UUID_V7);
     messageIDs.push(restartACK.messageID);
 
-    assert.deepEqual(await readdir(serverState), ["allowlist.json"]);
-    const allowlistPath = join(serverState, "allowlist.json");
+    assert.deepEqual(await readdir(serverState), ["relay.secret"]);
     assert.equal((await stat(serverState)).mode & 0o777, 0o700);
-    assert.equal((await stat(allowlistPath)).mode & 0o777, 0o600);
-    const privatePEM = await readFile(join(pairedExtensionState, "installation-ed25519.pem"), "utf8");
-    const beforeStop = await readFile(allowlistPath, "utf8");
-    const storedBeforeStop = assertClosedAllowlist(beforeStop, [...allBodies, ...messageIDs, privatePEM.trim(), pairingCode]);
-    assert.equal(storedBeforeStop.clients[0].client_id, acceptedPair.client_id);
-    assert.equal(storedBeforeStop.clients[0].client_public_key, acceptedPair.client_public_key);
 
     await stopRelay(first.relay);
     await restartRejection;
     await waitUntil(() => clock.pendingCount === 2, "sender and recipient restart reconnect deadlines");
-    const afterStop = await readFile(allowlistPath, "utf8");
-    assert.equal(afterStop, beforeStop);
-    assertClosedAllowlist(afterStop, [...allBodies, ...messageIDs, privatePEM.trim(), pairingCode]);
 
-    const second = await startRelay(binary, repositoryRoot, serverState, undefined, listen);
+    const second = await startRelay(binary, repositoryRoot, serverState, secretFile, listen);
     relays.push(second.relay);
     assert.equal(second.ready.address, listen);
-    assert.equal(await readFile(allowlistPath, "utf8"), beforeStop);
     await clock.advanceBy(500);
     const restartedAuth = [
       await nextEvent(second.relay.output, "auth_accepted"),
@@ -547,8 +476,6 @@ test("recipient delivery stream never replays across reconnect and child-process
     assert.ok(restartedSender);
     assert.ok(restartedRecipient);
     assert.equal(restartedSender.address, senderAddress);
-    assert.equal(restartedSender.client_id, acceptedPair.client_id);
-    assert.equal(restartedSender.client_public_key, acceptedPair.client_public_key);
     assert.equal(restartedRecipient.address, recipientAddress);
     assert.equal(restartedRecipient.route_id, recipientRouteID);
     assert.equal(socketControl.attempts.length, 3);
@@ -671,38 +598,40 @@ test("recipient delivery stream never replays across reconnect and child-process
       assert.equal(second.relay.output.lines.some((line) => line.includes(body)), false);
     }
 
-    const unknownPEM = await writeInstallationKey(unknownExtensionState);
-    process.env.PI_MESSAGING_RELAY_STATE_DIR = unknownExtensionState;
+    const unknownHome = join(root, "unknown-home");
     const unknown = new FakePiHost();
     unknown.cwd = "/srv/restart-unknown";
-    relayExtension(unknown.api as never);
-    hosts.push(unknown);
-    await unknown.emit("session_start", { type: "session_start", reason: "startup" });
-    const rejected = await nextEvent(
-      second.relay.output,
-      "auth_rejected",
-      (event) => event.reason === "not_authorized",
-    );
-    assert.equal(rejected.reason, "not_authorized");
-    await waitUntil(
-      () => extensionLogs.some((line) => {
-        const event = JSON.parse(line) as Record<string, unknown>;
-        return event.event === "relay_auth_rejected" && event.reason === "not_authorized";
-      }),
-      "unknown extension rejection",
-    );
+    const unknownEnvironment = installIsolatedHome(unknownHome);
+    try {
+      await writeClientConfig(unknownHome, { url: `http://${listen}`, secret: "unknown-wrong-secret" });
+      relayExtension(unknown.api as never);
+      hosts.push(unknown);
+      await unknown.emit("session_start", { type: "session_start", reason: "startup" });
+      const rejected = await nextEvent(
+        second.relay.output,
+        "auth_rejected",
+        (event) => event.reason === "not_authorized",
+      );
+      assert.equal(rejected.reason, "not_authorized");
+      await waitUntil(
+        () => extensionLogs.some((line) => {
+          const event = JSON.parse(line) as Record<string, unknown>;
+          return event.event === "relay_auth_rejected" && event.reason === "not_authorized";
+        }),
+        "unknown extension rejection",
+      );
+    } finally {
+      unknownEnvironment.restore();
+    }
     await assert.rejects(unknown.executeTool("list_peers", {}), /Relay is disconnected/);
 
-    const afterRestart = await readFile(allowlistPath, "utf8");
-    assert.equal(afterRestart, beforeStop);
-    assertClosedAllowlist(afterRestart, [
-      ...allBodies,
-      ...messageIDs,
-      privatePEM.trim(),
-      unknownPEM.trim(),
-      pairingCode,
-    ]);
-    assert.deepEqual(await readdir(serverState), ["allowlist.json"]);
+    assert.deepEqual(await readdir(serverState), ["relay.secret"]);
+    assert.equal(
+      [...extensionLogs, ...first.relay.output.lines, ...second.relay.output.lines]
+        .join("\n")
+        .includes(SHARED_RELAY_SECRET),
+      false,
+    );
     assert.equal(second.relay.stderr.length, 0);
     assert.equal(first.relay.stderr.length, 0);
   } catch (error: unknown) {
@@ -734,10 +663,9 @@ test("recipient delivery stream never replays across reconnect and child-process
     socketControl.restore();
     restoreReconnect();
     console.error = originalError;
+    environment?.restore();
     if (previousURL === undefined) delete process.env.PI_MESSAGING_RELAY_URL;
     else process.env.PI_MESSAGING_RELAY_URL = previousURL;
-    if (previousState === undefined) delete process.env.PI_MESSAGING_RELAY_STATE_DIR;
-    else process.env.PI_MESSAGING_RELAY_STATE_DIR = previousState;
     try {
       await rm(root, { recursive: true, force: true });
     } catch (error: unknown) {
