@@ -1,12 +1,16 @@
 ---
 title: Installation pairing seam
-description: How one relay startup code authorizes one Ed25519 extension installation through the real HTTP boundary.
-status: accepted
+description: How one relay startup code authorizes one Ed25519 extension installation through the real HTTP boundary. Superseded by protocol v2 shared-secret authentication.
+status: superseded
 date: 2026-09-10
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
+
+<Aside type="caution" title="Superseded by protocol v2 authentication">
+Protocol v2 removed pairing entirely: the `/relay-pair` command, startup pairing codes, the Ed25519 installation key, and the persisted allowlist are replaced by one optional static shared secret checked at the WebSocket upgrade. The accepted contract is [online relay authentication v2](../../protocol/online-relay-auth-v2/); this page is retained as history and no longer describes shipped behavior.
+</Aside>
 
 Pairing remains the trust bootstrap: a real `/relay-pair CODE` command calls `POST /v1/pair`, and the relay persists the accepted installation's public identity. During an active Pi session, successful pairing may then trigger one WebSocket authentication attempt with that identity and enable connected `list_peers` discovery. Pairing itself does not implement roster, delivery, reconnect, or restart behavior.
 

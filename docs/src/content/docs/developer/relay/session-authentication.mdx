@@ -1,12 +1,16 @@
 ---
 title: Session authentication seam
-description: How paired extension sessions authenticate over a bounded WebSocket challenge and receive opaque UUIDv7 route addresses.
-status: accepted
+description: How paired extension sessions authenticate over a bounded WebSocket challenge and receive opaque UUIDv7 route addresses. Superseded by protocol v2 shared-secret authentication.
+status: superseded
 date: 2026-09-10
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
+
+<Aside type="caution" title="Superseded by protocol v2 authentication">
+Protocol v2 removed the nonce challenge, the signed hello transcript, and per-installation authorization; authentication moved to the HTTP WebSocket upgrade with one optional static shared secret. The accepted contract is [online relay authentication v2](../../protocol/online-relay-auth-v2/); this page is retained as history and no longer describes shipped behavior.
+</Aside>
 
 This slice implements `/v1/connect` from challenge through welcome. After welcome, the [WebSocket envelope boundary](../../protocol/websocket-envelope-boundary/) owns the authenticated socket's bounded operation-message loop, and the [active peer roster](../active-peer-roster/) consumes authenticated presence. The [authenticated message delivery](../message-delivery/) seam consumes the same retained socket, renders string/object provenance, and selects recipient-local idle or busy injection. [Automatic session reconnect](../automatic-reconnect/) reuses this authentication boundary. A normal server restart reloads accepted installation identities from an explicitly selected durable state directory before serving this same boundary.
 
