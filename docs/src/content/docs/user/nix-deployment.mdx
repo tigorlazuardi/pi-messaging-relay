@@ -35,7 +35,7 @@ Add the complete store root to the Pi package list owned by your configuration:
 }
 ```
 
-The package root contains production `typebox` and `ws` dependencies. It needs no activation-time `npm install`. Deliver the client config file at the fixed `~/.config/pi/pi-messaging-relay.json` path with mode `0600`, outside the store: one closed JSON object with the service's numeric loopback origin as `url` and the optional shared `secret` matching the server's secret file. The path is operator-owned runtime input, exactly like the server secret file.
+The package root contains production `typebox` and `ws` dependencies. It needs no activation-time `npm install`. Deliver the client config file at the fixed `~/.config/pi/pi-messaging-relay.json` path with mode `0600`, outside the store: one closed JSON object with the service's numeric loopback origin as `url` and the optional shared `secret` matching the server's secret file. The path is operator-owned runtime input, exactly like the server secret file. A client on another machine may instead point `url` at this relay's HTTPS ingress; see [Install and configure the relay extension](../install-relay-extension/).
 
 ## Choose one service scope
 

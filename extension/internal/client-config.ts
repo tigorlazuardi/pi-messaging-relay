@@ -75,7 +75,11 @@ export async function loadClientConfiguration(home = homedir()): Promise<ClientC
   return { endpoint: parseLoopbackOrigin(source), secret: parsedFile?.secret };
 }
 
-/** Validate one HTTP loopback origin exactly like the v1 endpoint environment value. */
+/** Validate one origin for the client config. Plain HTTP stays loopback-only
+ * (same-host deployments, the v1 shape); HTTPS is trusted to any host because
+ * TLS is the transport trust boundary — remote ingress behind a TLS-terminating
+ * proxy is a supported deployment. Userinfo, non-root paths, query, and hash
+ * stay rejected for both schemes. */
 export function parseLoopbackOrigin(value: string): URL {
   let endpoint: URL;
   try {
@@ -83,9 +87,10 @@ export function parseLoopbackOrigin(value: string): URL {
   } catch {
     throw configurationError(
       "url_invalid",
-      "Relay client url must be an HTTP loopback origin such as http://127.0.0.1:8080.",
+      "Relay client url must be an HTTP loopback origin or an HTTPS origin such as http://127.0.0.1:8080 or https://relay.example.net.",
     );
   }
+  const httpsOrigin = endpoint.protocol === "https:";
   const host = endpoint.hostname.replace(/^\[|\]$/g, "");
   const ipv4Parts = host.split(".");
   const isIPv4Loopback =
@@ -93,17 +98,17 @@ export function parseLoopbackOrigin(value: string): URL {
     ipv4Parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255) &&
     Number(ipv4Parts[0]) === 127;
   if (
-    endpoint.protocol !== "http:" ||
+    (endpoint.protocol !== "http:" && !httpsOrigin) ||
     endpoint.username !== "" ||
     endpoint.password !== "" ||
     (endpoint.pathname !== "" && endpoint.pathname !== "/") ||
     endpoint.search !== "" ||
     endpoint.hash !== "" ||
-    (!isIPv4Loopback && host !== "::1")
+    (!httpsOrigin && !isIPv4Loopback && host !== "::1")
   ) {
     throw configurationError(
       "url_invalid",
-      "Relay client url must be an HTTP loopback origin such as http://127.0.0.1:8080.",
+      "Relay client url must be an HTTP loopback origin or an HTTPS origin such as http://127.0.0.1:8080 or https://relay.example.net.",
     );
   }
   return endpoint;

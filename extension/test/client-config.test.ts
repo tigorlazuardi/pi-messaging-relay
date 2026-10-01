@@ -136,11 +136,14 @@ for (const [name, text] of [
 for (const [name, value] of [
   ["non-http scheme", "ws://127.0.0.1:8080"],
   ["credentials", "http://user:pass@127.0.0.1:8080"],
+  ["credentials on https", "https://user:pass@relay.example.com"],
   ["path", "http://127.0.0.1:8080/v1"],
+  ["path on https", "https://relay.example.com/v1"],
   ["query string", "http://127.0.0.1:8080?x=1"],
   ["fragment", "http://127.0.0.1:8080#f"],
-  ["external hostname", "http://relay.example.com"],
-  ["external ipv4", "http://10.0.0.1"],
+  ["external hostname over plain http", "http://relay.example.com"],
+  ["external ipv4 over plain http", "http://10.0.0.1"],
+  ["private ipv4 over plain http", "http://192.168.1.10"],
   ["ipv6 non-loopback", "http://[::1:1]"],
   ["not a url", "localhost:8080"],
 ] as const) {
@@ -157,6 +160,13 @@ test("loopback origin accepts 127.0.0.1 and ::1 http forms", () => {
   assert.equal(parseLoopbackOrigin("http://127.0.0.1:8080").href, "http://127.0.0.1:8080/");
   assert.equal(parseLoopbackOrigin("http://127.5.6.7:1").hostname, "127.5.6.7");
   assert.equal(parseLoopbackOrigin("http://[::1]:9000").hostname, "[::1]");
+});
+
+test("https origins are accepted to any host including LAN addresses", () => {
+  assert.equal(parseLoopbackOrigin("https://pi-relay.tigor.web.id").href, "https://pi-relay.tigor.web.id/");
+  assert.equal(parseLoopbackOrigin("https://10.0.0.1:8443").hostname, "10.0.0.1");
+  assert.equal(parseLoopbackOrigin("https://192.168.1.10").hostname, "192.168.1.10");
+  assert.equal(parseLoopbackOrigin("https://[fd7a:115c:a1e0::1]").hostname, "[fd7a:115c:a1e0::1]");
 });
 
 test("absent file without environment override stays disconnected", { concurrency: false }, async (context) => {

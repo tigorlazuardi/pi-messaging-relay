@@ -133,7 +133,7 @@ function disconnected(operation: "list_peers" | "agent_send", body = false): nev
 
 function connectEndpoint(origin: URL): URL {
   const endpoint = new URL("/v1/connect", origin);
-  endpoint.protocol = "ws:";
+  endpoint.protocol = origin.protocol === "https:" ? "wss:" : "ws:";
   return endpoint;
 }
 
