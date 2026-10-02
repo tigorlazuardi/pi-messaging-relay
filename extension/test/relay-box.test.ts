@@ -60,6 +60,39 @@ test("card renders a consistent box with header, body, and reply hint", () => {
   assert.match(flat, /ctrl\+o expands/);
 });
 
+test("card paints a full-row background when the host exposes theme.bg", () => {
+  const calls: string[] = [];
+  const theme = {
+    fg: (color: string, text: string) => `\u001B[31m${text}\u001B[0m`,
+    bold: (text: string) => text,
+    bg: (color: string, text: string) => {
+      calls.push(color);
+      return `\u001B[44m${text}\u001B[0m`;
+    },
+  };
+  const lines = new RelayCardComponent(DETAILS, theme, false).render(80);
+  const plain = (line: string) => line.replace(/\u001B\[[0-9;]*m/g, "");
+  // Every row is one full-width background span: bg wraps the padded line.
+  for (const line of lines) {
+    assert.match(line, /^\u001B\[44m/);
+    assert.match(line, /\u001B\[0m$/);
+    assert.equal(plain(line).length, 80);
+  }
+  assert.ok(calls.length >= lines.length);
+  assert.ok(calls.every((color) => color === "customMessageBg"));
+});
+
+test("card without theme.bg renders unchanged plain frame", () => {
+  const theme = {
+    fg: (color: string, text: string) => `\u001B[31m${text}\u001B[0m`,
+    bold: (text: string) => text,
+  };
+  const lines = new RelayCardComponent(DETAILS, theme, false).render(80);
+  for (const line of lines) {
+    assert.equal(line.includes("\u001B\[44m"), false);
+  }
+});
+
 test("expanded card preserves exact newlines and drops the expand hint", () => {
   const lines = new RelayCardComponent(DETAILS, undefined, true).render(60);
   const flat = lines.join("\n");

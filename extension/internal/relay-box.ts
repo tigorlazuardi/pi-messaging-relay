@@ -2,10 +2,13 @@
 // @earendil-works/pi-tui instead when the extension ever ships inside a host
 // that resolves it (Nix-installed pi does not).
 
-/** Theme subset the card needs; hosts without a theme get plain text. */
+/** Theme subset the card needs; hosts without a theme get plain text.
+ * bg is optional: hosts exposing theme.bg paint the card's full-row
+ * background (customMessageBg), pi-intercom style. */
 export type CardTheme = {
   fg: (color: string, text: string) => string;
   bold: (text: string) => string;
+  bg?: (color: string, text: string) => string;
 };
 
 const ANSI_PATTERN = new RegExp("\\u001B\\[[0-9;]*m", "g");
@@ -150,16 +153,21 @@ export class RelayCardComponent {
     const title = (text: string) => this.theme ? this.theme.fg("toolTitle", text) : text;
     const dim = (text: string) => this.theme ? this.theme.fg("dim", text) : text;
     const text = (value: string) => this.theme ? this.theme.fg("text", value) : value;
+    // Intercom-style full-row background: paint each padded line when the
+    // host exposes theme.bg. Applied last so fg styles nest inside it.
+    const paint = this.theme?.bg
+      ? (line: string) => this.theme!.bg!("customMessageBg", line)
+      : (line: string) => line;
 
     const lines: string[] = [];
-    if (width < 8) return [truncateToWidth(`relay message from ${this.details.from}`, Math.max(1, width))];
+    if (width < 8) return [paint(truncateToWidth(`relay message from ${this.details.from}`, Math.max(1, width)))];
     const bodyWidth = Math.max(1, width - 2);
 
     const shortFrom = truncateToWidth(this.details.from, Math.max(1, bodyWidth - 30));
     const header = ` relay message from ${shortFrom} `;
     const headerText = truncateToWidth(header, bodyWidth);
     const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
-    lines.push(muted("╭") + title(headerText) + muted(`${"─".repeat(headerPadding)}╮`));
+    lines.push(paint(muted("╭") + title(headerText) + muted(`${"─".repeat(headerPadding)}╮`)));
 
     const frame = (content: string): string => {
       const clipped = truncateToWidth(content, bodyWidth);
@@ -173,16 +181,16 @@ export class RelayCardComponent {
         width: bodyWidth,
         lines: wrapText(this.details.bodyText.replace(/\n+$/g, ""), bodyWidth),
       }).lines;
-    for (const line of bodyLines) lines.push(frame(text(line)));
+    for (const line of bodyLines) lines.push(paint(frame(text(line))));
 
     const meta: string[] = [`reply via agent_send to=${JSON.stringify(this.details.from)}`];
     if (this.details.re !== undefined) meta.push(`re=${this.details.re.slice(0, 8)}`);
     if (!this.expanded) meta.push("ctrl+o expands");
     const metaPlain = ` ${meta.join(" · ")}`;
     for (const metaLine of wrapText(metaPlain, bodyWidth)) {
-      lines.push(frame(dim(metaLine)));
+      lines.push(paint(frame(dim(metaLine))));
     }
-    lines.push(muted(`╰${"─".repeat(bodyWidth)}╯`));
+    lines.push(paint(muted(`╰${"─".repeat(bodyWidth)}╯`)));
     return lines;
   }
 }

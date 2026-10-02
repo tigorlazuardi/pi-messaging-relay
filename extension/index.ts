@@ -667,8 +667,14 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.registerMessageRenderer(RELAY_MESSAGE_TYPE, (message, options, theme) => {
     const details = message.details as RelayCardDetails | undefined;
     if (details === null || typeof details !== "object") return undefined;
-    const cardTheme = theme && typeof theme === "object" && typeof (theme as CardTheme).fg === "function"
-      ? theme as CardTheme
+    const candidate = theme && typeof theme === "object" ? theme as Partial<CardTheme> : undefined;
+    const cardTheme = candidate && typeof candidate.fg === "function"
+      ? {
+        fg: candidate.fg,
+        bold: candidate.bold,
+        // Hosts exposing theme.bg paint the intercom-style card background.
+        ...(typeof candidate.bg === "function" ? { bg: candidate.bg } : {}),
+      }
       : undefined;
     return new RelayCardComponent(details, cardTheme, options.expanded === true);
   });
