@@ -748,26 +748,17 @@ export default function relayExtension(pi: ExtensionAPI): void {
     },
   });
 
-  const renderResultLine = (
-    label: string,
-    args: Record<string, unknown>,
-    result: Record<string, unknown> | undefined,
-    theme: CardTheme,
-  ): Text => {
-    let left = theme.fg("toolTitle", theme.bold(label));
+  // Header slot: title, short body preview, destination. renderResult owns
+  // the outcome; repeating the title there produced doubled labels.
+  const renderSendHeader = (args: Record<string, unknown>, theme: CardTheme): Text => {
+    let left = theme.fg("toolTitle", theme.bold("agent_send"));
     const body = args.body;
     if (typeof body === "string") left += theme.fg("muted", ` "${truncateToWidth(body.replace(/\s+/g, " ").trim(), 32)}"`);
     const destination = args.to;
     if (typeof destination === "string") {
       left += theme.fg("muted", " → ") + theme.fg("accent", senderLabel(destination));
     }
-    if (result === undefined) return new Text(left);
-    const status = typeof result.status === "string" ? result.status : undefined;
-    const reason = typeof result.reason === "string" ? result.reason : undefined;
-    const right = status === undefined
-      ? ""
-      : theme.fg(status === "received" ? "success" : "error", ` ${status}${reason ? ` (${reason})` : ""}`);
-    return new Text(`${left}${right}`);
+    return new Text(left);
   };
 
 
@@ -794,11 +785,15 @@ export default function relayExtension(pi: ExtensionAPI): void {
         throw error;
       }
     },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("list_peers")));
+    },
     renderResult(result, _options, theme) {
+      // Outcome only: the call header already shows the title.
       const details = result.details as { peers?: unknown[] } | undefined;
       const count = Array.isArray(details?.peers) ? details!.peers.length : 0;
-      return new Text(theme.fg("toolTitle", theme.bold("list_peers")) +
-        theme.fg("muted", ` ${count} online`));
+      return new Text(theme.fg("muted", "└ ") +
+        theme.fg(count > 0 ? "success" : "muted", `${count} online`));
     },
   });
 
@@ -845,16 +840,17 @@ export default function relayExtension(pi: ExtensionAPI): void {
       }
     },
     renderCall(args, theme) {
-      return renderResultLine("agent_send", args as Record<string, unknown>, undefined, theme as CardTheme);
+      return renderSendHeader(args as Record<string, unknown>, theme as CardTheme);
     },
-    renderResult(result, _options, theme, context) {
-      const args = (context as { state?: { args?: unknown } } | undefined)?.state?.args;
-      return renderResultLine(
-        "agent_send",
-        (args ?? {}) as Record<string, unknown>,
-        result.details as Record<string, unknown>,
-        theme as CardTheme,
-      );
+    renderResult(result, _options, theme) {
+      // Outcome only: the call header already shows title, body, destination.
+      const details = result.details as Record<string, unknown> | undefined;
+      const status = typeof details?.status === "string" ? details.status : undefined;
+      const reason = typeof details?.reason === "string" ? details.reason : undefined;
+      const text = status === undefined
+        ? theme.fg("error", "failed")
+        : theme.fg(status === "received" ? "success" : "error", `${status}${reason ? ` (${reason})` : ""}`);
+      return new Text(theme.fg("muted", "└ ") + text);
     },
   });
 }
