@@ -226,9 +226,12 @@ test("rejected credentials render the red relay indicator", { timeout: 60_000, c
     relayExtension(host.api as never);
     await host.emit("session_start", { type: "session_start", reason: "startup" });
 
-    const rejected = structuredEvents(logs.lines).find(
-      (event) => event.event === "relay_auth_rejected" && event.reason === "not_authorized");
-    assert.ok(rejected);
+    // Connect is fire-and-forget; wait for the rejection to land.
+    await waitUntil(
+      () => structuredEvents(logs.lines).some(
+        (event) => event.event === "relay_auth_rejected" && event.reason === "not_authorized"),
+      "waiting for not_authorized rejection",
+    );
     await waitUntil(
       () => renderedIndicator(host) === "error:● relay",
       "waiting for red indicator after auth rejection",
@@ -257,6 +260,11 @@ test("a rejected configuration file renders the red relay indicator", { concurre
     relayExtension(host.api as never);
     await host.emit("session_start", { type: "session_start", reason: "startup" });
 
+    // Connect is fire-and-forget; wait for the closed diagnostic to land.
+    await waitUntil(
+      () => structuredEvents(logs.lines).some((event) => event.event === "relay_config_rejected"),
+      "waiting for relay_config_rejected",
+    );
     const rejected = structuredEvents(logs.lines).find((event) => event.event === "relay_config_rejected");
     assert.ok(rejected);
     assert.equal(renderedIndicator(host), "error:● relay");

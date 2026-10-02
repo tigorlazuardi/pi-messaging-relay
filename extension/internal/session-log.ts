@@ -24,11 +24,13 @@ function joinPath(...segments: string[]): string {
   return segments.join("/").replace(/\/+/g, "/");
 }
 
-// One mkdir promise per target directory; appends chain after it. Weak
+// One append promise chain per target file; appends serialize onto it so
+// lines land in emit order despite the fire-and-forget path. Weak
 // synchronization overall: the emit path never awaits, each line is one
 // plain O_APPEND write, and failures are swallowed. One session owns one
 // file, so concurrent sessions never share a write target.
 const directoryReady = new Map<string, Promise<void>>();
+const fileChain = new Map<string, Promise<void>>();
 
 function ensureDirectory(directory: string): Promise<void> {
   let ready = directoryReady.get(directory);
@@ -39,11 +41,21 @@ function ensureDirectory(directory: string): Promise<void> {
   return ready;
 }
 
-/** Fire-and-forget append: no await in the emit path, errors swallowed. */
+/** Fire-and-forget append: no await in the emit path, errors swallowed.
+ * Appends to one file serialize onto a per-file promise chain, preserving
+ * emit order even when earlier writes are still in flight. */
 export function appendDiagnosticLine(path: string, line: string): void {
-  void ensureDirectory(path.slice(0, path.lastIndexOf("/")))
-    .then(() => appendFile(path, `${line}\n`, { encoding: "utf8", flag: "a" }))
-    .catch(() => undefined);
+  const directory = path.slice(0, path.lastIndexOf("/"));
+  const write = fileChain.get(path) ?? Promise.resolve();
+  const appended = write
+    .catch(() => undefined)
+    .then(() => ensureDirectory(directory))
+    .then(() => appendFile(path, `${line}\n`, { encoding: "utf8", flag: "a" }));
+  fileChain.set(
+    path,
+    appended.catch(() => undefined),
+  );
+  void appended.catch(() => undefined);
 }
 
 /** Newest-last tail of at most maxLines entries; missing files read empty. */

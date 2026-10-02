@@ -390,7 +390,9 @@ test("inline reconnect intent is discarded when session shutdown invalidates its
     relayExtension(host.api as never);
 
     await host.emit("session_start", { type: "session_start", reason: "startup" });
-    assert.ok(shutdown);
+    // Connect is fire-and-forget; wait until the synchronous retry fires and
+    // its callback has issued the racing shutdown.
+    await waitUntil(() => scheduleCalls >= 1 && shutdown !== undefined, "racing shutdown issued");
     await shutdown;
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(scheduleCalls, 1);

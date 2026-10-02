@@ -9,7 +9,13 @@ import {
   readSessionLogTail,
   resolveSessionLogPath,
 } from "./internal/session-log.ts";
-import { Text, truncateToWidth, type CardTheme } from "./internal/relay-box.ts";
+import {
+  Text,
+  truncateToWidth,
+  truncateStyledToWidth,
+  visibleWidth,
+  type CardTheme,
+} from "./internal/relay-box.ts";
 
 import {
   ClientConfigurationError,
@@ -30,6 +36,7 @@ import {
   type ReconnectDeadline,
 } from "./internal/reconnect.ts";
 import { RelayCardComponent } from "./internal/relay-box.ts";
+import { RelayLogsOverlay } from "./internal/logs-overlay.ts";
 import type { RelayCardDetails } from "./internal/message-renderer.ts";
 import { RosterRequestError, type SendResult } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
@@ -493,6 +500,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
   }
 
   const connectOnce = async (): Promise<void> => {
+    const generation = lifecycleGeneration;
     if (!sessionStarted || activeConnection) return;
     if (startupAttempted) return;
     if (activeTask) {
@@ -537,6 +545,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
     const cwd = sessionCWD;
     const sessionIdle = activeSessionIdle;
     if (!routeID || !cwd || !sessionIdle) return;
+    // Fire-and-forget entry: a session_start→shutdown race or a reload must
+    // not connect a stale generation over the fresh session's socket.
+    if (generation !== lifecycleGeneration) return;
 
     cancelRetry();
     connectionStatus = "connecting";
@@ -623,7 +634,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
       reason,
       route_id: sessionRouteID,
     });
-    await connectOnce();
+    // Fire-and-forget: a slow or unreachable relay must never delay session
+    // start; tools report the disconnected state until the connect lands.
+    void connectOnce().catch(() => undefined);
   });
 
   pi.on("session_shutdown", () => stopSession(true));
@@ -690,31 +703,33 @@ export default function relayExtension(pi: ExtensionAPI): void {
       }
       if (overlayFactory) {
         try {
+          // Load before opening: first paint is never blank, and the async
+          // load can never race the host's render pass.
+          const initial = await snapshotText();
           await overlayFactory(
-            (_tui, _theme, _keybindings, done) => {
-              const view = new Text("");
-              let rendered = "";
-              void snapshotText().then((text) => {
-                rendered = text;
-              });
-              (view as unknown as { render: (width: number) => string[] }).render = () =>
-                rendered.split("\n");
-              (view as { onKey?: (key: string) => boolean }).onKey = (key) => {
-                if (key === "escape" || key === "return") {
-                  done(true);
-                  return true;
-                }
-                if (key === "r") {
-                  void snapshotText().then((text) => {
-                    rendered = text;
-                  });
-                  return true;
-                }
-                return false;
-              };
-              return view;
+            (tui, theme, _keybindings, done) => {
+              const cardTheme = theme && typeof theme === "object" &&
+                  typeof (theme as CardTheme).fg === "function"
+                ? theme as CardTheme
+                : undefined;
+              return new RelayLogsOverlay(
+                snapshotText,
+                done,
+                cardTheme,
+                () => {
+                  try {
+                    (tui as { requestRender?: () => void } | undefined)?.requestRender?.();
+                  } catch {
+                    // The refresh render is cosmetic; never surface it.
+                  }
+                },
+                initial,
+              );
             },
-            { overlay: true },
+            {
+              overlay: true,
+              overlayOptions: { anchor: "center", width: "90%", maxHeight: "80%" },
+            },
           );
           return;
         } catch {

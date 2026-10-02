@@ -420,7 +420,20 @@ test("production session_shutdown force-settles retained socket when peer ignore
     const relayExtension = (await import(`../index.ts?hostile-shutdown=${Date.now()}`)).default;
     relayExtension(host.api as never);
     await within(host.emit("session_start"));
-    assert.equal(logs.filter((line) => JSON.parse(line).event === "relay_auth_accepted").length, 1);
+    // Connect is fire-and-forget; wait until the accepted event lands.
+    const acceptedCount = () =>
+      logs.filter((line) => {
+        try {
+          return JSON.parse(line).event === "relay_auth_accepted";
+        } catch {
+          return false;
+        }
+      }).length;
+    const acceptDeadline = Date.now() + 3_000;
+    while (acceptedCount() < 1 && Date.now() < acceptDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(acceptedCount(), 1);
 
     await within(host.emit("session_shutdown"));
     assert.ok(peerClosed);

@@ -228,6 +228,18 @@ test("invalid configuration file stays disconnected with one closed diagnostic a
     const relayExtension = await loadRelayExtension();
     relayExtension(host.api as never);
     await host.emit("session_start");
+    // Connect is fire-and-forget; wait for the closed diagnostic before
+    // shutdown. setImmediate polling: the disconnected-resource guards forbid
+    // setTimeout here, and microtasks alone would starve config-file I/O.
+    while (!logs.lines.some((line) => {
+      try {
+        return JSON.parse(line).event === "relay_config_rejected";
+      } catch {
+        return false;
+      }
+    })) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     await host.emit("session_shutdown");
   } finally {
     logs.restore();
@@ -273,6 +285,12 @@ test("environment endpoint alone attempts one bounded connection", { concurrency
     const relayExtension = await loadRelayExtension();
     relayExtension(host.api as never);
     await host.emit("session_start");
+    // Connect is fire-and-forget; the synchronous rejection still lands only
+    // after the emit returns. Wait for the bounded retry to be scheduled.
+    await waitUntil(
+      () => scheduledDelays.length >= 1,
+      "bounded retry scheduled",
+    );
     await host.emit("session_shutdown");
   } finally {
     logs.restore();
