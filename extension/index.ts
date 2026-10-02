@@ -668,14 +668,10 @@ export default function relayExtension(pi: ExtensionAPI): void {
     const details = message.details as RelayCardDetails | undefined;
     if (details === null || typeof details !== "object") return undefined;
     const candidate = theme && typeof theme === "object" ? theme as Partial<CardTheme> : undefined;
-    const cardTheme = candidate && typeof candidate.fg === "function"
-      ? {
-        fg: candidate.fg,
-        bold: candidate.bold,
-        // Hosts exposing theme.bg paint the intercom-style card background.
-        ...(typeof candidate.bg === "function" ? { bg: candidate.bg } : {}),
-      }
-      : undefined;
+    // Pass the host theme object through whole: pi's fg/bg are this-bound
+    // methods, and destructuring them into a fresh object crashes render
+    // with "Cannot read properties of undefined (reading 'get')".
+    const cardTheme = candidate && typeof candidate.fg === "function" ? theme as CardTheme : undefined;
     return new RelayCardComponent(details, cardTheme, options.expanded === true);
   });
 

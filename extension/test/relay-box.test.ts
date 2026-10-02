@@ -93,6 +93,33 @@ test("card without theme.bg renders unchanged plain frame", () => {
   }
 });
 
+test("render never throws: this-bound theme methods survive intact", () => {
+  // Reproduces the pi crash: host theme methods read `this` state, so
+  // destructuring them unbinds `this` and render threw at the first call.
+  const colors = new Map<string, string>([["text", "T"]]);
+  const theme = {
+    colors,
+    fg: function (color: string, text: string) {
+      if (!this) throw new TypeError("Cannot read properties of undefined (reading 'get')");
+      if (!this.colors.has(color)) this.colors.set(color, text);
+      return text;
+    },
+    bold: (text: string) => text,
+    bg: function (color: string, text: string) {
+      if (!this) throw new TypeError("unbound bg");
+      return text;
+    },
+  };
+  const lines = new RelayCardComponent(DETAILS, theme as never, false).render(80);
+  assert.ok(lines.length >= 5);
+  // Destructured (crashing) theme degrades to the one-line fallback.
+  const broken = new RelayCardComponent(DETAILS, {
+    fg: theme.fg as never,
+    bold: theme.bold,
+  } as never, false).render(80);
+  assert.match(broken.join("\n"), /relay message from/);
+});
+
 test("expanded card preserves exact newlines and drops the expand hint", () => {
   const lines = new RelayCardComponent(DETAILS, undefined, true).render(60);
   const flat = lines.join("\n");

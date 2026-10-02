@@ -149,6 +149,20 @@ export class RelayCardComponent {
   }
 
   render(width: number): string[] {
+    // A renderer throw must never kill the host session; degrade to the
+    // one-line fallback (observed: unbound theme methods crashing render).
+    try {
+      return this.renderLines(width);
+    } catch {
+      try {
+        return [truncateToWidth(`relay message from ${this.details.from}`, Math.max(1, width))];
+      } catch {
+        return ["relay message"];
+      }
+    }
+  }
+
+  private renderLines(width: number): string[] {
     const muted = (text: string) => this.theme ? this.theme.fg("muted", text) : text;
     const title = (text: string) => this.theme ? this.theme.fg("toolTitle", text) : text;
     const dim = (text: string) => this.theme ? this.theme.fg("dim", text) : text;
