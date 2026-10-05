@@ -179,10 +179,11 @@ test("loads and runs disconnected handlers without starting resources", { concur
 
   assert.deepEqual(host.registrations, [
     { kind: "command", name: "relay-logs" },
+    { kind: "command", name: "relay-peers" },
     { kind: "tool", name: "list_peers" },
     { kind: "tool", name: "agent_send" },
   ]);
-  assert.deepEqual([...host.commands.keys()], ["relay-logs"]);
+  assert.deepEqual([...host.commands.keys()], ["relay-logs", "relay-peers"]);
   assert.deepEqual([...host.tools.keys()], ["list_peers", "agent_send"]);
   assert.deepEqual(resourceAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);

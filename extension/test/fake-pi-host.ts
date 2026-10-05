@@ -27,6 +27,7 @@ export class FakePiHost {
   readonly commands = new Map<string, CommandRegistration>();
   readonly tools = new Map<string, ToolRegistration>();
   readonly messageRenderers = new Map<string, MessageRendererRegistration>();
+  readonly entryRenderers = new Map<string, unknown>();
   readonly registrations: Array<{ kind: "command" | "tool"; name: string }> = [];
   readonly notifications: Notification[] = [];
   readonly sendMessageAttempts: unknown[] = [];
@@ -63,6 +64,9 @@ export class FakePiHost {
       },
       registerMessageRenderer: (customType: string, renderer: unknown) => {
         this.messageRenderers.set(customType, { customType, renderer });
+      },
+      registerEntryRenderer: (customType: string, renderer: unknown) => {
+        this.entryRenderers.set(customType, renderer);
       },
       sendMessage: (...args: unknown[]) => {
         this.sendMessageAttempts.push(args);

@@ -1,6 +1,6 @@
 ---
 title: Automatic session reconnect
-description: How one active Pi session restores authenticated presence with bounded jittered backoff while retaining its exact route identity.
+description: How one active Pi session restores authenticated presence with bounded jittered backoff and a fresh ephemeral route identity per attempt.
 status: accepted
 date: 2026-09-11
 ---
@@ -21,26 +21,30 @@ sequenceDiagram
     R--xE: authenticated socket closes
     R->>O: subject absent from live roster
     E->>E: wait bounded jittered delay
-    E->>R: connect with same secret, cwd, hostname, and route UUID
+    E->>R: connect with same secret, cwd, hostname, fresh route UUID
     alt attempt fails
       E->>E: increase bounded retry delay
     else authentication succeeds
-      R->>O: same complete address returns to live roster
+      R->>O: <cwd>@<hostname>#<new route UUID> returns to live roster
       E->>E: reset retry progression
     end
 ```
 
-One active lifecycle captures its route UUID, cwd, hostname, the configured endpoint and optional secret, and the recipient idle predicate. Every automatic attempt uses that same identity snapshot, so successful reauthentication returns the exact original `<cwd>@<hostname>#<route_id>` address. The relay removes the old socket from live presence before any replacement is authenticated; failed attempts remain absent. Presence returns only after the relay accepts the hello.
+One active lifecycle captures cwd, hostname, the configured endpoint and optional secret, and the recipient idle predicate. The route UUID is ephemeral: each lifecycle generates a fresh UUIDv7 at session start, and every automatic attempt generates another fresh UUIDv7, so identity is stable only in its `cwd@hostname` part. A successful attempt publishes `<cwd>@<hostname>#<fresh route_id>`. The relay removes the old socket from live presence before any replacement is authenticated; failed attempts remain absent. Presence returns only after the relay accepts the hello. Senders capture recipient addresses from the newest roster page, so a changed route suffix requires no reconciliation anywhere.
 
-A hidden Pi custom session entry stores only `{version: 1, route_id: <uuidv7>}` under `pi-messaging-relay-route-v1`. It is not model context. `startup`, `reload`, and `resume` restore a strictly shaped canonical UUIDv7 entry when present. Missing or malformed state generates and appends a fresh route. `new` and `fork` always ignore inherited route entries and append a fresh UUIDv7, preventing two live Pi sessions from sharing one route.
+The extension stores no route identity at all. `startup`, `reload`, `resume`, `new`, and `fork` all generate a fresh UUIDv7, and no hidden session entry exists, so a restored or reloaded session can never collide with a registration the relay still holds.
 
-<Decision title="Keep route identity in Pi session state, separate from the shared secret" status="accepted">
-The config file's optional secret is the only credential, shared across that user's sessions. One hidden custom entry identifies only the current Pi session route. Strict restoration keeps reloads stable, while explicit new and fork lifecycle reasons always create a fresh route without treating cwd, hostname, or entry content as authorization.
+<Decision title="Keep route identity in Pi session state, separate from the shared secret" status="superseded">
+Replaced by fresh ephemeral route identity. Persisted route IDs raced zombie registrations and produced 34 repeated `route_conflict` rejections across two production incidents; the roster never required a stable suffix.
+</Decision>
+
+<Decision title="Fresh ephemeral route identity per lifecycle and per attempt" status="accepted">
+The stable identity is `cwd@hostname`; the route suffix is pure session ephemera, generated fresh per lifecycle and per reconnect attempt. Persisting route state bought address stability that no consumer used and paid for it with unresolvable conflicts after reload, resume, and `pi --continue`.
 </Decision>
 
 ## Fixed retry policy
 
-The first startup connection attempt remains immediate. After an attempt fails, or after a retained authenticated socket closes, the reconnect scheduler waits before another attempt.
+The first startup connection attempt remains immediate. After an attempt fails, or after a retained authenticated socket closes, the reconnect scheduler waits before another attempt. A retained socket can close through liveness enforcement as well as transport loss: the client heartbeat and the server watchdog bound silent transports (see [session authentication](../session-authentication/)), so a dead connection produces an ordinary `session_disconnected` and this same policy reconnects it with a fresh route UUID.
 
 | Policy value | Fixed v1 value |
 |---|---:|
@@ -85,12 +89,12 @@ The extension emits one `relay_reconnect_scheduled` event with one-based retry i
   </TabItem>
   <TabItem label="Scheduled output">
     ```json
-    {"delay_ms":375,"route_id":"01993ca1-1111-7aaa-8aaa-111111111111"}
+    {"delay_ms":375,"route_id":"01993ca1-7777-7aaa-8aaa-333333333333"}
     ```
   </TabItem>
   <TabItem label="Authenticated restoration">
     ```json
-    {"peers":[{"address":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111"}]}
+    {"peers":[{"address":"/srv/frontend@workstation-a#01993ca1-7777-7aaa-8aaa-333333333333"}]}
     ```
   </TabItem>
 </Tabs>

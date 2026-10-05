@@ -69,15 +69,23 @@ Angle-bracket terms above are substitutions, and every shown `\n` is one LF byte
 
 Authorization has exactly two inputs: the submitted Ed25519 public key must be in the server allowlist, and its signature must verify over the server nonce plus the complete hello metadata. Cwd, hostname, route UUID, and composed address are display and routing metadata only. The server never parses a composite address to recover identity or permission.
 
-After verification, welcome returns `<cwd>@<hostname>#<route_id>` verbatim as `self_address`, with `heartbeat_ms: 30000` and `max_body_bytes: 262144`. Separator characters inside display metadata remain data; later routing treats the complete address as opaque.
+After verification, welcome returns `<cwd>@<hostname>#<route_id>` verbatim as `self_address`, with `heartbeat_ms: 30000` and `max_body_bytes: 262144`. Separator characters inside display metadata remain data; later routing treats the complete address as opaque. The `route_id` suffix is ephemeral session identity: the extension generates a fresh UUIDv7 for every lifecycle and every automatic reconnect attempt, so the stable part of an address is only `cwd@hostname`. See [automatic session reconnect](../automatic-reconnect/) for the identity decision.
+
+## Liveness
+
+WebSocket control frames follow RFC 6455: each library answers pings automatically, and neither side may assume the peer sends one. The advertised `heartbeat_ms` is the application liveness cadence layered on that base: the client sends a WebSocket ping every 30 seconds and hard-terminates the transport when a deadline passes without any inbound pong; the server runs one watchdog per authenticated connection that pings the peer on the same cadence and force-closes (`CloseNow`) a connection whose ping errors or times out. Silent transports therefore end in the ordinary `session_disconnected` path instead of lingering as undead roster entries. Ping and pong control traffic produces no log events.
+
+<Decision title="Bound silent transports with symmetric application-level liveness" status="accepted">
+RFC 6455 obliges peers only to answer pings, so each side owns its own detection policy: client ping plus inbound-pong deadline, server watchdog ping plus write deadline. Detection always flows through the existing disconnect path, so reconnect policy stays single-pathed.
+</Decision>
 
 <Decision title="Separate authenticated installation identity from session display identity" status="accepted">
-The allowlisted key identifies the installation. One UUIDv7 identifies this Pi session route. Display metadata can contain address separator characters and can change what humans see, but cannot grant authorization.
+The allowlisted key identifies the installation. The UUIDv7 route suffix is ephemeral, regenerated per lifecycle and per reconnect attempt. Display metadata can contain address separator characters and can change what humans see, but cannot grant authorization.
 </Decision>
 
 The connection registry atomically reserves one of 1,024 slots before `websocket.Accept`. Capacity exhaustion returns bounded HTTP `503` without upgrading and emits one `session_capacity_rejected` event. Accept failure releases the reservation; every successful upgrade attaches to its reservation immediately. Shutdown force-closes and settles reserved authentication or authenticated sockets within the existing five-second process deadline before reporting `server_stopped`.
 
-Under the same registry lock, authentication rejects an active duplicate route UUID or complete opaque address. Each accepted entry stores the authenticated installation key and route UUID separately; no composite-address parsing participates in identity or authorization. The roster consumes only a copy of active opaque address strings and omits reserved or unauthenticated entries. After exact disconnect cleanup, a bounded automatic attempt may authenticate the same route and complete opaque address as a new live registry entry. It cannot replace an entry that is still active.
+Under the same registry lock, authentication rejects an active duplicate route UUID or complete opaque address. Each accepted entry stores the authenticated installation key and route UUID separately; no composite-address parsing participates in identity or authorization. The roster consumes only a copy of active opaque address strings and omits reserved or unauthenticated entries. Because every retry presents a fresh route UUID, an automatic attempt can never collide with a registration the relay still holds; only an already-live exact address is a conflict, and the client never reuses one.
 
 ## Dependency boundary
 

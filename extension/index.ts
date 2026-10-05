@@ -37,6 +37,12 @@ import {
 } from "./internal/reconnect.ts";
 import { RelayCardComponent } from "./internal/relay-box.ts";
 import { RelayLogsOverlay } from "./internal/logs-overlay.ts";
+import {
+  buildPeerRosterSnapshot,
+  PeerRosterCardComponent,
+  PEER_ROSTER_ENTRY_TYPE,
+  snapshotFromUnknown,
+} from "./internal/peer-roster-view.ts";
 import type { RelayCardDetails } from "./internal/message-renderer.ts";
 import { RosterRequestError, type SendResult } from "./internal/roster-client.ts";
 import { generateUUIDv7, SessionSocketAttempt } from "./internal/session-auth.ts";
@@ -45,8 +51,6 @@ const DISCONNECTED_ERROR =
   "Relay is disconnected. Write ~/.config/pi/pi-messaging-relay.json with mode 0600 (url required, secret optional) or set PI_MESSAGING_RELAY_URL, then restart the session.";
 const MAX_CURSOR_CHARACTERS = 5_856;
 const UUID_V7_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
-const ROUTE_ENTRY_TYPE = "pi-messaging-relay-route-v1";
-const ROUTE_ENTRY_VERSION = 1;
 const RELAY_MESSAGE_TYPE = "pi-messaging-relay-message-v1";
 const RELAY_RESULT_LIST_TYPE = "pi-messaging-relay-roster-v1";
 const RELAY_RESULT_SEND_TYPE = "pi-messaging-relay-send-v1";
@@ -165,35 +169,10 @@ function connectEndpoint(origin: URL): URL {
   return endpoint;
 }
 
-function retainedSessionRouteID(context: {
-  sessionManager: { getEntries(): unknown[] };
-}): string | undefined {
-  const entries = context.sessionManager.getEntries();
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const candidate = entries[index];
-    if (candidate === null || typeof candidate !== "object" ||
-        (candidate as { type?: unknown }).type !== "custom" ||
-        (candidate as { customType?: unknown }).customType !== ROUTE_ENTRY_TYPE) {
-      continue;
-    }
-    const data = (candidate as { data?: unknown }).data;
-    if (data === null || typeof data !== "object" || Array.isArray(data)) return undefined;
-    const record = data as Record<string, unknown>;
-    if (Object.keys(record).sort().join(",") !== "route_id,version" ||
-        record.version !== ROUTE_ENTRY_VERSION || typeof record.route_id !== "string" ||
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.route_id)) {
-      return undefined;
-    }
-    return record.route_id;
-  }
-  return undefined;
-}
-
 export default function relayExtension(pi: ExtensionAPI): void {
   type ConnectionIdentity = {
     endpoint: URL;
     secret: string | undefined;
-    routeID: string;
     cwd: string;
     hostname: string;
     sessionIdle(): boolean;
@@ -235,6 +214,26 @@ export default function relayExtension(pi: ExtensionAPI): void {
       // The statusline is cosmetic; it must never block lifecycle or transport ownership.
     }
   };
+
+  // One-shot toasts for the two transitions a passive footer dot hides: the
+  // retry budget dying (red, silent before this) and recovery after it. The
+  // toast is cosmetic and must never block lifecycle or transport ownership.
+  const notifyUI = (message: string, level: string): void => {
+    const ui = activeUI;
+    if (ui === undefined) return;
+    try {
+      (ui as { notify?: (message: string, level?: string) => void }).notify?.(message, level);
+    } catch {
+      // Notification failures never replace lifecycle or transport ownership.
+    }
+  };
+  const notifyExhausted = (): void =>
+    notifyUI(
+      "Relay reconnect exhausted — the session stays disconnected until the next lifecycle event. See /relay-logs.",
+      "warning",
+    );
+  const notifyRecovered = (): void =>
+    notifyUI("Relay reconnected.", "success");
 
   const logAuthentication = (
     level: "info" | "warn",
@@ -291,9 +290,10 @@ export default function relayExtension(pi: ExtensionAPI): void {
     return value;
   };
 
-  const isCurrent = (generation: number, routeID?: string): boolean =>
-    sessionStarted && lifecycleGeneration === generation &&
-    (routeID === undefined || sessionRouteID === routeID);
+  // Generation-only: identity is cwd+hostname for the whole lifecycle; the
+  // route UUID changes on every attempt and must not gate currency checks.
+  const isCurrent = (generation: number): boolean =>
+    sessionStarted && lifecycleGeneration === generation;
 
   const cancelRetry = (): void => {
     const scheduled = retryDeadline;
@@ -311,17 +311,30 @@ export default function relayExtension(pi: ExtensionAPI): void {
     generation: number,
     cause: { kind: "startup" } | { kind: "reconnect"; retryIndex: number },
   ): Promise<void> => {
-    if (!isCurrent(generation, identity.routeID) || activeConnection) return;
+    if (!isCurrent(generation) || activeConnection) return;
     if (activeTask) {
       const previousTask = activeTask;
       await previousTask;
-      if (!isCurrent(generation, identity.routeID) || activeConnection || activeTask) return;
+      if (!isCurrent(generation) || activeConnection || activeTask) return;
     }
+
+    // Fresh ephemeral route UUID for every attempt — startup and each
+    // scheduled retry alike. Re-presenting a retained route raced the relay's
+    // still-held registration and produced repeated route_conflict rejections
+    // after reload, resume, or `pi --continue`.
+    let routeID: string;
+    try {
+      routeID = generateUUIDv7(now());
+    } catch {
+      return;
+    }
+    if (!isCurrent(generation)) return;
+    sessionRouteID = routeID;
 
     if (cause.kind === "reconnect") {
       logReconnect("relay_reconnect_attempted", "info", "attempted", {
         retryIndex: cause.retryIndex,
-        routeID: identity.routeID,
+        routeID,
       });
     }
     const operation = (async () => {
@@ -338,7 +351,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
         attempt = new SessionSocketAttempt({
           endpoint: identity.endpoint,
           secret: identity.secret,
-          routeID: identity.routeID,
+          routeID,
           cwd: identity.cwd,
           hostname: identity.hostname,
           deliverUserMessage: createRecipientDelivery(
@@ -355,10 +368,10 @@ export default function relayExtension(pi: ExtensionAPI): void {
             if (wasCurrent) activeConnection = undefined;
             logAuthentication("info", "disconnected", {
               address: connection.address,
-              routeID: identity.routeID,
+              routeID,
             });
-            if (wasCurrent && isCurrent(generation, identity.routeID)) {
-              scheduleRetry(identity, generation, "session_disconnected");
+            if (wasCurrent && isCurrent(generation)) {
+              scheduleRetry(identity, generation, "session_disconnected", routeID);
             }
           },
         });
@@ -367,15 +380,15 @@ export default function relayExtension(pi: ExtensionAPI): void {
         // must never crash over transport creation.
         logAuthentication("warn", "rejected", {
           reason: "connection_failed",
-          routeID: identity.routeID,
+          routeID,
         });
-        scheduleRetry(identity, generation, "connection_failed");
+        scheduleRetry(identity, generation, "connection_failed", routeID);
         return;
       }
       activeAttempt = attempt;
       try {
         connection = await attempt.result;
-        if (!isCurrent(generation, identity.routeID)) {
+        if (!isCurrent(generation)) {
           await connection.closeAndWait();
           return;
         }
@@ -389,25 +402,27 @@ export default function relayExtension(pi: ExtensionAPI): void {
         retained = true;
         sessionAddress = connection.address;
         retryIndex = 0;
+        const wasExhausted = reconnectExhausted;
         reconnectExhausted = false;
         if (cause.kind === "reconnect") {
           logReconnect("relay_reconnect_succeeded", "info", "connected", {
             retryIndex: cause.retryIndex,
             address: connection.address,
-            routeID: identity.routeID,
+            routeID,
             latencyMS,
           });
         } else {
           logAuthentication("info", "accepted", {
             address: connection.address,
-            routeID: identity.routeID,
+            routeID,
             latencyMS,
           });
         }
         connectionStatus = "connected";
         applyStatus();
+        if (wasExhausted) notifyRecovered();
       } catch (error) {
-        if (!isCurrent(generation, identity.routeID)) return;
+        if (!isCurrent(generation)) return;
         const reason = error !== null && typeof error === "object" && "reason" in error &&
             typeof (error as { reason?: unknown }).reason === "string"
           ? (error as { reason: string }).reason
@@ -420,10 +435,10 @@ export default function relayExtension(pi: ExtensionAPI): void {
         }
         logAuthentication("warn", "rejected", {
           reason,
-          routeID: identity.routeID,
+          routeID,
           latencyMS,
         });
-        scheduleRetry(identity, generation, reason);
+        scheduleRetry(identity, generation, reason, routeID);
       } finally {
         if (activeAttempt === attempt) activeAttempt = undefined;
       }
@@ -437,8 +452,13 @@ export default function relayExtension(pi: ExtensionAPI): void {
     await trackedTask;
   };
 
-  function scheduleRetry(identity: ConnectionIdentity, generation: number, reason: string): void {
-    if (!isCurrent(generation, identity.routeID) || activeConnection || retryDeadline) return;
+  function scheduleRetry(
+    identity: ConnectionIdentity,
+    generation: number,
+    reason: string,
+    failedRouteID: string,
+  ): void {
+    if (!isCurrent(generation) || activeConnection || retryDeadline) return;
     if (retryIndex >= RECONNECT_MAX_RETRIES) {
       if (!reconnectExhausted) {
         reconnectExhausted = true;
@@ -447,8 +467,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
         logReconnect("relay_reconnect_exhausted", "warn", "exhausted", {
           reason,
           retryIndex,
-          routeID: identity.routeID,
+          routeID: failedRouteID,
         });
+        notifyExhausted();
       }
       return;
     }
@@ -485,7 +506,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
       reason,
       retryIndex: scheduledRetryIndex,
       delayMS,
-      routeID: identity.routeID,
+      routeID: failedRouteID,
     });
     connectionStatus = "connecting";
     applyStatus();
@@ -541,10 +562,9 @@ export default function relayExtension(pi: ExtensionAPI): void {
     } catch {
       return;
     }
-    const routeID = sessionRouteID;
     const cwd = sessionCWD;
     const sessionIdle = activeSessionIdle;
-    if (!routeID || !cwd || !sessionIdle) return;
+    if (!sessionRouteID || !cwd || !sessionIdle) return;
     // Fire-and-forget entry: a session_start→shutdown race or a reload must
     // not connect a stale generation over the fresh session's socket.
     if (generation !== lifecycleGeneration) return;
@@ -555,7 +575,6 @@ export default function relayExtension(pi: ExtensionAPI): void {
     const identity: ConnectionIdentity = {
       endpoint: connectEndpoint(configuration.endpoint),
       secret: configuration.secret,
-      routeID,
       cwd,
       hostname,
       sessionIdle,
@@ -603,17 +622,11 @@ export default function relayExtension(pi: ExtensionAPI): void {
         ["startup", "reload", "resume", "new", "fork"].includes(submittedReason)
       ? submittedReason
       : "unknown";
-    const mayRetainRoute = reason === "startup" || reason === "reload" || reason === "resume";
-    const retainedRouteID = mayRetainRoute
-      ? retainedSessionRouteID(ctx as unknown as { sessionManager: { getEntries(): unknown[] } })
-      : undefined;
-    sessionRouteID = retainedRouteID ?? generateUUIDv7(now());
-    if (!retainedRouteID) {
-      pi.appendEntry(ROUTE_ENTRY_TYPE, {
-        version: ROUTE_ENTRY_VERSION,
-        route_id: sessionRouteID,
-      });
-    }
+    // Route identity is pure session ephemera: every lifecycle gets a fresh
+    // UUIDv7, never read back from persisted state. A reloaded, resumed, or
+    // `pi --continue`d session therefore cannot collide with a registration
+    // the relay still holds; only cwd@hostname stays stable.
+    sessionRouteID = generateUUIDv7(now());
     sessionCWD = ctx.cwd;
     activeSessionIdle = () => ctx.isIdle();
     activeUI = (ctx as { ui?: unknown }).ui;
@@ -632,7 +645,6 @@ export default function relayExtension(pi: ExtensionAPI): void {
       event: "relay_session_started",
       result: "started",
       reason,
-      route_id: sessionRouteID,
     });
     // Fire-and-forget: a slow or unreachable relay must never delay session
     // start; tools report the disconnected state until the connect lands.
@@ -746,6 +758,45 @@ export default function relayExtension(pi: ExtensionAPI): void {
         } catch {
           return;
         }
+      }
+    },
+  });
+
+  // /relay-peers: user-side roster snapshot. Pages the roster through the
+  // retained connection, then appends a display-only custom entry — custom
+  // entries never reach LLM context, so no model turn can be triggered. The
+  // entry renderer paints the grouped markdown tables as a bordered,
+  // background-painted card so it reads as relay UI, not a chat message.
+  pi.registerEntryRenderer(PEER_ROSTER_ENTRY_TYPE, (entry, _options, theme) => {
+    const snapshot = snapshotFromUnknown((entry as { data?: unknown }).data);
+    if (snapshot === undefined) return undefined;
+    const candidate = theme && typeof theme === "object" ? theme as Partial<CardTheme> : undefined;
+    // Pass the host theme object through whole: pi's fg/bg are this-bound
+    // methods, and destructuring them into a fresh object crashes render.
+    const cardTheme = candidate && typeof candidate.fg === "function" ? theme as CardTheme : undefined;
+    return new PeerRosterCardComponent(snapshot, cardTheme);
+  });
+
+  pi.registerCommand("relay-peers", {
+    description: "Show online relay peers grouped by hostname (display only, no LLM turn)",
+    handler: async (_args, ctx) => {
+      const connection = activeConnection;
+      if (!connection) {
+        (ctx as { ui?: { notify?: (message: string, level?: string) => void } }).ui?.notify?.(
+          "Relay is disconnected — no peers to show.",
+          "warning",
+        );
+        return;
+      }
+      try {
+        const snapshot = await buildPeerRosterSnapshot((cursor) => connection.list(cursor, new AbortController().signal));
+        pi.appendEntry(PEER_ROSTER_ENTRY_TYPE, snapshot);
+      } catch {
+        logFailure("list_peers", "roster_snapshot_failed");
+        (ctx as { ui?: { notify?: (message: string, level?: string) => void } }).ui?.notify?.(
+          "Relay roster request failed — see /relay-logs.",
+          "error",
+        );
       }
     },
   });

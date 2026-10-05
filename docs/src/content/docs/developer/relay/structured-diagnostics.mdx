@@ -43,7 +43,7 @@ Per-session JSONL capture mirrors this table exactly: the file stores the same o
 
 | Event | Level | Stable fields beyond `level` and `event` |
 |---|---|---|
-| `relay_session_started` | `info` | `result: "started"`, normalized lifecycle `reason`, `route_id` |
+| `relay_session_started` | `info` | `result: "started"`, normalized lifecycle `reason`. No route identity: routes are per-attempt ephemera, so lifecycle events stay route-free |
 | `relay_config_rejected` | `warn` | `result: "rejected"`, `reason`, `secret: "<redacted>"` |
 | `relay_auth_accepted` | `info` | `result: "accepted"`, address, route, `latency_ms` |
 | `relay_auth_rejected` | `warn` | `result: "rejected"`, `reason`, available route, available `latency_ms` |

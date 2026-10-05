@@ -14,8 +14,69 @@ const MAX_ESTABLISHMENT_FRAME_BYTES = 16 * 1024;
 const MAX_SOCKET_PAYLOAD_BYTES = 512 * 1024;
 const MAX_CWD_BYTES = 4096;
 const MAX_HOSTNAME_BYTES = 255;
-const HEARTBEAT_MS = 30_000;
+// ponytail: fixed to the advertised 30 s cadence with a 75 s stale deadline
+// (covers two missed pongs plus jitter); make configurable when another
+// deployment profile exists.
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_STALE_MS = 75_000;
 const MAX_BODY_BYTES = 262_144;
+
+/** Injectable clock for the client heartbeat so tests can fire intervals
+ * deterministically without real timers. */
+export type HeartbeatClock = {
+  now(): number;
+  schedule(callback: () => void, delayMS: number): { cancel(): void };
+};
+
+const productionHeartbeatClock: HeartbeatClock = Object.freeze({
+  now: () => Date.now(),
+  schedule: (callback, delayMS) => {
+    const timer = setTimeout(callback, delayMS);
+    return { cancel: () => clearTimeout(timer) };
+  },
+});
+
+/** Starts the post-welcome liveness loop: one WebSocket ping per interval;
+ * a pong silence past the stale deadline hard-terminates the transport so
+ * the ordinary disconnected path owns reconnect. Returns the stopper.
+ * RFC 6455 only obliges the peer to answer pings — the answering side is the
+ * library; this side owns the asking-and-deciding policy. */
+export function startClientHeartbeat(
+  socket: WebSocket,
+  terminate: () => void,
+  clock: HeartbeatClock,
+): () => void {
+  let lastPongAt = clock.now();
+  let stopped = false;
+  let scheduled: { cancel(): void } | undefined;
+  const onPong = () => {
+    lastPongAt = clock.now();
+  };
+  socket.on("pong", onPong);
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    scheduled?.cancel();
+    socket.off("pong", onPong);
+  };
+  const tick = () => {
+    if (stopped) return;
+    try {
+      if (clock.now() - lastPongAt > HEARTBEAT_STALE_MS) {
+        terminate();
+        return;
+      }
+      socket.ping();
+    } catch {
+      terminate();
+      return;
+    }
+    if (stopped) return;
+    scheduled = clock.schedule(tick, HEARTBEAT_INTERVAL_MS);
+  };
+  scheduled = clock.schedule(tick, HEARTBEAT_INTERVAL_MS);
+  return stop;
+}
 
 type AuthenticatedConnection = {
   socket: WebSocket;
@@ -38,6 +99,7 @@ type SessionSocketAttemptOptions = {
   hostname?: string;
   deliverUserMessage(body: string, details: RelayCardDetails): void;
   onDisconnected(): void;
+  heartbeatClock?: HeartbeatClock;
 };
 
 class SessionEstablishmentError extends Error {
@@ -164,9 +226,15 @@ export class SessionSocketAttempt {
           this.settled = true;
           cleanHandshakeListeners();
           const onRetainedError = () => {};
+          const stopHeartbeat = startClientHeartbeat(
+            socket,
+            () => socket.terminate(),
+            options.heartbeatClock ?? productionHeartbeatClock,
+          );
           socket.on("error", onRetainedError);
           socket.once("close", () => {
             socket.off("error", onRetainedError);
+            stopHeartbeat();
             options.onDisconnected();
           });
           const roster = new RosterClient(socket, {
@@ -231,7 +299,7 @@ function parseWelcome(frame: Record<string, unknown>, requestID: string, address
     throw new SessionEstablishmentError("invalid_welcome", "Relay welcome payload is invalid.");
   }
   const welcome = payload as Record<string, unknown>;
-  if (welcome.self_address !== address || welcome.heartbeat_ms !== HEARTBEAT_MS ||
+  if (welcome.self_address !== address || welcome.heartbeat_ms !== HEARTBEAT_INTERVAL_MS ||
       welcome.max_body_bytes !== MAX_BODY_BYTES) {
     throw new SessionEstablishmentError("invalid_welcome", "Relay welcome values do not match this session.");
   }

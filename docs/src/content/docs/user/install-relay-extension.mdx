@@ -101,6 +101,28 @@ When an endpoint is configured, the extension renders one footer status line so 
 
 The line shows a fixed `relay` label beside the circle, so the indicator never needs interpretation. When no endpoint is configured at all — no config file at all and no `PI_MESSAGING_RELAY_URL` override — the indicator is hidden entirely: nothing renders, not even a placeholder. An invalid or unsafe config file is a rejected configuration, not an absent one: it keeps the red indicator.
 
+## Peer roster view
+
+Run `/relay-peers` inside Pi to see who is online. The command walks the address-only roster pages (at most 8) and appends one display-only card to the transcript, grouped by hostname with one markdown table per group:
+
+```text
+╭ relay peers — 3 online ──────────────────────────────────╮
+├ ── alpha-host (2) ───────────────────────────────────────┤
+│| CWD             | ROUTE                                |│
+│| --------------- | ------------------------------------ |│
+│| /srv/alpha      | 01993c84-...-f945bfa42cdf            |│
+│| /srv/bravo      | 01993c84-...-f945bfa42cfe            |│
+├ ── zeta-host (1) ────────────────────────────────────────┤
+│| CWD             | ROUTE                                |│
+│| --------------- | ------------------------------------ |│
+│| /srv/delta      | 01993c84-...-f945bfa42cdf            |│
+╰──────────────────────────────────────────────────────────╯
+```
+
+- The card is for you, not the model. It is a custom session entry, which never reaches LLM context, and running the command never starts a model turn. The card is painted with the message background color and hard-truncated to the terminal width so it cannot crash the renderer on narrow views; the route column stays whole for copy-paste into `agent_send`, and a very narrow terminal shrinks the cwd column first (marked with `…`).
+- Addresses stay opaque end to end: the card recomposes the route address from its cwd, hostname, and route parts for display only, and anything that does not fit that shape lands in one `(unparsed)` group with the raw address.
+- A roster longer than 8 pages renders with a `(partial)` marker in the title; disconnected sessions get a warning notification and no card. Restored sessions re-render the newest card from the session file without new relay requests.
+
 ## Install as a local Pi package
 
 For a self-contained store package, follow [Deploy with Nix](../nix-deployment/#install-the-extension-package). From a checkout, after `npm --prefix extension ci`, add the extension directory to user settings:

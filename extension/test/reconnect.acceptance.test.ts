@@ -84,7 +84,10 @@ async function within<T>(promise: Promise<T>, action: string): Promise<T> {
     return await Promise.race([
       promise,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`timed out ${action}`)), TEST_TIMEOUT_MS);
+        timer = setTimeout(() => {
+          console.log(`TIMEOUT-ACTION ${action}`);
+          throw new Error(`timed out ${action}`);
+        }, TEST_TIMEOUT_MS);
       }),
     ]);
   } finally {
@@ -114,6 +117,7 @@ async function nextEvent(
     if (next.done) throw new Error(`server output ended before ${name}`);
     output.lines.push(next.value);
     const event = JSON.parse(next.value) as Record<string, unknown>;
+    console.log(`SERVEREV ${String(event.event)} ${JSON.stringify(event).slice(0, 150)}`);
     if (event.event === name && matches(event)) return event;
   }
 }
@@ -343,10 +347,11 @@ test("inline reconnect deadline preserves one failed-authentication retry intent
     );
     assert.equal(scheduleCalls, 1);
     assert.equal(endpoint.hellos.length, 2);
+    // Fresh ephemeral identity: the successor attempt presents a NEW route UUID.
     assert.equal(
       new Set(endpoint.hellos.map((hello) =>
         String((hello.payload as Record<string, unknown>).route_id))).size,
-      1,
+      2,
     );
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(endpoint.hellos.length, 2, "inline retry intent launched a duplicate attempt");
@@ -448,7 +453,7 @@ test("inline reconnect deadlines consume exactly the finite retry budget", { con
       result: "exhausted",
       reason: "connection_closed",
       retry_index: 10,
-      route_id: (endpoint.hellos[0].payload as Record<string, unknown>).route_id,
+      route_id: (endpoint.hellos.at(-1)!.payload as Record<string, unknown>).route_id,
     }]);
   } finally {
     await host.emit("session_shutdown");
@@ -607,23 +612,20 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
     await clock.advanceBy(1);
     await waitUntil(() => socketControl.attempts.length === 4, "successful reconnect attempt");
     const restoredAuth = await nextEvent(output, "auth_accepted", (event) => event.cwd === subjectCWD);
-    assert.equal(restoredAuth.route_id, originalRouteID);
-    assert.equal(restoredAuth.address, originalAddress);
-    assert.deepEqual(
-      socketControl.attempts.slice(0, 4).map((attempt) => ({ at: attempt.at, routeID: attempt.routeID })),
-      [
-        { at: 1_800_000_000_000, routeID: originalRouteID },
-        { at: 1_800_000_000_375, routeID: originalRouteID },
-        { at: 1_800_000_001_375, routeID: originalRouteID },
-        { at: 1_800_000_003_625, routeID: originalRouteID },
-      ],
-    );
-    assert.deepEqual(await listedAddresses(observer), [originalAddress]);
+    // Fresh ephemeral identity: every attempt presents a new route UUID; only cwd@hostname stays stable.
+    assert.match(String(restoredAuth.route_id), UUID_V7);
+    assert.notEqual(restoredAuth.route_id, originalRouteID);
+    assert.equal(restoredAuth.address, `${subjectCWD}@${String(restoredAuth.hostname)}#${String(restoredAuth.route_id)}`);
+    const attemptRoutes = socketControl.attempts.slice(0, 4).map((attempt) => String(attempt.routeID));
+    assert.deepEqual(attemptRoutes.map((routeID) => UUID_V7.test(routeID)), [true, true, true, true]);
+    assert.equal(new Set(attemptRoutes).size, 4, "each reconnect attempt presents a fresh route UUID");
+    assert.deepEqual(await listedAddresses(observer), [String(restoredAuth.address)]);
 
     await subject.emit("session_start", { type: "session_start", reason: "reload" });
     const reloadAuth = await nextEvent(output, "auth_accepted", (event) => event.cwd === subjectCWD);
-    assert.equal(reloadAuth.route_id, originalRouteID);
-    assert.equal(reloadAuth.address, originalAddress);
+    assert.match(String(reloadAuth.route_id), UUID_V7);
+    assert.notEqual(reloadAuth.route_id, originalRouteID);
+    assert.notEqual(reloadAuth.route_id, restoredAuth.route_id);
 
     await subject.emit("session_start", { type: "session_start", reason: "new" });
     const newAuth = await nextEvent(output, "auth_accepted", (event) => event.cwd === subjectCWD);
@@ -652,12 +654,12 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
 
     await subject.emit("session_start", { type: "session_start", reason: "resume" });
     const resumedAuth = await nextEvent(output, "auth_accepted", (event) => event.cwd === subjectCWD);
-    assert.equal(resumedAuth.route_id, forkAuth.route_id);
-    assert.equal(resumedAuth.address, forkAuth.address);
+    assert.match(String(resumedAuth.route_id), UUID_V7);
+    assert.notEqual(resumedAuth.route_id, forkAuth.route_id);
     const resumedSocket = socketControl.attempts.at(-1)?.socket;
     assert.ok(resumedSocket);
     resumedSocket.terminate();
-    await nextEvent(output, "session_disconnected", (event) => event.address === forkAuth.address);
+    await nextEvent(output, "session_disconnected", (event) => event.address === resumedAuth.address);
     await waitUntil(() => clock.pendingCount === 1, "in-flight shutdown reconnect schedule");
     const attemptCountBeforeJoin = socketControl.attempts.length;
     socketControl.holdNextAttempt();
@@ -677,7 +679,7 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
 
     const routeEntries = subject.appendEntryAttempts.filter((entry) =>
       entry.customType === "pi-messaging-relay-route-v1");
-    assert.equal(routeEntries.length, 3, "startup, new, and fork each publish one route entry");
+    assert.equal(routeEntries.length, 0, "route identity is ephemeral and never persisted");
 
     await observer.emit("session_shutdown");
     await stop(child);
@@ -788,10 +790,11 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
     ]);
     assert.equal(hostileFailure.body, "<redacted>");
 
-    const reconnectEvents = extensionEvents.filter((event) =>
-      event.route_id === originalRouteID &&
-      ["relay_session_disconnected", "relay_reconnect_scheduled", "relay_reconnect_attempted",
-        "relay_auth_rejected", "relay_reconnect_succeeded"].includes(String(event.event)));
+    const disconnectIndex = extensionEvents.findIndex((event) =>
+      event.event === "relay_session_disconnected" && event.address === originalAddress);
+    const succeededIndex = extensionEvents.findIndex((event) => event.event === "relay_reconnect_succeeded");
+    assert.ok(disconnectIndex >= 0 && succeededIndex > disconnectIndex);
+    const reconnectEvents = extensionEvents.slice(disconnectIndex, succeededIndex + 1);
     assert.deepEqual(
       reconnectEvents.slice(0, 10).map((event) => ({
         event: event.event,
@@ -814,10 +817,11 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
       ],
     );
     const started = extensionEvents.find((event) =>
-      event.event === "relay_session_started" && event.reason === "startup" && event.route_id === originalRouteID);
+      event.event === "relay_session_started" && event.reason === "startup");
     assert.ok(started);
     assert.equal(started.level, "info");
     assert.equal(started.result, "started");
+    assert.equal(started.route_id, undefined, "session lifecycle events carry no route identity");
     assert.ok(extensionEvents.some((event) =>
       event.event === "relay_session_stopped" && event.result === "graceful"));
 

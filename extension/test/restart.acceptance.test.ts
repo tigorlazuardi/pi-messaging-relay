@@ -260,7 +260,7 @@ function installRecipientSocketControl(recipientCWD: string): {
 
 async function boundedQuietCheckpoint(
   sender: FakePiHost,
-  recipientAddress: string,
+  recipientPrefix: string,
   recipient: FakePiHost,
   expectedInjectionCount: number,
   action: string,
@@ -268,7 +268,12 @@ async function boundedQuietCheckpoint(
   const started = Date.now();
   while (true) {
     try {
-      assert.deepEqual(await listedAddresses(sender), [recipientAddress]);
+      const addresses = await listedAddresses(sender);
+      assert.equal(addresses.length, 1, "roster shows exactly the recipient");
+      assert.ok(
+        addresses[0].startsWith(recipientPrefix),
+        `roster address ${addresses[0]} keeps prefix ${recipientPrefix}`,
+      );
       break;
     } catch (error) {
       if (Date.now() - started >= TEST_TIMEOUT_MS) throw error;
@@ -418,19 +423,23 @@ test("recipient delivery stream never replays across reconnect and child-process
       "auth_accepted",
       (event) => event.cwd === recipient.cwd,
     );
-    assert.equal(reconnectedRecipient.address, recipientAddress);
-    assert.equal(reconnectedRecipient.route_id, recipientRouteID);
+    assert.ok(
+      String(reconnectedRecipient.address).startsWith(`${recipient.cwd}@`),
+      "reconnect keeps the stable cwd@hostname prefix",
+    );
+    assert.notEqual(reconnectedRecipient.route_id, recipientRouteID);
     assert.equal(socketControl.attempts.length, 2);
     await boundedQuietCheckpoint(
       sender,
-      recipientAddress,
+      `${recipient.cwd}@`,
       recipient,
       2,
       "reconnect emitted no startup or historical delivery",
     );
 
+    const freshRecipientAddress = (await listedAddresses(sender))[0];
     const freshAfterReconnect = await within(sender.executeTool("agent_send", {
-      to: recipientAddress,
+      to: freshRecipientAddress,
       body: bodies.freshAfterReconnect,
     }), "settling fresh post-reconnect send") as ToolResult;
     assert.deepEqual(freshAfterReconnect.details, {
@@ -443,8 +452,9 @@ test("recipient delivery stream never replays across reconnect and child-process
       event.message_id === freshAfterReconnect.details.message_id);
 
     socketControl.holdNextACK();
+    const interruptedByRestartAddress = (await listedAddresses(sender))[0];
     const interruptedByRestartPromise = sender.executeTool("agent_send", {
-      to: recipientAddress,
+      to: interruptedByRestartAddress,
       body: bodies.interruptedByRestart,
     });
     const restartRejection = assert.rejects(
@@ -482,20 +492,27 @@ test("recipient delivery stream never replays across reconnect and child-process
     const restartedRecipient = restartedAuth.find((event) => event.cwd === recipient.cwd);
     assert.ok(restartedSender);
     assert.ok(restartedRecipient);
-    assert.equal(restartedSender.address, senderAddress);
-    assert.equal(restartedRecipient.address, recipientAddress);
-    assert.equal(restartedRecipient.route_id, recipientRouteID);
+    assert.ok(
+      String(restartedSender.address).startsWith(`${sender.cwd}@`),
+      "restart keeps the stable cwd@hostname prefix",
+    );
+    assert.ok(
+      String(restartedRecipient.address).startsWith(`${recipient.cwd}@`),
+      "restart keeps the stable cwd@hostname prefix",
+    );
+    assert.notEqual(restartedRecipient.route_id, recipientRouteID);
     assert.equal(socketControl.attempts.length, 3);
     await boundedQuietCheckpoint(
       sender,
-      recipientAddress,
+      `${recipient.cwd}@`,
       recipient,
       4,
       "restart emitted no startup or historical delivery",
     );
 
+    const restartedRecipientAddress = (await listedAddresses(sender))[0];
     const freshAfterRestart = await within(sender.executeTool("agent_send", {
-      to: recipientAddress,
+      to: restartedRecipientAddress,
       body: bodies.freshAfterRestart,
     }), "settling fresh post-restart send") as ToolResult;
     assert.deepEqual(freshAfterRestart.details, {

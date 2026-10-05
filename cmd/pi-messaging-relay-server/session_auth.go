@@ -23,6 +23,10 @@ const (
 	maxCWDBytes           = 4096
 	maxHostnameBytes      = 255
 	heartbeatMilliseconds = 30_000
+	// ponytail: fixed to the advertised 30 s liveness cadence; the ping write
+	// gets one full interval before the watchdog declares the transport dead.
+	// Make configurable when another deployment profile exists.
+	heartbeatInterval = time.Duration(heartbeatMilliseconds) * time.Millisecond
 	// ponytail: fixed to v1's 256 KiB serialized body; make configurable when another profile exists.
 	maxBodyBytes          = 262_144
 	maxSessionConnections = 1024
@@ -384,6 +388,7 @@ type sessionAuthService struct {
 	afterProtocolTerminalTransition   func()
 	beforeResponseAudit               func(logEvent)
 	establishmentTimeout              time.Duration
+	heartbeatInterval                 time.Duration
 }
 
 func newSessionAuthService(
@@ -403,6 +408,7 @@ func newSessionAuthService(
 			return wsjson.Write(ctx, connection, welcome)
 		},
 		establishmentTimeout: establishmentDeadline,
+		heartbeatInterval:    heartbeatInterval,
 	}
 }
 
@@ -519,7 +525,9 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	markUnavailable := func() {
 		unavailableOnce.Do(func() { service.connections.clearAuthentication(entry) })
 	}
+	stopHeartbeat := service.startHeartbeatWatchdog(connection)
 	service.serveAuthenticated(connection, session, markUnavailable)
+	stopHeartbeat()
 	markUnavailable()
 	service.writeAudit(logEvent{
 		Level:   "info",
@@ -528,6 +536,45 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		Address: address,
 		RouteID: hello.Payload.RouteID,
 	})
+}
+
+// startHeartbeatWatchdog enforces the advertised liveness cadence on one
+// authenticated connection: one WebSocket ping per interval, each allowed a
+// full interval before the next check. A failed or late-answered ping means
+// the transport is dead even though no TCP FIN arrived (sleep, NAT drop);
+// CloseNow tears it down so the ordinary disconnected path owns cleanup.
+// The concurrent Reader consumes pong frames per the coder/websocket
+// contract, so the watchdog only writes pings and never races reads.
+func (service *sessionAuthService) startHeartbeatWatchdog(connection *websocket.Conn) (stop func()) {
+	interval := service.heartbeatInterval
+	if interval <= 0 {
+		interval = heartbeatInterval
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pingContext, cancelPing := context.WithTimeout(context.Background(), interval)
+				err := connection.Ping(pingContext)
+				cancelPing()
+				if err != nil {
+					_ = connection.CloseNow()
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // authorizeUpgrade validates one Authorization header value against the retained
