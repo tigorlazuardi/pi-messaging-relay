@@ -20,7 +20,7 @@ A `relay_auth_accepted` diagnostic means the session connected and can use disco
 - A running Linux relay server
 - One configuration file at `~/.config/pi/pi-messaging-relay.json`
 
-The TypeScript extension remains a platform-neutral Node component; the Linux-only support boundary applies to the Go relay server because its state-directory safety depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and `typebox` v1.3.7 (MIT) for tool schemas.
+The TypeScript extension remains a platform-neutral Node component; the Linux-only support boundary applies to the Go relay server because its state-directory safety depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and resolves `typebox` through the Pi host loader (peer dependency `"*"`; Pi 1.0.0+ ships it).
 
 ## Install from a checkout
 
@@ -183,7 +183,7 @@ Pi reads the package manifest and loads `extension/index.ts` in future sessions.
 
 ## Troubleshooting
 
-- **`Cannot find module 'typebox'` or `Cannot find module 'ws'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`. This local package resolution is required for Nix-installed Pi too.
+- **`Cannot find module 'typebox'`** — Pi 1.0.0+ provides TypeBox through its extension loader; on older Pi versions run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`. **`Cannot find module 'ws'`** — run `npm --prefix extension ci` from the repository root and keep `extension/node_modules/` beside `extension/index.ts`. Local package resolution for `ws` is required for Nix-installed Pi too.
 - **Command or tools absent** — confirm Pi loaded `extension/index.ts`; retry with the temporary `-e` command above and inspect Pi's extension issues.
 - **`relay_config_rejected` at startup** — verify the file is the exact fixed path `~/.config/pi/pi-messaging-relay.json`, is a regular non-symlink file owned by the current user with mode exactly `0600`, holds at most 4,096 bytes of valid UTF-8, and contains only `url` plus optional `secret` with no duplicate or unknown keys. Fix the file and restart the Pi session; the extension never retries a rejected file mid-session.
 - **`Relay is disconnected` despite a config file** — the rejected or absent file is equivalent to no configuration. Correct it and restart the session; the diagnostic `reason` distinguishes unreadable, unsafe-form, wrong-mode, and JSON rejections.

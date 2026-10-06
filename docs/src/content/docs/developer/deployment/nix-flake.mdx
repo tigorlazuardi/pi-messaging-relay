@@ -46,9 +46,13 @@ The server uses `buildGoModule`, the locked Go module graph, a fixed `vendorHash
 
 ### Extension package
 
-The extension uses the npm lockfile and a fixed `npmDepsHash`, with no nonexistent build step. Its output root contains `package.json`, `index.ts`, `internal/`, and production `node_modules`; tests and development files are absent. Pi accepts this exact absolute directory as a local package and resolves `pi.extensions` relative to its root.
+The extension uses the npm lockfile and a fixed `npmDepsHash`, with no nonexistent build step. Its output root contains `package.json`, `index.ts`, `internal/`, and production `node_modules` (`ws` only); tests and development files are absent. Pi accepts this exact absolute directory as a local package and resolves `pi.extensions` relative to its root.
 
-<Decision title="Preserve package-local TypeBox for this Nix output" status="accepted">
+<Decision title="Resolve TypeBox through the Pi host loader" status="accepted">
+Pi 1.0.0 ships TypeBox itself and aliases the `typebox` root, `/value`, and `/compile` specifiers to its host copy; it warns on every startup when an extension package installs its own copy, because duplicate modules break schema identity across extensions. The extension therefore declares `typebox` as a peer dependency `"*"` and vendors no copy in the Nix output. This supersedes the earlier accepted decision to preserve package-local TypeBox, which was made against Pi 0.85.1 where no host copy existed. A real Pi load test remains authoritative for this contract.
+</Decision>
+
+<Decision title="Preserve package-local TypeBox for this Nix output" status="superseded-by:resolve-typebox-through-the-pi-host-loader">
 Pi's general package guidance classifies bundled core `typebox` as a peer dependency. This repository already pins and tests `typebox` as an extension-local runtime dependency. Nix packaging will not silently change that manifest contract: the self-contained output retains the pinned dependency, and a real Pi load test is authoritative. Any later peer-dependency migration is a separate compatibility issue.
 </Decision>
 

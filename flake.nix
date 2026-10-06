@@ -36,7 +36,11 @@
             pname = "pi-messaging-relay-extension";
             version = "0.0.0";
             src = ./extension;
-            npmDepsHash = "sha256-1qDzypuYbL/YuGIvbbsxyuVgrvPJ26MlJTk6Nt5TFSU=";
+            npmDepsHash = "sha256-oO75Ym9yXBaNXyM0irvgDUW+/f1omcrkeJlnUYDNRAk=";
+            npmInstallFlags = [
+              "--omit=dev"
+              "--omit=peer"
+            ];
             dontNpmBuild = true;
             installPhase = ''
               runHook preInstall
