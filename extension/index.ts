@@ -73,7 +73,8 @@ const agentSendParameters = Type.Object(
   {
     to: Type.String({
       minLength: 1,
-      description: "Opaque address returned by list_peers",
+      description:
+      "Opaque address returned by list_peers; on timeout/offline or timeout/recipient_disconnected call list_peers again and resend to the fresh address (the old route dies on a peer session restart)",
     }),
     body: Type.Union([
       Type.String({ description: "Message text" }),
@@ -853,7 +854,8 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "agent_send",
     label: "Send to Relay Peer",
-    description: "Send a string or JSON object to one online Pi relay session",
+    description:
+      "Send a string or JSON object to one online Pi relay session. A timeout/offline or timeout/recipient_disconnected result means the destination route is stale (for example the peer session restarted): call list_peers again and resend to its fresh address",
     parameters: agentSendParameters,
     async execute(_toolCallID, params, signal) {
       const started = Date.now();
@@ -875,8 +877,14 @@ export default function relayExtension(pi: ExtensionAPI): void {
           signal as AbortSignal,
         );
         logSendSettlement(result, connection.address, destination as string, Date.now() - started);
+        const resultText = JSON.stringify(result);
+        const staleReason = result.status === "timeout" &&
+          (result.reason === "offline" || result.reason === "recipient_disconnected");
+        const hint = staleReason
+          ? ` — destination route is stale (peer may have restarted); call list_peers again and resend to its current address`
+          : "";
         return {
-          content: [{ type: "text", text: JSON.stringify(result) }],
+          content: [{ type: "text", text: `${resultText}${hint}` }],
           details: result,
         };
       } catch (error) {

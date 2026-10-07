@@ -148,7 +148,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     });
     assert.deepEqual(offlineResult.content, [{
       type: "text",
-      text: JSON.stringify(offlineResult.details),
+      text: `${JSON.stringify(offlineResult.details)} — destination route is stale (peer may have restarted); call list_peers again and resend to its current address`,
     }]);
     assert.deepEqual(recipient.sendUserMessageAttempts, []);
     assert.deepEqual(recipient.sendMessageAttempts, []);

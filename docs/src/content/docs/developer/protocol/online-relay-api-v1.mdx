@@ -23,6 +23,8 @@ The Pi extension exposes two model tools:
 - `list_peers({ cursor? })`
 - `agent_send({ to, body, re? })`
 
+`agent_send` result text appends a model-directed hint on `timeout/offline` and `timeout/recipient_disconnected`: the destination route is stale (a peer session restart changes the route suffix while `cwd@hostname` stays), so the caller must run `list_peers` again and resend to the fresh address. The hint is appended to the same result text; `details` stay the closed correlated result unchanged.
+
 Connection and pairing are human/configuration concerns. They are not model tools. The extension maintains one persistent WebSocket to a localhost server; cross-machine deployments provide localhost reachability through VPN or SSH forwarding.
 
 <Decision title="Keep the model tool surface to two intents" status="accepted">

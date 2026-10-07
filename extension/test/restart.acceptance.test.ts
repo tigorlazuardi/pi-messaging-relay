@@ -414,6 +414,11 @@ test("recipient delivery stream never replays across reconnect and child-process
       status: "timeout",
       reason: "recipient_disconnected",
     });
+    assert.match(
+      String((interruptedByDisconnect.content as Array<{ text: string }>)[0]?.text),
+      /call list_peers again and resend to its current address$/,
+      "recipient_disconnected result carries the roster-refresh hint",
+    );
     await nextEvent(first.relay.output, "send_settled", (event) =>
       event.message_id === disconnectACK.messageID && event.reason === "recipient_disconnected");
     await waitUntil(() => clock.pendingCount === 1, "recipient reconnect deadline");
