@@ -64,7 +64,7 @@ const listPeersParameters = Type.Object(
     cursor: Type.Optional(Type.String({
       maxLength: MAX_CURSOR_CHARACTERS,
       pattern: "^cur_[A-Za-z0-9_-]+$",
-      description: "Opaque next_cursor from the preceding list_peers page; omit for the first page",
+      description: "Opaque next_cursor from the preceding relay_list_peers page; omit for the first page",
     })),
   },
   { additionalProperties: false },
@@ -74,7 +74,7 @@ const agentSendParameters = Type.Object(
     to: Type.String({
       minLength: 1,
       description:
-      "Opaque address returned by list_peers; on timeout/offline or timeout/recipient_disconnected call list_peers again and resend to the fresh address (the old route dies on a peer session restart)",
+      "Opaque address returned by relay_list_peers; on timeout/offline or timeout/recipient_disconnected call relay_list_peers again and resend to the fresh address (the old route dies on a peer session restart)",
     }),
     body: Type.Union([
       Type.String({ description: "Message text" }),
@@ -147,7 +147,7 @@ function logSendSettlement(
   emitDiagnostic({
     level: result.status === "received" ? "info" : "warn",
     event: "relay_send_settled",
-    operation: "agent_send",
+    operation: "relay_agent_send",
     result: "settled",
     reason: "reason" in result ? result.reason : result.status,
     message_id: result.message_id,
@@ -159,7 +159,7 @@ function logSendSettlement(
   });
 }
 
-function disconnected(operation: "list_peers" | "agent_send", body = false): never {
+function disconnected(operation: "relay_list_peers" | "relay_agent_send", body = false): never {
   logFailure(operation, "disconnected", { body });
   throw new Error(DISCONNECTED_ERROR);
 }
@@ -793,7 +793,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
         const snapshot = await buildPeerRosterSnapshot((cursor) => connection.list(cursor, new AbortController().signal));
         pi.appendEntry(PEER_ROSTER_ENTRY_TYPE, snapshot);
       } catch {
-        logFailure("list_peers", "roster_snapshot_failed");
+        logFailure("relay_list_peers", "roster_snapshot_failed");
         (ctx as { ui?: { notify?: (message: string, level?: string) => void } }).ui?.notify?.(
           "Relay roster request failed — see /relay-logs.",
           "error",
@@ -805,7 +805,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
   // Header slot: title, short body preview, destination. renderResult owns
   // the outcome; repeating the title there produced doubled labels.
   const renderSendHeader = (args: Record<string, unknown>, theme: CardTheme): Text => {
-    let left = theme.fg("toolTitle", theme.bold("agent_send"));
+    let left = theme.fg("toolTitle", theme.bold("relay_agent_send"));
     const body = args.body;
     if (typeof body === "string") left += theme.fg("muted", ` "${truncateToWidth(body.replace(/\s+/g, " ").trim(), 32)}"`);
     const destination = args.to;
@@ -817,13 +817,13 @@ export default function relayExtension(pi: ExtensionAPI): void {
 
 
   pi.registerTool({
-    name: "list_peers",
+    name: "relay_list_peers",
     label: "List Relay Peers",
     description: "List one address-only page of online Pi relay sessions; the result contains peers and optional next_cursor",
     parameters: listPeersParameters,
     async execute(_toolCallID, params, signal) {
       const connection = activeConnection;
-      if (!connection) return disconnected("list_peers");
+      if (!connection) return disconnected("relay_list_peers");
       try {
         const cursor = (params as { cursor?: string }).cursor;
         const page = await connection.list(cursor, signal as AbortSignal);
@@ -833,14 +833,14 @@ export default function relayExtension(pi: ExtensionAPI): void {
         };
       } catch (error) {
         logFailure(
-          "list_peers",
+          "relay_list_peers",
           error instanceof RosterRequestError ? error.reason : "unexpected_failure",
         );
         throw error;
       }
     },
     renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("list_peers")));
+      return new Text(theme.fg("toolTitle", theme.bold("relay_list_peers")));
     },
     renderResult(result, _options, theme) {
       // Outcome only: the call header already shows the title.
@@ -852,10 +852,10 @@ export default function relayExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "agent_send",
+    name: "relay_agent_send",
     label: "Send to Relay Peer",
     description:
-      "Send a string or JSON object to one online Pi relay session. A timeout/offline or timeout/recipient_disconnected result means the destination route is stale (for example the peer session restarted): call list_peers again and resend to its fresh address",
+      "Send a string or JSON object to one online Pi relay session. A timeout/offline or timeout/recipient_disconnected result means the destination route is stale (for example the peer session restarted): call relay_list_peers again and resend to its fresh address",
     parameters: agentSendParameters,
     async execute(_toolCallID, params, signal) {
       const started = Date.now();
@@ -868,7 +868,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
       const body = input.body;
       const replyTo = input.re;
       const connection = activeConnection;
-      if (!connection) return disconnected("agent_send", true);
+      if (!connection) return disconnected("relay_agent_send", true);
       try {
         const result = await connection.send(
           destination as string,
@@ -881,7 +881,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
         const staleReason = result.status === "timeout" &&
           (result.reason === "offline" || result.reason === "recipient_disconnected");
         const hint = staleReason
-          ? ` — destination route is stale (peer may have restarted); call list_peers again and resend to its current address`
+          ? ` — destination route is stale (peer may have restarted); call relay_list_peers again and resend to its current address`
           : "";
         return {
           content: [{ type: "text", text: `${resultText}${hint}` }],
@@ -889,7 +889,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
         };
       } catch (error) {
         logFailure(
-          "agent_send",
+          "relay_agent_send",
           error instanceof RosterRequestError ? error.reason : "unexpected_failure",
           {
             recipientRoute: typeof destination === "string" ? destination : undefined,

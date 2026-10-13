@@ -123,7 +123,7 @@ test("real extensions list live authenticated peers with strict address-only con
     }
 
     for (let index = 0; index < hosts.length; index += 1) {
-      const result = page(await hosts[index].executeTool("list_peers", {}));
+      const result = page(await hosts[index].executeTool("relay_list_peers", {}));
       const expected = addresses.filter((_address, candidate) => candidate !== index).sort();
       assert.deepEqual(result.details, { peers: expected.map((address) => ({ address })) });
       assert.equal(/idle|busy|connection_name|client_id|client_public_key/.test(result.content[0].text), false);
@@ -133,11 +133,11 @@ test("real extensions list live authenticated peers with strict address-only con
       assert.equal("cursor" in settled || "peers" in settled || "address" in settled, false);
     }
 
-    const first = page(await hosts[0].executeTool("list_peers", {})).details;
+    const first = page(await hosts[0].executeTool("relay_list_peers", {})).details;
     await nextEvent(output, "operation_settled", (event) => event.type === "list");
     assert.equal(first.peers.length, 3);
     const cursor = `cur_${Buffer.from(first.peers[0].address, "utf8").toString("base64url")}`;
-    const continuation = page(await hosts[0].executeTool("list_peers", { cursor })).details;
+    const continuation = page(await hosts[0].executeTool("relay_list_peers", { cursor })).details;
     await nextEvent(output, "operation_settled", (event) => event.type === "list");
     assert.deepEqual(continuation.peers, first.peers.slice(1));
     assert.ok(continuation.peers.every((peer) => peer.address > first.peers[0].address));
@@ -145,7 +145,7 @@ test("real extensions list live authenticated peers with strict address-only con
     const removedAddress = addresses[3];
     await hosts[3].emit("session_shutdown");
     await nextEvent(output, "session_disconnected", (event) => event.address === removedAddress);
-    const afterDisconnect = page(await hosts[0].executeTool("list_peers", {})).details;
+    const afterDisconnect = page(await hosts[0].executeTool("relay_list_peers", {})).details;
     await nextEvent(output, "operation_settled", (event) => event.type === "list");
     assert.equal(afterDisconnect.peers.some((peer) => peer.address === removedAddress), false);
     assert.deepEqual(

@@ -52,7 +52,7 @@ Per-session JSONL capture mirrors this table exactly: the file stores the same o
 | `relay_reconnect_attempted` | `info` | `result: "attempted"`, one-based `retry_index`, route |
 | `relay_reconnect_succeeded` | `info` | `result: "connected"`, one-based `retry_index`, address, route, `latency_ms` |
 | `relay_reconnect_exhausted` | `warn` | `result: "exhausted"`, bounded `reason`, `retry_index: 10`, route |
-| `relay_send_settled` | `info` for `received`; otherwise `warn` | `operation: "agent_send"`, `result: "settled"`, `reason`, `message_id`, authenticated `sender_route`, requested `recipient_route`, `status`, `body`, `latency_ms` |
+| `relay_send_settled` | `info` for `received`; otherwise `warn` | `operation: "relay_agent_send"`, `result: "settled"`, `reason`, `message_id`, authenticated `sender_route`, requested `recipient_route`, `status`, `body`, `latency_ms` |
 | `relay_operation_failed` | `warn` | `operation`, `result: "failed"`, `reason`, plus safe operation-specific route, redaction, and latency fields when available |
 | `relay_session_stopped` | `info` | `result: "graceful"`, optional address and route |
 
@@ -83,7 +83,7 @@ The welcome value `heartbeat_ms: 30000` is transport metadata. WebSocket ping/po
 <Tabs>
   <TabItem label="Extension send">
     ```json
-    {"level":"info","event":"relay_send_settled","operation":"agent_send","result":"settled","reason":"received","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","recipient_route":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222","status":"received","body":"<redacted>","latency_ms":12}
+    {"level":"info","event":"relay_send_settled","operation":"relay_agent_send","result":"settled","reason":"received","message_id":"01993c84-fc2b-7e1c-af99-61b8118ac6df","sender_route":"/srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111","recipient_route":"/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222","status":"received","body":"<redacted>","latency_ms":12}
     ```
   </TabItem>
   <TabItem label="Server settlement">

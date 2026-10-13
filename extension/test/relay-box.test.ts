@@ -56,7 +56,7 @@ test("card renders a consistent box with header, body, and reply hint", () => {
   const flat = lines.join("\n");
   assert.match(flat, /first line/);
   assert.match(flat, /second line/);
-  assert.match(flat, /reply via agent_send/);
+  assert.match(flat, /reply via relay_agent_send/);
   assert.match(flat, /ctrl\+o expands/);
 });
 
@@ -139,7 +139,7 @@ test("card wraps long bodies within the frame at narrow widths", () => {
   }
 });
 
-test("reply hint quotes the full opaque address for agent_send", () => {
+test("reply hint quotes the full opaque address for relay_agent_send", () => {
   const lines = new RelayCardComponent(DETAILS, undefined, false).render(200);
   assert.match(lines.join("\n"), new RegExp(ADDRESS.replace(/[/.@]/g, "\\$&")));
 });
@@ -173,7 +173,7 @@ test("Text truncates styled tool lines to terminal width", () => {
     fg: (color: string, s: string) => `\u001B[${color === "accent" ? 34 : color === "muted" ? 90 : 1}m${s}\u001B[22m`,
     bold: (s: string) => s,
   };
-  const styled = theme.fg("toolTitle", theme.bold("agent_send")) +
+  const styled = theme.fg("toolTitle", theme.bold("relay_agent_send")) +
     theme.fg("muted", ` "${"x".repeat(60)}"`) +
     " → " +
     theme.fg("accent", "/home/homeserver/homelab@Config-Management");

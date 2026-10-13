@@ -153,16 +153,16 @@ test("loads and runs disconnected handlers without starting resources", { concur
 
     const result = relayExtension(host.api as never);
     assert.equal(result, undefined);
-    await assert.rejects(host.executeTool("list_peers", {}), {
+    await assert.rejects(host.executeTool("relay_list_peers", {}), {
       name: "Error",
       message: EXPECTED_DISCONNECTED_ERROR,
     });
-    await assert.rejects(host.executeTool("list_peers", { cursor: "cur_cGVlcg" }), {
+    await assert.rejects(host.executeTool("relay_list_peers", { cursor: "cur_cGVlcg" }), {
       name: "Error",
       message: EXPECTED_DISCONNECTED_ERROR,
     });
     await assert.rejects(
-      host.executeTool("agent_send", {
+      host.executeTool("relay_agent_send", {
         to: "/srv/backend@host#route-id",
         body: "sensitive-message-body",
       }),
@@ -180,11 +180,11 @@ test("loads and runs disconnected handlers without starting resources", { concur
   assert.deepEqual(host.registrations, [
     { kind: "command", name: "relay-logs" },
     { kind: "command", name: "relay-peers" },
-    { kind: "tool", name: "list_peers" },
-    { kind: "tool", name: "agent_send" },
+    { kind: "tool", name: "relay_list_peers" },
+    { kind: "tool", name: "relay_agent_send" },
   ]);
   assert.deepEqual([...host.commands.keys()], ["relay-logs", "relay-peers"]);
-  assert.deepEqual([...host.tools.keys()], ["list_peers", "agent_send"]);
+  assert.deepEqual([...host.tools.keys()], ["relay_list_peers", "relay_agent_send"]);
   assert.deepEqual(resourceAttempts, []);
   assert.deepEqual(host.liveAccessAttempts, []);
   assert.deepEqual(host.sendMessageAttempts, []);
@@ -257,7 +257,7 @@ test("invalid configuration file stays disconnected with one closed diagnostic a
     { level: "warn", result: "rejected", reason: "unsafe_config_permissions", secret: "<redacted>" },
   );
   assert.equal(events.some((event) => event.event === "relay_auth_rejected"), false);
-  await assert.rejects(host.executeTool("list_peers", {}), {
+  await assert.rejects(host.executeTool("relay_list_peers", {}), {
     name: "Error",
     message: EXPECTED_DISCONNECTED_ERROR,
   });
@@ -314,12 +314,12 @@ test("environment endpoint alone attempts one bounded connection", { concurrency
   assert.deepEqual(host.sendUserMessageAttempts, []);
 });
 
-test("publishes the closed list_peers schema", { concurrency: false }, async () => {
+test("publishes the closed relay_list_peers schema", { concurrency: false }, async () => {
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
   relayExtension(host.api as never);
 
-  const listSchema = host.tools.get("list_peers")?.parameters;
+  const listSchema = host.tools.get("relay_list_peers")?.parameters;
   assert.ok(listSchema);
 
   const maximumCursor = `cur_${Buffer.from("a".repeat(4_389), "utf8").toString("base64url")}`;
@@ -335,12 +335,12 @@ test("publishes the closed list_peers schema", { concurrency: false }, async () 
   assert.equal(Value.Check(listSchema as never, { unexpected: true }), false);
 });
 
-test("publishes only to, body, and optional canonical reply correlation for agent_send", { concurrency: false }, async () => {
+test("publishes only to, body, and optional canonical reply correlation for relay_agent_send", { concurrency: false }, async () => {
   const host = new FakePiHost();
   const relayExtension = await loadRelayExtension();
   relayExtension(host.api as never);
 
-  const sendSchema = host.tools.get("agent_send")?.parameters as {
+  const sendSchema = host.tools.get("relay_agent_send")?.parameters as {
     properties?: Record<string, unknown>;
     required?: string[];
     additionalProperties?: boolean;
@@ -396,7 +396,7 @@ test("diagnostic sink failure never replaces lifecycle or disconnected tool owne
   try {
     await host.emit("session_start", { type: "session_start", reason: "startup" });
     await assert.rejects(
-      host.executeTool("agent_send", {
+      host.executeTool("relay_agent_send", {
         to: "/srv/backend@host#route-id",
         body: "private-body-must-not-reach-the-sink",
       }),
@@ -419,12 +419,12 @@ test("both tools fail through Pi's thrown-error path while disconnected", { conc
   const secretBody = "sensitive-message-body";
 
   try {
-    await assert.rejects(host.executeTool("list_peers", {}), {
+    await assert.rejects(host.executeTool("relay_list_peers", {}), {
       name: "Error",
       message: EXPECTED_DISCONNECTED_ERROR,
     });
     await assert.rejects(
-      host.executeTool("agent_send", {
+      host.executeTool("relay_agent_send", {
         to: "/srv/backend@host#route-id",
         body: secretBody,
       }),
@@ -441,14 +441,14 @@ test("both tools fail through Pi's thrown-error path while disconnected", { conc
       {
         level: "warn",
         event: "relay_operation_failed",
-        operation: "list_peers",
+        operation: "relay_list_peers",
         result: "failed",
         reason: "disconnected",
       },
       {
         level: "warn",
         event: "relay_operation_failed",
-        operation: "agent_send",
+        operation: "relay_agent_send",
         result: "failed",
         reason: "disconnected",
         body: "<redacted>",
@@ -471,7 +471,7 @@ test("headless host keeps no session log; /relay-logs reports the stderr stream"
     const relayExtension = await loadIsolatedRelayExtension("relay-logs-headless");
     relayExtension(host.api as never);
     await host.emit("session_start", { type: "session_start", reason: "startup" });
-    await assert.rejects(host.executeTool("list_peers", {}));
+    await assert.rejects(host.executeTool("relay_list_peers", {}));
     await host.executeCommand("relay-logs");
   } finally {
     logs.restore();
@@ -500,7 +500,7 @@ test("persisted TUI session logs per-session file, stderr stays quiet, /relay-lo
     const relayExtension = await loadIsolatedRelayExtension("relay-logs-tui");
     relayExtension(host.api as never);
     await host.emit("session_start", { type: "session_start", reason: "startup" });
-    await assert.rejects(host.executeTool("list_peers", {}));
+    await assert.rejects(host.executeTool("relay_list_peers", {}));
     // Append writes are fire-and-forget; wait until the events land.
     await waitUntil(
       () => existsSync(join(logDir, "session.jsonl.log.jsonl")),

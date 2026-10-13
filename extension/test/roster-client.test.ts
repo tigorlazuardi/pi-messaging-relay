@@ -114,7 +114,7 @@ test("roster client rejects concurrent list locally without sending or queueing"
   const first = client.list(undefined, new AbortController().signal);
   const request = await firstRequest;
   await assert.rejects(client.list(undefined, new AbortController().signal), {
-    message: "Relay list_peers already has one request in flight.",
+    message: "Relay relay_list_peers already has one request in flight.",
   });
   pair.server.send(roster(String(request.request_id), { peers: [] }));
   await first;
@@ -133,7 +133,7 @@ test("malformed, wrong-correlation, and unsolicited roster frames fail closed", 
     const request = await requestPromise;
     const peerClosed = closes(pair.server);
     pair.server.send(makeFrame(String(request.request_id)));
-    await assert.rejects(result, { message: "Relay returned an invalid list_peers response." });
+    await assert.rejects(result, { message: "Relay returned an invalid relay_list_peers response." });
     await peerClosed;
     await pair.close();
   }
@@ -178,7 +178,7 @@ test("roster client rejects every non-closed roster value and canonical cursor v
       try {
         await result;
       } catch (error) {
-        assert.equal((error as Error).message, "Relay returned an invalid list_peers response.");
+        assert.equal((error as Error).message, "Relay returned an invalid relay_list_peers response.");
         rejected = true;
         await peerClosed;
       }
@@ -209,7 +209,7 @@ test("roster client accepts exact 48 KiB frame and rejects one byte over", async
   const over = exactBoundaryRoster(String(overRequest.request_id)) + " ";
   const peerClosed = closes(overPair.server);
   overPair.server.send(over);
-  await assert.rejects(overResult, { message: "Relay returned an invalid list_peers response." });
+  await assert.rejects(overResult, { message: "Relay returned an invalid relay_list_peers response." });
   await peerClosed;
 });
 
@@ -225,10 +225,10 @@ test("abort, timeout, and socket close reject in-flight list and settle resource
     if (mode === "close") pair.server.close();
     await assert.rejects(result, {
       message: mode === "abort"
-        ? "Relay list_peers request was aborted."
+        ? "Relay relay_list_peers request was aborted."
         : mode === "timeout"
-          ? "Relay list_peers response timed out."
-          : "Relay disconnected during list_peers.",
+          ? "Relay relay_list_peers response timed out."
+          : "Relay disconnected during relay_list_peers.",
     });
     await closes(pair.client);
     await pair.close();
@@ -254,7 +254,7 @@ test("send rejects malformed reply correlation locally without consuming the soc
       (error: unknown) => {
         assert.ok(error instanceof RosterRequestError);
         assert.equal(error.reason, "invalid_arguments");
-        assert.equal(error.message, "Relay agent_send arguments are invalid.");
+        assert.equal(error.message, "Relay relay_agent_send arguments are invalid.");
         assert.equal(error.message.includes(re), false);
         assert.equal(error.message.includes(privateBodyMarker), false);
         return true;
@@ -437,7 +437,7 @@ test("send enforces exact serialized-body bytes locally before operation ownersh
     client.send("destination", atLimit + "x", undefined, overLimitController.signal),
     (error: unknown) => error instanceof RosterRequestError &&
       error.reason === "body_too_large" &&
-      error.message === "Relay agent_send body exceeds 256 KiB." &&
+      error.message === "Relay relay_agent_send body exceeds 256 KiB." &&
       !error.message.includes(marker),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -628,7 +628,7 @@ test("synchronous response expiry owns pending send before any frame write", { t
   await assert.rejects(result, (error: unknown) => {
     assert.ok(error instanceof RosterRequestError);
     assert.equal(error.reason, "timeout");
-    assert.equal(error.message, "Relay agent_send response timed out.");
+    assert.equal(error.message, "Relay relay_agent_send response timed out.");
     return true;
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -658,7 +658,7 @@ test("response deadline factory failure rejects generically without writing or l
   await assert.rejects(result, (error: unknown) => {
     assert.ok(error instanceof RosterRequestError);
     assert.equal(error.reason, "disconnected");
-    assert.equal(error.message, "Relay disconnected during agent_send.");
+    assert.equal(error.message, "Relay disconnected during relay_agent_send.");
     assert.equal(error.message.includes("deadline-factory-private-marker"), false);
     return true;
   });
@@ -738,7 +738,7 @@ test("send accepts canonical objects and rejects unsafe or over-body-limit input
       client.send("destination", body, undefined, new AbortController().signal),
       (error: unknown) => error instanceof RosterRequestError &&
         error.reason === "invalid_arguments" &&
-        error.message === "Relay agent_send body is not safe JSON." &&
+        error.message === "Relay relay_agent_send body is not safe JSON." &&
         !error.message.includes(marker),
     );
   }
@@ -749,13 +749,13 @@ test("send accepts canonical objects and rejects unsafe or over-body-limit input
     client.send("destination", { hugeSparse }, undefined, new AbortController().signal),
     (error: unknown) => error instanceof RosterRequestError &&
       error.reason === "body_too_large" &&
-      error.message === "Relay agent_send body exceeds 256 KiB.",
+      error.message === "Relay relay_agent_send body exceeds 256 KiB.",
   );
   await assert.rejects(client.send("destination", "\ud800", undefined, new AbortController().signal), {
-    message: "Relay agent_send arguments are invalid.",
+    message: "Relay relay_agent_send arguments are invalid.",
   });
   await assert.rejects(client.send("destination", "x".repeat(512 * 1024), undefined, new AbortController().signal), {
-    message: "Relay agent_send body exceeds 256 KiB.",
+    message: "Relay relay_agent_send body exceeds 256 KiB.",
   });
   const overLimitObjectValueBytes = MAX_BODY_BYTES - Buffer.byteLength('{"value":""}', "utf8") + 1;
   await assert.rejects(
@@ -767,7 +767,7 @@ test("send accepts canonical objects and rejects unsafe or over-body-limit input
     ),
     (error: unknown) => error instanceof RosterRequestError &&
       error.reason === "body_too_large" &&
-      error.message === "Relay agent_send body exceeds 256 KiB." &&
+      error.message === "Relay relay_agent_send body exceeds 256 KiB." &&
       !error.message.includes(marker),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -973,7 +973,7 @@ test("wrong destination, duplicate message fields, and malformed or desynchroniz
     const messageID = String((request.payload as Record<string, unknown>).message_id);
     const peerClosed = closes(pair.server);
     pair.server.send(makeFrame(String(request.request_id), messageID));
-    await assert.rejects(result, { message: "Relay returned an invalid agent_send response." });
+    await assert.rejects(result, { message: "Relay returned an invalid relay_agent_send response." });
     await peerClosed;
     assert.deepEqual(attempts, []);
     await pair.close();

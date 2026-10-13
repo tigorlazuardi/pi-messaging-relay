@@ -185,7 +185,7 @@ async function reserveLoopbackAddress(): Promise<string> {
 }
 
 async function listedAddresses(host: FakePiHost): Promise<string[]> {
-  const result = await host.executeTool("list_peers", {}) as RosterPage;
+  const result = await host.executeTool("relay_list_peers", {}) as RosterPage;
   return result.details.peers.map((peer) => peer.address);
 }
 
@@ -379,7 +379,7 @@ test("recipient delivery stream never replays across reconnect and child-process
     assert.deepEqual(await listedAddresses(recipient), [senderAddress]);
     assert.equal(socketControl.attempts.length, 1);
 
-    const settledBeforeLoss = await within(sender.executeTool("agent_send", {
+    const settledBeforeLoss = await within(sender.executeTool("relay_agent_send", {
       to: recipientAddress,
       body: bodies.settledBeforeLoss,
     }), "settling message before lifecycle loss") as ToolResult;
@@ -393,7 +393,7 @@ test("recipient delivery stream never replays across reconnect and child-process
       event.message_id === settledBeforeLoss.details.message_id);
 
     socketControl.holdNextACK();
-    const interruptedByDisconnectPromise = sender.executeTool("agent_send", {
+    const interruptedByDisconnectPromise = sender.executeTool("relay_agent_send", {
       to: recipientAddress,
       body: bodies.interruptedByDisconnect,
     }) as Promise<ToolResult>;
@@ -416,7 +416,7 @@ test("recipient delivery stream never replays across reconnect and child-process
     });
     assert.match(
       String((interruptedByDisconnect.content as Array<{ text: string }>)[0]?.text),
-      /call list_peers again and resend to its current address$/,
+      /call relay_list_peers again and resend to its current address$/,
       "recipient_disconnected result carries the roster-refresh hint",
     );
     await nextEvent(first.relay.output, "send_settled", (event) =>
@@ -443,7 +443,7 @@ test("recipient delivery stream never replays across reconnect and child-process
     );
 
     const freshRecipientAddress = (await listedAddresses(sender))[0];
-    const freshAfterReconnect = await within(sender.executeTool("agent_send", {
+    const freshAfterReconnect = await within(sender.executeTool("relay_agent_send", {
       to: freshRecipientAddress,
       body: bodies.freshAfterReconnect,
     }), "settling fresh post-reconnect send") as ToolResult;
@@ -458,7 +458,7 @@ test("recipient delivery stream never replays across reconnect and child-process
 
     socketControl.holdNextACK();
     const interruptedByRestartAddress = (await listedAddresses(sender))[0];
-    const interruptedByRestartPromise = sender.executeTool("agent_send", {
+    const interruptedByRestartPromise = sender.executeTool("relay_agent_send", {
       to: interruptedByRestartAddress,
       body: bodies.interruptedByRestart,
     });
@@ -516,7 +516,7 @@ test("recipient delivery stream never replays across reconnect and child-process
     );
 
     const restartedRecipientAddress = (await listedAddresses(sender))[0];
-    const freshAfterRestart = await within(sender.executeTool("agent_send", {
+    const freshAfterRestart = await within(sender.executeTool("relay_agent_send", {
       to: restartedRecipientAddress,
       body: bodies.freshAfterRestart,
     }), "settling fresh post-restart send") as ToolResult;
@@ -652,7 +652,7 @@ test("recipient delivery stream never replays across reconnect and child-process
     } finally {
       unknownEnvironment.restore();
     }
-    await assert.rejects(unknown.executeTool("list_peers", {}), /Relay is disconnected/);
+    await assert.rejects(unknown.executeTool("relay_list_peers", {}), /Relay is disconnected/);
 
     assert.deepEqual(await readdir(serverState), ["relay.secret"]);
     assert.equal(

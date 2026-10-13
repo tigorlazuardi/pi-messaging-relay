@@ -66,7 +66,7 @@ Ponytail: v1 uses 500 ms initial delay, multiplier 2, ±25% jitter, a 30-second 
 
 `session_shutdown` invalidates the lifecycle first, cancels its pending reconnect deadline, closes any connecting socket, joins that attempt, and then closes and awaits the retained socket. No cancelled timer or stale disconnect callback can start another attempt after shutdown returns. Starting a replacement Pi session applies the same cancellation-and-join sequence before selecting its route identity.
 
-An interrupted `list_peers` or `agent_send` still settles through the retained socket's existing disconnected path. Reconnect never resumes that operation and never reuses its request or message state. A caller starts a fresh tool operation only after authentication restores the connection. Across a normal server process restart, the same scheduler reconnects to the replacement listener and authenticates at the upgrade boundary with the same configured secret.
+An interrupted `relay_list_peers` or `relay_agent_send` still settles through the retained socket's existing disconnected path. Reconnect never resumes that operation and never reuses its request or message state. A caller starts a fresh tool operation only after authentication restores the connection. Across a normal server process restart, the same scheduler reconnects to the replacement listener and authenticates at the upgrade boundary with the same configured secret.
 
 The accepted recipient delivery-stream seam now spans both lifecycle losses. It deliberately drops—not delays—a recipient ACK before terminating that exact socket, proves the sender receives `timeout/recipient_disconnected`, then authenticates the same recipient route and checks the live roster before bounded quiet turns. No settled or interrupted offer appears on the replacement socket; only a fresh send produces the next message frame and Pi injection. The same stream then drops another ACK before graceful server shutdown, starts a replacement child on the same address and secret file, reauthenticates both extensions, and again observes only welcome traffic until a fresh post-restart send. Exact message IDs, delivery IDs, bodies, socket generations, and injection order distinguish absence of replay from a mere timing delay.
 
@@ -79,7 +79,7 @@ The extension emits one `relay_reconnect_scheduled` event with one-based retry i
 <Tabs>
   <TabItem label="Disconnect">
     ```text
-    t=0 ms: /srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111 leaves list_peers
+    t=0 ms: /srv/frontend@workstation-a#01993ca1-1111-7aaa-8aaa-111111111111 leaves relay_list_peers
     ```
   </TabItem>
   <TabItem label="Deterministic retry input">

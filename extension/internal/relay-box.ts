@@ -197,7 +197,7 @@ export class RelayCardComponent {
       }).lines;
     for (const line of bodyLines) lines.push(paint(frame(text(line))));
 
-    const meta: string[] = [`reply via agent_send to=${JSON.stringify(this.details.from)}`];
+    const meta: string[] = [`reply via relay_agent_send to=${JSON.stringify(this.details.from)}`];
     if (this.details.re !== undefined) meta.push(`re=${this.details.re.slice(0, 8)}`);
     if (!this.expanded) meta.push("ctrl+o expands");
     const metaPlain = ` ${meta.join(" · ")}`;

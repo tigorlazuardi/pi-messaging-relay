@@ -75,7 +75,7 @@ async function waitForAttempt(host: FakePiHost, count: number): Promise<void> {
   }), "recipient inbound injection attempt");
 }
 
-test("agent_send crosses real relay and two real extensions before settling received", { timeout: 60_000, concurrency: false }, async () => {
+test("relay_agent_send crosses real relay and two real extensions before settling received", { timeout: 60_000, concurrency: false }, async () => {
   const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
   const root = await mkdtemp(join(tmpdir(), "pi-relay-delivery-"));
   let child: ChildProcessWithoutNullStreams | undefined;
@@ -134,7 +134,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     const offlineAddress = "/srv/absent@workstation#01993ca3-3333-7aaa-8aaa-333333333333";
     const offlineBodyMarker = "offline-body-must-never-reach-recipient-or-logs";
     const offlineStarted = Date.now();
-    const offlineResult = await within(sender.executeTool("agent_send", {
+    const offlineResult = await within(sender.executeTool("relay_agent_send", {
       to: offlineAddress,
       body: offlineBodyMarker,
     }), "sender received offline result") as ToolResult;
@@ -148,7 +148,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     });
     assert.deepEqual(offlineResult.content, [{
       type: "text",
-      text: `${JSON.stringify(offlineResult.details)} — destination route is stale (peer may have restarted); call list_peers again and resend to its current address`,
+      text: `${JSON.stringify(offlineResult.details)} — destination route is stale (peer may have restarted); call relay_list_peers again and resend to its current address`,
     }]);
     assert.deepEqual(recipient.sendUserMessageAttempts, []);
     assert.deepEqual(recipient.sendMessageAttempts, []);
@@ -172,7 +172,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     assert.equal(extensionLogs.some((line) => line.includes(offlineBodyMarker)), false);
 
     const rosterAfterOffline = await within(
-      sender.executeTool("list_peers", {}),
+      sender.executeTool("relay_list_peers", {}),
       "listing peers after offline result",
     ) as { content: Array<{ type: string; text: string }>; details: { peers: Array<{ address: string }> } };
     assert.deepEqual(rosterAfterOffline.details, { peers: [{ address: recipientAddress }] });
@@ -194,11 +194,11 @@ test("agent_send crosses real relay and two real extensions before settling rece
     });
     for (const body of [transparentProxy, { nested: transparentProxy }, { nested: mutatingProxy }]) {
       await assert.rejects(
-        sender.executeTool("agent_send", { to: recipientAddress, body }),
+        sender.executeTool("relay_agent_send", { to: recipientAddress, body }),
         (error: unknown) => error instanceof Error &&
           error.name === "RosterRequestError" &&
           (error as Error & { reason?: string }).reason === "invalid_arguments" &&
-          error.message === "Relay agent_send body is not safe JSON." &&
+          error.message === "Relay relay_agent_send body is not safe JSON." &&
           !error.message.includes(rejectedMarker),
       );
     }
@@ -213,7 +213,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     const bodyBoundaryPrefixBytes = Buffer.byteLength(JSON.stringify(bodyBoundaryMarker), "utf8");
     const atBodyLimit = bodyBoundaryMarker + "x".repeat((256 * 1024) - bodyBoundaryPrefixBytes);
     assert.equal(Buffer.byteLength(JSON.stringify(atBodyLimit), "utf8"), 262_144);
-    const atLimitResult = await within(sender.executeTool("agent_send", {
+    const atLimitResult = await within(sender.executeTool("relay_agent_send", {
       to: recipientAddress,
       body: atBodyLimit,
     }), "sending exact body limit") as ToolResult;
@@ -237,11 +237,11 @@ test("agent_send crosses real relay and two real extensions before settling rece
 
     const attemptsAtBoundary = recipient.sendMessageAttempts.length;
     await assert.rejects(
-      sender.executeTool("agent_send", { to: recipientAddress, body: atBodyLimit + "x" }),
+      sender.executeTool("relay_agent_send", { to: recipientAddress, body: atBodyLimit + "x" }),
       (error: unknown) => error instanceof Error &&
         error.name === "RosterRequestError" &&
         (error as Error & { reason?: string }).reason === "body_too_large" &&
-        error.message === "Relay agent_send body exceeds 256 KiB." &&
+        error.message === "Relay relay_agent_send body exceeds 256 KiB." &&
         !error.message.includes(bodyBoundaryMarker),
     );
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -250,7 +250,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
     assert.equal(output.lines.some((line) => line.includes(bodyBoundaryMarker)), false);
     assert.equal(extensionLogs.some((line) => line.includes('"reason":"body_too_large"')), true);
     const rosterAfterBodyDenial = await within(
-      sender.executeTool("list_peers", {}),
+      sender.executeTool("relay_list_peers", {}),
       "listing peers after local body denial",
     ) as { details: { peers: Array<{ address: string }> } };
     assert.deepEqual(rosterAfterBodyDenial.details, { peers: [{ address: recipientAddress }] });
@@ -288,7 +288,7 @@ test("agent_send crosses real relay and two real extensions before settling rece
       recipient.setIdle(delivery.idle);
       if (delivery.throwFromIdleCheck) recipient.failNextIdleCheck(new Error("simulated stale context"));
       if (delivery.throwFromPi) recipient.failNextSendUserMessage(new Error("simulated Pi rejection"));
-      const resultPromise = sender.executeTool("agent_send", {
+      const resultPromise = sender.executeTool("relay_agent_send", {
         to: recipientAddress,
         body: delivery.body,
         ...(delivery.re === undefined ? {} : { re: delivery.re }),

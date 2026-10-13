@@ -286,7 +286,7 @@ test("secret-mode server authenticates the configured extension and closes every
       event.event === "auth_rejected" && event.reason === "not_authorized").length;
     assert.equal(rejectedCount, 3);
 
-    const roster = await within(host.executeTool("list_peers", {}), "listing peers while authenticated");
+    const roster = await within(host.executeTool("relay_list_peers", {}), "listing peers while authenticated");
     assert.deepEqual(
       (roster as { details: { peers: Array<{ address: string }> } }).details,
       { peers: [] },
@@ -475,7 +475,7 @@ test("wrong client secret receives the closed 401 and bounded not_authorized ret
       if (event.event === "auth_rejected" && event.reason === "not_authorized") rejections.push(event);
     }
     assert.equal(rejections.length >= 1, true);
-    await assert.rejects(host.executeTool("list_peers", {}), /Relay is disconnected/);
+    await assert.rejects(host.executeTool("relay_list_peers", {}), /Relay is disconnected/);
     assert.equal(logs.lines.join("\n").includes("wrong-secret"), false);
     assert.equal(logs.lines.join("\n").includes(SHARED_SECRET), false);
   } finally {

@@ -20,10 +20,10 @@ Protocol v2 ([online relay authentication v2](../online-relay-auth-v2/)) removed
 
 The Pi extension exposes two model tools:
 
-- `list_peers({ cursor? })`
-- `agent_send({ to, body, re? })`
+- `relay_list_peers({ cursor? })`
+- `relay_agent_send({ to, body, re? })`
 
-`agent_send` result text appends a model-directed hint on `timeout/offline` and `timeout/recipient_disconnected`: the destination route is stale (a peer session restart changes the route suffix while `cwd@hostname` stays), so the caller must run `list_peers` again and resend to the fresh address. The hint is appended to the same result text; `details` stay the closed correlated result unchanged.
+`relay_agent_send` result text appends a model-directed hint on `timeout/offline` and `timeout/recipient_disconnected`: the destination route is stale (a peer session restart changes the route suffix while `cwd@hostname` stays), so the caller must run `relay_list_peers` again and resend to the fresh address. The hint is appended to the same result text; `details` stay the closed correlated result unchanged.
 
 Connection and pairing are human/configuration concerns. They are not model tools. The extension maintains one persistent WebSocket to a localhost server; cross-machine deployments provide localhost reachability through VPN or SSH forwarding.
 
@@ -280,7 +280,7 @@ A 48 KiB roster-frame ceiling leaves tool-result wrapper headroom and avoids sna
 </Decision>
 
 <Aside type="note" title="Implementation boundary">
-Tickets #36 and #13 implement this complete discovery seam: strict cursor input, live authenticated-registry reads, deterministic bounded pages, correlated `roster` responses, and the connected `list_peers` model tool. Delivery, Pi message injection, reconnect, persistence, and replay remain outside this boundary.
+Tickets #36 and #13 implement this complete discovery seam: strict cursor input, live authenticated-registry reads, deterministic bounded pages, correlated `roster` responses, and the connected `relay_list_peers` model tool. Delivery, Pi message injection, reconnect, persistence, and replay remain outside this boundary.
 </Aside>
 
 ### I/O examples
@@ -378,7 +378,7 @@ sequenceDiagram
     participant RE as Recipient extension
     participant RP as Recipient Pi
 
-    SA->>SE: agent_send(to, body, re?)
+    SA->>SE: relay_agent_send(to, body, re?)
     SE->>R: send(request_id, message_id, to, body, re?)
     R->>RE: message(delivery_id, message_id, from, to, body, re?)
     RE->>RP: sendMessage card (steer when busy; user-message fallback)
@@ -386,7 +386,7 @@ sequenceDiagram
     R->>SE: send_result(received)
     SE->>SA: received
     Note over RP: Later turn; task completion is not guaranteed
-    RP->>RE: ordinary agent_send(to=original from, re=original message_id)
+    RP->>RE: ordinary relay_agent_send(to=original from, re=original message_id)
     RE->>RE: generate fresh request_id and message_id
     RE->>R: send(new message_id, re=original message_id)
     R->>SE: message(new delivery_id, new message_id, re=original message_id)
@@ -417,7 +417,7 @@ Tickets #14–#21 implement successful string and object delivery, correlated re
 
 A reply is never automatic and does not use a special operation. The relay does not look up message history or validate that `re` names a retained message; `re` is correlation metadata, not authorization. Each online reply gets a fresh message ID, delivery ID, request/response correlation, ACK, and result independent of the original call. The one transport retry reuses only its own new logical message ID; it never reuses the replied-to ID. Raw authenticated clients may pipeline up to 128 distinct logical sends per exact sender session; the extension intentionally remains single-flight.
 
-The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs, malformed `re` values, and bodies above the fixed serialized limit fail content-free before IDs or socket work. An oversized local body throws `RosterRequestError` reason `body_too_large` with `Relay agent_send body exceeds 256 KiB.` through Pi's existing tool-error path; it is not a returned denied result because no message operation exists. The sender extension accepts exactly the closed correlated result payloads `{message_id,status:"received"}`, `{message_id,status:"timeout",reason:"offline"}`, `{message_id,status:"timeout",reason:"recipient_disconnected"}`, `{message_id,status:"timeout",reason:"ack_timeout"}`, `{message_id,status:"denied",reason:"message_id_conflict"}`, `{message_id,status:"denied",reason:"body_too_large"}`, and `{message_id,status:"denied",reason:"sender_capacity"}`. Capacity denial is valid compatibility language even though this extension's local single-flight cannot normally cause it. Every other status/reason pair, including a missing or extra field or a future reason, is an invalid response that terminally closes the retained socket. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
+The local extension accepts safe string or JSON-object bodies under its closed tool schema. Unsafe non-JSON runtime graphs, malformed `re` values, and bodies above the fixed serialized limit fail content-free before IDs or socket work. An oversized local body throws `RosterRequestError` reason `body_too_large` with `Relay relay_agent_send body exceeds 256 KiB.` through Pi's existing tool-error path; it is not a returned denied result because no message operation exists. The sender extension accepts exactly the closed correlated result payloads `{message_id,status:"received"}`, `{message_id,status:"timeout",reason:"offline"}`, `{message_id,status:"timeout",reason:"recipient_disconnected"}`, `{message_id,status:"timeout",reason:"ack_timeout"}`, `{message_id,status:"denied",reason:"message_id_conflict"}`, `{message_id,status:"denied",reason:"body_too_large"}`, and `{message_id,status:"denied",reason:"sender_capacity"}`. Capacity denial is valid compatibility language even though this extension's local single-flight cannot normally cause it. Every other status/reason pair, including a missing or extra field or a future reason, is an invalid response that terminally closes the retained socket. The relay protocol parser remains the strict duplicate/type/depth boundary and forwards an accepted object as the same JSON value. The recipient parser accepts only a string or non-array object and passes sender, message ID, optional valid `re`, and body to the pure renderer. Renderer failure produces neither Pi injection nor ACK and force-settles the retained socket.
 </Aside>
 
 ### I/O examples
@@ -617,7 +617,7 @@ The local extension accepts safe string or JSON-object bodies under its closed t
   </TabItem>
 </Tabs>
 
-A reply uses the same ordinary `agent_send({ to, body, re })` and wire `send` operations. The receiving agent copies `to` from the original header's complete JSON-quoted `from` value and copies `re` from its `id`. The extension generates a fresh request ID and reply `message_id`; the relay generates a fresh delivery ID. The reply ACK and `send_result` settle only that reply call, independently of the original result. The model cannot supply any of those generated IDs. There is no automatic reply, special reply operation, server message-history lookup, or guarantee of completion or another reply. `re` carries correlation only and grants no routing authority.
+A reply uses the same ordinary `relay_agent_send({ to, body, re })` and wire `send` operations. The receiving agent copies `to` from the original header's complete JSON-quoted `from` value and copies `re` from its `id`. The extension generates a fresh request ID and reply `message_id`; the relay generates a fresh delivery ID. The reply ACK and `send_result` settle only that reply call, independently of the original result. The model cannot supply any of those generated IDs. There is no automatic reply, special reply operation, server message-history lookup, or guarantee of completion or another reply. `re` carries correlation only and grants no routing authority.
 
 The recipient injects one user message with this exact shape:
 
@@ -661,7 +661,7 @@ An exact recipient ACK returns the correlated `send_result` with `status: "recei
 After a recipient is found and its offer is successfully written, the relay starts exactly five seconds for the exact recipient session to return matching delivery and message IDs. Expiry atomically removes that pending offer before returning the correlated `send_result` with `status: "timeout"` and `reason: "ack_timeout"`. A valid ACK that wins before expiry still returns `received`; the deadline boundary chooses only one settlement. A later ACK finds no pending offer, emits no response, changes no result, and leaves the recipient connection healthy. The released slot is immediately available for another send. `ack_timeout` says only that an offer was written but no exact extension ACK arrived by the deadline; it is not a model-read, work-completion, queue-durability, or message-durability status.
 
 <Decision title="Keep sender response time outside the full relay ACK path" status="accepted">
-The extension keeps the five-second `list_peers` response deadline but uses a fixed eight-second `agent_send` response deadline. Send timing starts before the relay offer, so eight seconds covers the bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender-result write, and scheduling allowance without reducing the recipient's five seconds. An explicit test-only `responseTimeoutMS` override still replaces either default.
+The extension keeps the five-second `relay_list_peers` response deadline but uses a fixed eight-second `relay_agent_send` response deadline. Send timing starts before the relay offer, so eight seconds covers the bounded one-second recipient write, full five-second recipient ACK interval, bounded one-second sender-result write, and scheduling allowance without reducing the recipient's five seconds. An explicit test-only `responseTimeoutMS` override still replaces either default.
 </Decision>
 
 After lookup succeeds, recipient session loss before exact ACK returns `timeout/recipient_disconnected`. This differs from `offline`, which is only a pre-allocation lookup miss, and `ack_timeout`, which is only expiry after a written offer remained unacknowledged for five seconds. Recipient cancellation removes every matching pending offer once; ACK, expiry, and disconnect ownership cannot relabel one another. Reauthentication of the same installation/address receives no old offer, stale ACKs are harmless, and only a fresh send creates a fresh offer. The sender socket remains reusable after the result. Server/global shutdown that itself claims pending work emits no recipient-disconnect result.
@@ -679,7 +679,7 @@ The currently enforced ceilings are:
 - 64 nested object or array containers, counting the outer envelope as depth 1;
 - 4,389 UTF-8 bytes for an opaque address;
 - exactly five seconds for the relay's pending recipient ACK wait;
-- five seconds for the extension's `list_peers` response, a retry trigger at four seconds from `agent_send` start, and eight seconds for its complete `agent_send` response;
+- five seconds for the extension's `relay_list_peers` response, a retry trigger at four seconds from `relay_agent_send` start, and eight seconds for its complete `relay_agent_send` response;
 - 1,024 retained settled message IDs per exact recipient session, evicting the oldest settled insertion;
 - 128 in-flight distinct logical sends and 256 pre-encoding normal-response ownership slots per exact authenticated sender session, plus one separately bounded terminal error;
 - one pending retry attachment per in-flight logical send, at most 128 per exact sender session, plus one sender-current tombstone per exact sender session;
@@ -785,7 +785,7 @@ A `received` result remains an extension-boundary acknowledgment only. Reload, c
 
 ## Implementation requirements derived from the contract
 
-1. Keep model access limited to `list_peers` and `agent_send`.
+1. Keep model access limited to `relay_list_peers` and `relay_agent_send`.
 2. Reject malformed, unauthenticated, and oversized input at the trust boundary.
 3. Keep allowlisted client identity separate from ephemeral online session routing.
 4. Bound currently implemented pending sends and ACK waits using the enforced ceilings.

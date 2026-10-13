@@ -190,7 +190,7 @@ function installReceivedACKGate(): {
   };
 }
 
-test("reply uses captured provenance in a second ordinary agent_send with independent received settlement", { timeout: 60_000, concurrency: false }, async () => {
+test("reply uses captured provenance in a second ordinary relay_agent_send with independent received settlement", { timeout: 60_000, concurrency: false }, async () => {
   const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
   const root = await mkdtemp(join(tmpdir(), "pi-relay-reply-"));
   let child: ChildProcessWithoutNullStreams | undefined;
@@ -253,7 +253,7 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
     const originalBody = "original-message-body-must-remain-private\nwith exact spacing  ";
     const originalACKGate = ackGate.blockNext();
     let originalState = "pending";
-    const originalResultPromise = sender.executeTool("agent_send", {
+    const originalResultPromise = sender.executeTool("relay_agent_send", {
       to: recipientAddress,
       body: originalBody,
     }) as Promise<ToolResult>;
@@ -295,7 +295,7 @@ test("reply uses captured provenance in a second ordinary agent_send with indepe
       '{"10":"ten","2":"two","answer":"reply-message-body-must-remain-private","nested":{"a":[null,1],"z":false}}';
     const replyACKGate = ackGate.blockNext();
     let replyState = "pending";
-    const replyResultPromise = recipient.executeTool("agent_send", {
+    const replyResultPromise = recipient.executeTool("relay_agent_send", {
       to: originalInjection.from,
       body: replyBody,
       re: originalInjection.messageID,

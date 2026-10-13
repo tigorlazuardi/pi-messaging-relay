@@ -308,7 +308,7 @@ async function startControllableAuthEndpoint(
 }
 
 async function listedAddresses(host: FakePiHost): Promise<string[]> {
-  const result = await host.executeTool("list_peers", {}) as ToolPage;
+  const result = await host.executeTool("relay_list_peers", {}) as ToolPage;
   return result.details.peers.map((peer) => peer.address);
 }
 
@@ -537,14 +537,14 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
 
     const privateStringBody = "diagnostic-private-string-body-marker";
     const privateObjectMarker = "diagnostic-private-object-body-marker";
-    const stringSend = await subject.executeTool("agent_send", {
+    const stringSend = await subject.executeTool("relay_agent_send", {
       to: observerAddress,
       body: privateStringBody,
     }) as ToolSendResult;
     assert.equal(stringSend.details.status, "received");
     const stringSettlement = await nextEvent(output, "send_settled", (event) =>
       event.message_id === stringSend.details.message_id);
-    const objectSend = await subject.executeTool("agent_send", {
+    const objectSend = await subject.executeTool("relay_agent_send", {
       to: observerAddress,
       body: { private: privateObjectMarker, nested: { safe: false } },
     }) as ToolSendResult;
@@ -553,7 +553,7 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
       event.message_id === objectSend.details.message_id);
     const privateOfflineBody = "diagnostic-private-offline-body-marker";
     const offlineAddress = "/srv/offline@diagnostic#01993ca3-3333-7aaa-8aaa-333333333333";
-    const offlineSend = await subject.executeTool("agent_send", {
+    const offlineSend = await subject.executeTool("relay_agent_send", {
       to: offlineAddress,
       body: privateOfflineBody,
     }) as ToolSendResult;
@@ -575,7 +575,7 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
       },
     };
     await assert.rejects(
-      subject.executeTool("agent_send", {
+      subject.executeTool("relay_agent_send", {
         to: hostileDestination,
         body: hostileBodySecret,
       }),
@@ -778,11 +778,11 @@ test("captured relay diagnostics cover lifecycle, reconnect, settlement, and red
         Object.keys(event).sort(),
         ["body", "event", "latency_ms", "level", "message_id", "operation", "reason", "recipient_route", "result", "sender_route", "status"],
       );
-      assert.equal(event.operation, "agent_send");
+      assert.equal(event.operation, "relay_agent_send");
       assert.equal(typeof event.latency_ms, "number");
     }
     const hostileFailure = extensionEvents.find((event) =>
-      event.event === "relay_operation_failed" && event.operation === "agent_send" &&
+      event.event === "relay_operation_failed" && event.operation === "relay_agent_send" &&
       event.reason === "invalid_arguments");
     assert.ok(hostileFailure);
     assert.deepEqual(Object.keys(hostileFailure).sort(), [

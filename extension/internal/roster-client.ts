@@ -135,7 +135,7 @@ export class RosterClient {
         (typeof body !== "string" && !isObject(body)) ||
         (typeof body === "string" && !validText(body)) ||
         (re !== undefined && !isUUIDv7(re))) {
-      return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send arguments are invalid."));
+      return Promise.reject(new RosterRequestError("invalid_arguments", "Relay relay_agent_send arguments are invalid."));
     }
     let encodedBody: string;
     try {
@@ -144,12 +144,12 @@ export class RosterClient {
       if (error instanceof CanonicalJSONError && error.failure === "maximum_bytes") {
         return Promise.reject(new RosterRequestError(
           "body_too_large",
-          "Relay agent_send body exceeds 256 KiB.",
+          "Relay relay_agent_send body exceeds 256 KiB.",
         ));
       }
       return Promise.reject(new RosterRequestError(
         "invalid_arguments",
-        "Relay agent_send body is not safe JSON.",
+        "Relay relay_agent_send body is not safe JSON.",
       ));
     }
     const requestID = generateUUIDv7();
@@ -161,7 +161,7 @@ export class RosterClient {
       `{"v":1,"type":"send","request_id":${JSON.stringify(frameRequestID)},"payload":${immutablePayload}}`;
     const frame = makeFrame(requestID);
     if (Buffer.byteLength(frame, "utf8") > MAX_FRAME_BYTES) {
-      return Promise.reject(new RosterRequestError("invalid_arguments", "Relay agent_send frame exceeds 512 KiB."));
+      return Promise.reject(new RosterRequestError("invalid_arguments", "Relay relay_agent_send frame exceeds 512 KiB."));
     }
     return this.beginOperation("send", requestID, messageID, frame, signal, makeFrame) as Promise<SendResult>;
   }
@@ -178,7 +178,7 @@ export class RosterClient {
       return Promise.reject(this.operationError(kind, "disconnected"));
     }
     if (this.pending || this.writeInFlight) {
-      const operation = kind === "list" ? "list_peers" : "agent_send";
+      const operation = kind === "list" ? "relay_list_peers" : "relay_agent_send";
       return Promise.reject(new RosterRequestError(
         "concurrent_request",
         `Relay ${operation} already has one request in flight.`,
@@ -396,7 +396,7 @@ export class RosterClient {
   }
 
   private operationError(kind: "list" | "send", reason: string): RosterRequestError {
-    const operation = kind === "list" ? "list_peers" : "agent_send";
+    const operation = kind === "list" ? "relay_list_peers" : "relay_agent_send";
     const messages: Record<string, string> = {
       aborted: `Relay ${operation} request was aborted.`,
       timeout: `Relay ${operation} response timed out.`,

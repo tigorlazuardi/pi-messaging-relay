@@ -1,19 +1,19 @@
 ---
 title: List online relay peers
-description: Use list_peers safely, continue bounded live pages, and refresh after sessions disconnect.
+description: Use relay_list_peers safely, continue bounded live pages, and refresh after sessions disconnect.
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../components/Decision.astro';
 
-`list_peers` returns one bounded page of other authenticated Pi sessions that are online now. Each peer has only an opaque `address`. The roster does not expose idle/busy state, a connection name, installation identity, or separate cwd, hostname, and route fields.
+`relay_list_peers` returns one bounded page of other authenticated Pi sessions that are online now. Each peer has only an opaque `address`. The roster does not expose idle/busy state, a connection name, installation identity, or separate cwd, hostname, and route fields.
 
 ## List and continue
 
 <Steps>
-1. Call `list_peers` with `{}` for a fresh first page.
+1. Call `relay_list_peers` with `{}` for a fresh first page.
 2. Use every returned `peers[].address` as one opaque value. Do not split or reinterpret it.
-3. If the result contains `next_cursor`, call `list_peers` again with that exact value.
+3. If the result contains `next_cursor`, call `relay_list_peers` again with that exact value.
 4. Stop when `next_cursor` is absent. Start again with `{}` whenever a fresh current view matters.
 </Steps>
 
@@ -29,18 +29,18 @@ Copy only a `next_cursor` returned by the relay. A cursor is not a peer identity
 
 ## Disconnect and local limits
 
-A disconnected peer is absent from later pages after its disconnect settles. If your own retained relay connection closes, the in-flight `list_peers` fails instead of returning a stale roster. Automatic reconnect retries up to ten times with bounded jittered backoff and restores the same complete address only after authentication. It does not resume the failed list or preserve that operation's cursor; start a fresh `{}` call when current presence matters.
+A disconnected peer is absent from later pages after its disconnect settles. If your own retained relay connection closes, the in-flight `relay_list_peers` fails instead of returning a stale roster. Automatic reconnect retries up to ten times with bounded jittered backoff and restores the same complete address only after authentication. It does not resume the failed list or preserve that operation's cursor; start a fresh `{}` call when current presence matters.
 
-Only one outgoing `list_peers` or `agent_send` operation can be in flight on one retained extension connection. A concurrent call fails locally without being sent or queued. Incoming validated delivery can still arrive while that operation waits. On the server, a raw client's list runs synchronously one at a time in its connection reader, may overlap that session's admitted sends, consumes none of the 128 SEND slots, and is never placed in a list queue. A `list_peers` request fails and settles the connection when it is aborted, exceeds its five-second response deadline, receives malformed or wrongly correlated data, or loses the socket; `agent_send` uses a separate eight-second response deadline documented in the send guide. Retry from a newly authenticated connection; do not reuse a cursor when you need a fresh view.
+Only one outgoing `relay_list_peers` or `relay_agent_send` operation can be in flight on one retained extension connection. A concurrent call fails locally without being sent or queued. Incoming validated delivery can still arrive while that operation waits. On the server, a raw client's list runs synchronously one at a time in its connection reader, may overlap that session's admitted sends, consumes none of the 128 SEND slots, and is never placed in a list queue. A `relay_list_peers` request fails and settles the connection when it is aborted, exceeds its five-second response deadline, receives malformed or wrongly correlated data, or loses the socket; `relay_agent_send` uses a separate eight-second response deadline documented in the send guide. Retry from a newly authenticated connection; do not reuse a cursor when you need a fresh view.
 
 | Condition | Error |
 |---|---|
 | No authenticated connection | `Relay is disconnected. Write ~/.config/pi/pi-messaging-relay.json with mode 0600 (url required, secret optional) or set PI_MESSAGING_RELAY_URL, then restart the session.` |
-| Another list is in flight | `Relay list_peers already has one request in flight.` |
-| Request aborted | `Relay list_peers request was aborted.` |
-| Response deadline | `Relay list_peers response timed out.` |
-| Socket disconnected | `Relay disconnected during list_peers.` |
-| Invalid relay response | `Relay returned an invalid list_peers response.` |
+| Another list is in flight | `Relay relay_list_peers already has one request in flight.` |
+| Request aborted | `Relay relay_list_peers request was aborted.` |
+| Response deadline | `Relay relay_list_peers response timed out.` |
+| Socket disconnected | `Relay disconnected during relay_list_peers.` |
+| Invalid relay response | `Relay returned an invalid relay_list_peers response.` |
 
 ### I/O examples
 

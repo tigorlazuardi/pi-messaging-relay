@@ -337,11 +337,11 @@ This remains a loopback origin. It is not a proxy recipe and does not make publi
      const fs = require("node:fs");
      const response = JSON.parse(fs.readFileSync(0, "utf8"));
      const command = response.data?.commands?.find((item) =>
-       item.name === "list_peers" && item.source === "extension");
+       item.name === "relay_list_peers" && item.source === "extension");
      if (response.id !== "commands" || response.command !== "get_commands" ||
          response.success !== true || typeof command?.sourceInfo?.path !== "string") process.exit(1);
      process.stdout.write(command.sourceInfo.path);
-   ')" || { printf '%s\n' 'Pi get_commands response lacked list_peers provenance.' >&2; exit 1; }
+   ')" || { printf '%s\n' 'Pi get_commands response lacked relay_list_peers provenance.' >&2; exit 1; }
 
    case "$source_path" in
      "$new_extension"/*)
@@ -355,7 +355,7 @@ This remains a loopback origin. It is not a proxy recipe and does not make publi
    esac
    ```
 
-   Success requires `list_peers`'s nested `sourceInfo.path` to begin with the complete `new pinned extension root` printed in step 2 plus `/`; compare the hash-bearing `/nix/store/...-pi-messaging-relay-extension` path, not only its package name. The probe must also confirm the response contains no `relay-pair` command: protocol v2 removed pairing. The probe's private stderr is Pi-side extension lifecycle evidence; keep it local because operational diagnostics can contain public identity and route metadata.
+   Success requires `relay_list_peers`'s nested `sourceInfo.path` to begin with the complete `new pinned extension root` printed in step 2 plus `/`; compare the hash-bearing `/nix/store/...-pi-messaging-relay-extension` path, not only its package name. The probe must also confirm the response contains no `relay-pair` command: protocol v2 removed pairing. The probe's private stderr is Pi-side extension lifecycle evidence; keep it local because operational diagnostics can contain public identity and route metadata.
 5. In a journal terminal, capture a second cursor and begin the matching 30-second watcher. Immediately afterward, run normal configured Pi as `pi` in another trusted terminal. Do not use the isolated probe environment from step 4.
 
    <Tabs>

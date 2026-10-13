@@ -8,7 +8,7 @@ date: 2026-09-11
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The roster seam connects the server's authenticated session registry to the extension's `list_peers` tool. It publishes only complete opaque addresses. Installation identity, client ID, cwd, hostname, route fields, socket details, connection names, and Pi idle/busy state do not enter roster entries.
+The roster seam connects the server's authenticated session registry to the extension's `relay_list_peers` tool. It publishes only complete opaque addresses. Installation identity, client ID, cwd, hostname, route fields, socket details, connection names, and Pi idle/busy state do not enter roster entries.
 
 ## Live registry boundary
 
@@ -40,7 +40,7 @@ The existing server `operation_settled` event remains the single settled-operati
 
 The authenticated connection owns one deep `list` request API. It generates a UUIDv7 request ID, sends one closed `list` envelope, and accepts only the exactly correlated `roster` response. The complete roster frame is limited to 49,152 bytes and must be valid UTF-8 with no duplicate JSON keys. Envelope, payload, peer entries, value types, address byte bounds, and cursor spelling are closed and validated.
 
-One outgoing list or send request may be in flight per retained connection. A second attempt fails locally without a send or queue. Validated server-pushed delivery offers remain acceptable while that operation waits. The `list_peers` response deadline remains five seconds; `agent_send` uses its separate eight-second deadline so the relay's complete five-second recipient ACK path can answer. Abort or local response timeout closes and settles the socket because a later response could otherwise desynchronize correlation. Socket close rejects an in-flight request. A malformed, unsolicited, or wrong-correlation roster also fails closed and force-settles the transport.
+One outgoing list or send request may be in flight per retained connection. A second attempt fails locally without a send or queue. Validated server-pushed delivery offers remain acceptable while that operation waits. The `relay_list_peers` response deadline remains five seconds; `relay_agent_send` uses its separate eight-second deadline so the relay's complete five-second recipient ACK path can answer. Abort or local response timeout closes and settles the socket because a later response could otherwise desynchronize correlation. Socket close rejects an in-flight request. A malformed, unsolicited, or wrong-correlation roster also fails closed and force-settles the transport.
 
 After that exact connection closes, [automatic session reconnect](../automatic-reconnect/) may restore the same address only through a fresh successful authentication. The session remains absent from every roster read while disconnected or while retry attempts have not authenticated. Reconnect does not resume the failed list, retain its cursor as operation state, or return a stale page.
 
@@ -52,13 +52,13 @@ Stable local errors are:
 
 | Condition | Tool error |
 |---|---|
-| Already in flight | `Relay list_peers already has one request in flight.` |
-| Aborted | `Relay list_peers request was aborted.` |
-| Five-second deadline | `Relay list_peers response timed out.` |
-| Socket closes | `Relay disconnected during list_peers.` |
-| Invalid or wrongly correlated response | `Relay returned an invalid list_peers response.` |
+| Already in flight | `Relay relay_list_peers already has one request in flight.` |
+| Aborted | `Relay relay_list_peers request was aborted.` |
+| Five-second deadline | `Relay relay_list_peers response timed out.` |
+| Socket closes | `Relay disconnected during relay_list_peers.` |
+| Invalid or wrongly correlated response | `Relay returned an invalid relay_list_peers response.` |
 
-A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain only `peers` and optional `next_cursor`. Successful idle and busy string/object `agent_send` shares this operation owner; see [authenticated message delivery](../message-delivery/).
+A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain only `peers` and optional `next_cursor`. Successful idle and busy string/object `relay_agent_send` shares this operation owner; see [authenticated message delivery](../message-delivery/).
 
 ### I/O examples
 
@@ -80,7 +80,7 @@ A successful Pi tool result includes deterministic compact JSON text and matchin
   </TabItem>
   <TabItem label="Concurrent local call">
     ```text
-    Relay list_peers already has one request in flight.
+    Relay relay_list_peers already has one request in flight.
     ```
   </TabItem>
 </Tabs>
