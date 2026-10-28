@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildPeerRosterSnapshot,
+  collectRosterAddresses,
   parsePeerAddress,
   PeerRosterCardComponent,
   PEER_ROSTER_ENTRY_TYPE,
@@ -68,6 +69,29 @@ test("buildPeerRosterSnapshot walks next_cursor pages until exhaustion or the 8-
   });
   assert.equal(budgetPages, 8);
   assert.equal(truncated.totalCount, 8);
+  assert.equal(truncated.truncated, true);
+});
+
+test("collectRosterAddresses walks pages and reports budget truncation", async () => {
+  const seen: Array<string | undefined> = [];
+  let page = 0;
+  const collected = await collectRosterAddresses(async (cursor) => {
+    seen.push(cursor);
+    page += 1;
+    if (page < 3) return { peers: [{ address: `/srv/x@h#${ROUTE_A}` }], next_cursor: `cur_${page}` };
+    return { peers: [{ address: `/srv/y@h#${ROUTE_B}` }] };
+  });
+  assert.deepEqual(collected.addresses, [`/srv/x@h#${ROUTE_A}`, `/srv/x@h#${ROUTE_A}`, `/srv/y@h#${ROUTE_B}`]);
+  assert.equal(collected.truncated, false);
+  assert.deepEqual(seen, [undefined, "cur_1", "cur_2"]);
+
+  let budgetPages = 0;
+  const truncated = await collectRosterAddresses(async () => {
+    budgetPages += 1;
+    return { peers: [], next_cursor: `cur_${budgetPages}` };
+  });
+  assert.equal(budgetPages, 8);
+  assert.deepEqual(truncated.addresses, []);
   assert.equal(truncated.truncated, true);
 });
 

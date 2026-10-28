@@ -39,6 +39,7 @@ import { RelayCardComponent } from "./internal/relay-box.ts";
 import { RelayLogsOverlay } from "./internal/logs-overlay.ts";
 import {
   buildPeerRosterSnapshot,
+  collectRosterAddresses,
   PeerRosterCardComponent,
   PEER_ROSTER_ENTRY_TYPE,
   snapshotFromUnknown,
@@ -65,6 +66,11 @@ const listPeersParameters = Type.Object(
       maxLength: MAX_CURSOR_CHARACTERS,
       pattern: "^cur_[A-Za-z0-9_-]+$",
       description: "Opaque next_cursor from the preceding relay_list_peers page; omit for the first page",
+    })),
+    filter: Type.Optional(Type.String({
+      minLength: 1,
+      maxLength: 200,
+      description: "Case-insensitive substring to look for in addresses (cwd@hostname#route), e.g. a project name or hostname. Prefer this whenever you know part of the target; only matching peers are returned. Mutually exclusive with cursor",
     })),
   },
   { additionalProperties: false },
@@ -819,13 +825,33 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "relay_list_peers",
     label: "List Relay Peers",
-    description: "List one address-only page of online Pi relay sessions; the result contains peers and optional next_cursor",
+    description: "List online Pi relay sessions. When you know part of the target (project/cwd, hostname), ALWAYS pass filter (case-insensitive substring over the full address cwd@hostname#route): the whole roster is searched and only matches are returned, keeping context small. Without filter you get one address-only page with optional next_cursor; use that only to browse everything",
     parameters: listPeersParameters,
     async execute(_toolCallID, params, signal) {
       const connection = activeConnection;
       if (!connection) return disconnected("relay_list_peers");
       try {
-        const cursor = (params as { cursor?: string }).cursor;
+        const { cursor, filter } = params as { cursor?: string; filter?: string };
+        if (cursor !== undefined && filter !== undefined) {
+          throw new RosterRequestError(
+            "invalid_arguments",
+            "Relay relay_list_peers accepts cursor or filter, not both.",
+          );
+        }
+        if (filter !== undefined) {
+          const needle = filter.toLowerCase();
+          const { addresses, truncated } = await collectRosterAddresses(
+            (next) => connection.list(next, signal as AbortSignal),
+          );
+          const peers = addresses
+            .filter((address) => address.toLowerCase().includes(needle))
+            .map((address) => ({ address }));
+          const page = truncated ? { peers, next_cursor: "" } : { peers };
+          return {
+            content: [{ type: "text", text: JSON.stringify(page) }],
+            details: page,
+          };
+        }
         const page = await connection.list(cursor, signal as AbortSignal);
         return {
           content: [{ type: "text", text: JSON.stringify(page) }],

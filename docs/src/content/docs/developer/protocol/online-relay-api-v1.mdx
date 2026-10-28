@@ -20,8 +20,10 @@ Protocol v2 ([online relay authentication v2](../online-relay-auth-v2/)) removed
 
 The Pi extension exposes two model tools:
 
-- `relay_list_peers({ cursor? })`
+- `relay_list_peers({ cursor?, filter? })`
 - `relay_agent_send({ to, body, re? })`
+
+`filter` is extension-side convenience over the same address-only roster: a case-insensitive substring match on complete opaque addresses that walks pagination within the fixed page budget instead of returning one page, and is mutually exclusive with `cursor`. The server protocol stays unchanged; `filter` never crosses the WebSocket.
 
 `relay_agent_send` result text appends a model-directed hint on `timeout/offline` and `timeout/recipient_disconnected`: the destination route is stale (a peer session restart changes the route suffix while `cwd@hostname` stays), so the caller must run `relay_list_peers` again and resend to the fresh address. The hint is appended to the same result text; `details` stay the closed correlated result unchanged.
 

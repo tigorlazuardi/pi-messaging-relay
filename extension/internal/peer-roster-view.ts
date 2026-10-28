@@ -55,10 +55,13 @@ export function parsePeerAddress(address: string): PeerRosterPeer {
   return { cwd: head.slice(0, at), hostname: head.slice(at + 1), routeID: routeCandidate };
 }
 
-/** Walks address-only roster pages through the injected list function until
- * the relay reports exhaustion or the fixed page budget is hit. `truncated`
- * marks a budget hit so the card can say the view is partial. */
-export async function buildPeerRosterSnapshot(list: RosterListFunction): Promise<PeerRosterSnapshot> {
+/** Walks injected roster pages until exhaustion or the fixed page budget,
+ * returning the collected addresses and whether the walk hit the budget.
+ * Shared by the /relay-peers display snapshot and the filtered
+ * relay_list_peers tool path. */
+export async function collectRosterAddresses(
+  list: RosterListFunction,
+): Promise<{ addresses: string[]; truncated: boolean }> {
   const addresses: string[] = [];
   let cursor: string | undefined;
   let truncated = true;
@@ -77,6 +80,12 @@ export async function buildPeerRosterSnapshot(list: RosterListFunction): Promise
     }
     cursor = next;
   }
+  return { addresses, truncated };
+}
+
+/** Builds the grouped display snapshot from the collected roster walk. */
+export async function buildPeerRosterSnapshot(list: RosterListFunction): Promise<PeerRosterSnapshot> {
+  const { addresses, truncated } = await collectRosterAddresses(list);
   const groups = new Map<string, PeerRosterGroup>();
   for (const address of addresses) {
     const peer = parsePeerAddress(address);

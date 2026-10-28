@@ -332,7 +332,14 @@ test("publishes the closed relay_list_peers schema", { concurrency: false }, asy
   assert.equal(Value.Check(listSchema as never, { cursor: "cur_cGVlcg==" }), false);
   assert.equal(Value.Check(listSchema as never, { cursor: `${maximumCursor}a` }), false);
   assert.equal(Value.Check(listSchema as never, { cursor: 12 }), false);
-  assert.equal(Value.Check(listSchema as never, { unexpected: true }), false);
+  assert.equal(Value.Check(listSchema as never, { filter: "alpha" }), true);
+  assert.equal(Value.Check(listSchema as never, { filter: "x" }), true);
+  assert.equal(Value.Check(listSchema as never, { filter: "f".repeat(200) }), true);
+  assert.equal(Value.Check(listSchema as never, { filter: "" }), false);
+  assert.equal(Value.Check(listSchema as never, { filter: "f".repeat(201) }), false);
+  assert.equal(Value.Check(listSchema as never, { filter: 12 }), false);
+  // Schema-level exclusivity is not expressible; both-present is rejected at runtime.
+  assert.equal(Value.Check(listSchema as never, { cursor: "cur_cGVlcg", filter: "alpha" }), true);
 });
 
 test("publishes only to, body, and optional canonical reply correlation for relay_agent_send", { concurrency: false }, async () => {

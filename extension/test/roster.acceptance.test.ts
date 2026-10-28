@@ -142,6 +142,16 @@ test("real extensions list live authenticated peers with strict address-only con
     assert.deepEqual(continuation.peers, first.peers.slice(1));
     assert.ok(continuation.peers.every((peer) => peer.address > first.peers[0].address));
 
+    const filtered = page(await hosts[0].executeTool("relay_list_peers", { filter: "Bravo" })).details;
+    await nextEvent(output, "operation_settled", (event) => event.type === "list");
+    assert.deepEqual(filtered.peers, [{ address: addresses[3] }]);
+    assert.equal((filtered as { next_cursor?: string }).next_cursor, undefined);
+
+    await assert.rejects(
+      hosts[0].executeTool("relay_list_peers", { cursor: "cur_cGVlcg", filter: "bravo" }),
+      { message: "Relay relay_list_peers accepts cursor or filter, not both." },
+    );
+
     const removedAddress = addresses[3];
     await hosts[3].emit("session_shutdown");
     await nextEvent(output, "session_disconnected", (event) => event.address === removedAddress);
