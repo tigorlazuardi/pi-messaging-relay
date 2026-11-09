@@ -5,7 +5,7 @@ description: Load the Pi extension and deliver its loopback endpoint and optiona
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The extension exposes `relay_list_peers` and `relay_agent_send`. A connected Pi session authenticates one WebSocket automatically and receives its opaque route address. `relay_list_peers` reads bounded live address-only roster pages; `relay_agent_send` can deliver a provenance-labelled string or JSON object to an online idle or busy recipient and return extension-boundary `received`.
+The extension exposes `relay_list_peers` and `relay_agent_send`. A connected Pi session authenticates one WebSocket automatically and receives its opaque route address. `relay_list_peers` reads bounded live roster pages of peer addresses plus their optional annotations; `relay_agent_send` can deliver a provenance-labelled string or JSON object to an online idle or busy recipient and return extension-boundary `received`.
 
 <Aside type="caution" title="Best-effort online delivery only">
 A `relay_auth_accepted` diagnostic means the session connected and can use discovery plus successful idle and busy string/object delivery. Automatic reconnect can restore only that live capability. It does not enable offline delivery, replay, durable Pi acceptance, model completion, or guaranteed replies.
@@ -103,7 +103,7 @@ The line shows a fixed `relay` label beside the circle, so the indicator never n
 
 ## Peer roster view
 
-Run `/relay-peers` inside Pi to see who is online. The command walks the address-only roster pages (at most 8) and appends one display-only card to the transcript, grouped by hostname with one markdown table per group:
+Run `/relay-peers` inside Pi to see who is online. The command walks the roster pages (at most 8) and appends one display-only card to the transcript, grouped by hostname with one markdown table per group:
 
 ```text
 ╭ relay peers — 3 online ──────────────────────────────────╮
