@@ -619,7 +619,8 @@ func (service *sessionAuthService) authorizeUpgrade(header string) bool {
 
 // applyHelloAnnotations applies the optional initial annotation set from one
 // hello. An invalid set is dropped: the session keeps an empty set, the
-// registration succeeds, and the socket stays healthy.
+// registration succeeds, and the socket stays healthy. A set with a
+// duplicated key is dropped exactly like the annotate path drops it.
 func (service *sessionAuthService) applyHelloAnnotations(
 	session *authenticatedSession,
 	raw json.RawMessage,
@@ -627,7 +628,7 @@ func (service *sessionAuthService) applyHelloAnnotations(
 	if len(raw) == 0 {
 		return
 	}
-	set, reason := decodeAnnotationMap(raw)
+	set, reason := decodeHelloAnnotationMap(raw)
 	if reason != "" {
 		service.writeAudit(logEvent{
 			Level:   "warn",

@@ -76,6 +76,17 @@ func decodeAnnotationMap(data []byte) (annotationSet, string) {
 	return set, ""
 }
 
+// decodeHelloAnnotationMap validates one hello-borne annotation map. A
+// duplicated key inside the map drops the set, exactly like the annotate
+// path: map decoding would otherwise keep the last value silently and apply
+// a set the documented rules drop.
+func decodeHelloAnnotationMap(data []byte) (annotationSet, string) {
+	if inspection, err := inspectJSON(data); err == nil && inspection.duplicate {
+		return nil, "duplicate_key"
+	}
+	return decodeAnnotationMap(data)
+}
+
 // decodeAnnotationValue accepts one JSON string value. Numbers, booleans,
 // null, objects, and arrays are not annotation values.
 func decodeAnnotationValue(raw json.RawMessage) (string, bool) {

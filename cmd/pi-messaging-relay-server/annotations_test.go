@@ -55,6 +55,10 @@ type annotationSessionOptions struct {
 	cwd       string
 	capable   bool
 	annotated map[string]string
+	// rawPayload replaces the whole hello payload object with verbatim JSON.
+	// A typed map cannot express a duplicated key, so the duplicate-key cases
+	// need the raw form.
+	rawPayload string
 }
 
 // openAnnotationSessionWith dials the relay upgrade and returns the raw
@@ -75,13 +79,17 @@ func openAnnotationSessionWith(
 	if err != nil {
 		t.Fatalf("dial relay: %v", err)
 	}
-	payload := map[string]any{
+	payloadFields := map[string]any{
 		"route_id": options.routeID,
 		"hostname": options.hostname,
 		"cwd":      options.cwd,
 	}
 	if options.annotated != nil {
-		payload["annotations"] = options.annotated
+		payloadFields["annotations"] = options.annotated
+	}
+	var payload any = payloadFields
+	if options.rawPayload != "" {
+		payload = json.RawMessage(options.rawPayload)
 	}
 	if err := wsjson.Write(ctx, connection, map[string]any{
 		"v":          1,
@@ -292,6 +300,119 @@ func TestHelloAnnotationsApplyForCapableSessions(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("the hello annotation never reached the roster: %s", logs.String())
+}
+
+func TestHelloAnnotationsDropDuplicateKeys(t *testing.T) {
+	logs := &lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(writerFunc(func(data []byte) (int, error) { return logs.Write(data) }))
+	t.Cleanup(func() { _ = logger.close() })
+	registry := newSessionConnectionRegistryWithLimit(8)
+	service := newSessionAuthService("", registry, logger, newFatalRuntimeReporter().report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	announcer, _ := openAnnotationSessionWith(t, endpoint, annotationSessionOptions{
+		routeID:  annotationRouteA,
+		hostname: "host",
+		cwd:      "/srv/project",
+		capable:  true,
+		rawPayload: `{"route_id":"` + annotationRouteA + `","hostname":"host","cwd":"/srv/project",` +
+			`"annotations":{"name":"alice","name":"bob"}}`,
+	})
+	defer announcer.CloseNow()
+	observer, _ := openAnnotationSession(t, endpoint, annotationRouteB, "host", "/srv/other", true)
+	defer observer.CloseNow()
+
+	waitForLog(t, logs, `"reason":"duplicate_key"`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	requestID := "01993c9a-1111-7aaa-8aaa-111111111111"
+	if err := observer.Write(ctx, websocket.MessageText, []byte(listFrame(requestID))); err != nil {
+		t.Fatalf("write observer list: %v", err)
+	}
+	page := readRoster(t, observer, requestID)
+	for _, peer := range page.Peers {
+		if strings.HasPrefix(peer.Address, "/srv/project@") && len(peer.Annotations) != 0 {
+			t.Fatalf("a hello set with a duplicated key was applied: %#v", peer.Annotations)
+		}
+	}
+	for _, value := range []string{"alice", "bob"} {
+		if strings.Contains(logs.String(), value) {
+			t.Fatalf("annotation value %q reached the log: %s", value, logs.String())
+		}
+	}
+}
+
+func TestHelloAnnotationsDropInvalidSetKeepsTheSessionUsable(t *testing.T) {
+	logs := &lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(writerFunc(func(data []byte) (int, error) { return logs.Write(data) }))
+	t.Cleanup(func() { _ = logger.close() })
+	registry := newSessionConnectionRegistryWithLimit(8)
+	service := newSessionAuthService("", registry, logger, newFatalRuntimeReporter().report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	announcer, _ := openAnnotationSessionWith(t, endpoint, annotationSessionOptions{
+		routeID:  annotationRouteA,
+		hostname: "host",
+		cwd:      "/srv/project",
+		capable:  true,
+		rawPayload: `{"route_id":"` + annotationRouteA + `","hostname":"host","cwd":"/srv/project",` +
+			`"annotations":{"bad key":"do-not-log"}}`,
+	})
+	defer announcer.CloseNow()
+	observer, _ := openAnnotationSession(t, endpoint, annotationRouteB, "host", "/srv/other", true)
+	defer observer.CloseNow()
+
+	waitForLog(t, logs, `"event":"annotations_dropped"`)
+	output := logs.String()
+	if !strings.Contains(output, `"type":"hello"`) {
+		t.Fatalf("the drop was not attributed to the hello path: %s", output)
+	}
+	if !strings.Contains(output, `"reason":"invalid_key"`) {
+		t.Fatalf("no invalid_key drop reason was logged: %s", output)
+	}
+	if strings.Contains(output, "do-not-log") {
+		t.Fatalf("annotation value reached the log: %s", output)
+	}
+
+	// The session still registered and stays usable: the peer is in the
+	// roster and carries no annotation.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	requestID := "01993c9b-2222-7aaa-8aaa-222222222222"
+	if err := observer.Write(ctx, websocket.MessageText, []byte(listFrame(requestID))); err != nil {
+		t.Fatalf("write observer list: %v", err)
+	}
+	page := readRoster(t, observer, requestID)
+	found := false
+	for _, peer := range page.Peers {
+		if strings.HasPrefix(peer.Address, "/srv/project@") {
+			found = true
+			if len(peer.Annotations) != 0 {
+				t.Fatalf("a dropped hello set reached the roster: %#v", peer.Annotations)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("the session with the dropped hello set is missing from the roster: %#v", page.Peers)
+	}
+}
+
+// waitForLog waits until the relay log carries one fragment.
+func waitForLog(t *testing.T, logs *lockedBuffer, fragment string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logs.String(), fragment) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the relay log never carried %q: %s", fragment, logs.String())
 }
 
 func TestAnnotateAcceptedVisibleOnlyToCapableRequesters(t *testing.T) {
@@ -613,6 +734,9 @@ func TestAnnotationValidationAcceptsLegalSetsAndRejectsIllegalOnes(t *testing.T)
 	if _, reason := decodeAnnotationMap([]byte(oversized)); reason != "too_large" {
 		t.Fatalf("oversized set reason = %q, want too_large", reason)
 	}
+	if _, reason := decodeHelloAnnotationMap([]byte(`{"name":"first","name":"second"}`)); reason != "duplicate_key" {
+		t.Fatalf("duplicate hello map reason = %q, want duplicate_key", reason)
+	}
 }
 
 func TestRosterPageFitsWorstCaseAddressAndAnnotationSet(t *testing.T) {
@@ -663,6 +787,80 @@ func TestRosterPageFitsWorstCaseAddressAndAnnotationSet(t *testing.T) {
 	}
 	if len(encoded) > maxRosterFrameBytes {
 		t.Fatalf("paged roster frame = %d bytes, cap %d", len(encoded), maxRosterFrameBytes)
+	}
+}
+
+func TestRosterPagesAnnotatedPeersWithinTheFrameCeiling(t *testing.T) {
+	operation := clientOperation{
+		Type:      "list",
+		RequestID: "01993c9c-3333-7aaa-8aaa-333333333333",
+		List:      &listOperationPayload{},
+	}
+	// Every peer carries a near-maximum annotation set, so the page fill must
+	// size the annotated peers and not only their addresses.
+	peers := make([]rosterPeer, 0, 60)
+	for index := 0; index < 60; index++ {
+		annotations := map[string]string{}
+		for key := 0; key < maxAnnotationKeys; key++ {
+			annotations[fmt.Sprintf("k%d", key)] = strings.Repeat("<", 119)
+		}
+		peers = append(peers, rosterPeer{
+			Address:     fmt.Sprintf("/srv/peer-%03d@host#%036d", index, index),
+			Annotations: annotations,
+		})
+	}
+
+	seen := make([]string, 0, len(peers))
+	remaining := peers
+	for page := 1; len(remaining) > 0; page++ {
+		if page > 100 {
+			t.Fatal("the roster paging did not terminate")
+		}
+		built, err := buildRosterPage(operation, remaining)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if len(built.Peers) == 0 {
+			t.Fatalf("page %d returned no peer", page)
+		}
+		encoded, err := encodeOperationResponse(operation, operationResponse{
+			Type: "roster", Payload: built, Outcome: "settled", Code: "roster",
+		})
+		if err != nil {
+			t.Fatalf("page %d did not fit the frame ceiling: %v", page, err)
+		}
+		if len(encoded) > maxRosterFrameBytes {
+			t.Fatalf("page %d = %d bytes, cap %d", page, len(encoded), maxRosterFrameBytes)
+		}
+		for _, peer := range built.Peers {
+			seen = append(seen, peer.Address)
+		}
+		if built.NextCursor == "" {
+			if len(built.Peers) != len(remaining) {
+				t.Fatalf("the last page dropped peers: %d of %d", len(built.Peers), len(remaining))
+			}
+			break
+		}
+		// The page is the longest prefix that still fits: one more peer must
+		// exceed the ceiling.
+		overflow := built
+		overflow.Peers = append(append([]rosterPeer{}, built.Peers...), remaining[len(built.Peers)])
+		overflowed, err := encodeOperationResponse(operation, operationResponse{
+			Type: "roster", Payload: overflow, Outcome: "settled", Code: "roster",
+		})
+		if err == nil && len(overflowed) <= maxRosterFrameBytes {
+			t.Fatalf("page %d was not the longest fitting prefix: %d bytes with one more peer", page, len(overflowed))
+		}
+		remaining = remaining[len(built.Peers):]
+	}
+
+	if len(seen) != len(peers) {
+		t.Fatalf("paging returned %d peers, want %d", len(seen), len(peers))
+	}
+	for index, address := range seen {
+		if address != peers[index].Address {
+			t.Fatalf("paging changed the peer order at %d: %q", index, address)
+		}
 	}
 }
 
