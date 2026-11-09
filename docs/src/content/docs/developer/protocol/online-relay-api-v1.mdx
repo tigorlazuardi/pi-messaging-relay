@@ -457,6 +457,8 @@ Page filling sizes a peer with its annotations, JSON-escaped, and still respects
 
 An invalid, oversized, over-keyed, or control-character set is dropped. The previous set stays in place, the socket stays healthy, the registration never fails, and no fatal error reaches the client. A duplicate key inside the annotation map is a dropped set, not a terminal frame, because the map is best-effort metadata; every other duplicate key in the protocol stays terminal. The rule holds on both ingestion paths: a hello-borne set and an `annotate`-borne set with a duplicated key are dropped the same way.
 
+The dropped-set exception covers the map's own keys only. A duplicated `annotations` payload field is an ordinary duplicate protocol key: it keeps the terminal `invalid_envelope` / `duplicate_field` rejection and ends the session, exactly like the duplicate-field rule on the hello path.
+
 Drop reasons are stable: `invalid_payload`, `invalid_key`, `invalid_value`, `too_many_keys`, `too_large`, and `duplicate_key`.
 
 ### Compatibility matrix
