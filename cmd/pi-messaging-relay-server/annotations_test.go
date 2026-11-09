@@ -901,3 +901,108 @@ func TestConcurrentAnnotationUpdatesKeepTheSocketHealthy(t *testing.T) {
 	}
 	readRoster(t, announcer, requestID)
 }
+
+// TestAnnotateDuplicatePayloadFieldStaysTerminal proves that a duplicated
+// annotations payload field is a protocol-level duplicate: it keeps the
+// terminal duplicate-field rejection instead of silently dropping the set.
+func TestAnnotateDuplicatePayloadFieldStaysTerminal(t *testing.T) {
+	logs := &lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(writerFunc(func(data []byte) (int, error) { return logs.Write(data) }))
+	t.Cleanup(func() { _ = logger.close() })
+	registry := newSessionConnectionRegistryWithLimit(8)
+	service := newSessionAuthService("", registry, logger, newFatalRuntimeReporter().report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	announcer, _ := openAnnotationSession(t, endpoint, annotationRouteA, "host", "/srv/project", true)
+	defer announcer.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := announcer.Write(ctx, websocket.MessageText, []byte(annotatePayloadFrame(
+		"01993c91-1111-7aaa-8aaa-111111111111",
+		`{"annotations":{"name":"alice"},"annotations":{"name":"bob"}}`,
+	))); err != nil {
+		t.Fatalf("write annotate frame: %v", err)
+	}
+	var failure struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Code  string `json:"code"`
+			Close bool   `json:"close"`
+		} `json:"payload"`
+	}
+	if err := wsjson.Read(ctx, announcer, &failure); err != nil {
+		t.Fatalf("read protocol failure: %v", err)
+	}
+	if failure.Type != "error" || failure.Payload.Code != "invalid_envelope" || !failure.Payload.Close {
+		t.Fatalf("duplicate payload field failure = %+v, want terminal invalid_envelope", failure)
+	}
+	waitForLog(t, logs, `"reason":"duplicate_field"`)
+	for _, value := range []string{"alice", "bob"} {
+		if strings.Contains(logs.String(), value) {
+			t.Fatalf("annotation value %q reached the log: %s", value, logs.String())
+		}
+	}
+}
+
+// TestAnnotateDuplicateMapKeyDropsSetAndKeepsSocketHealthy proves that only a
+// duplicated key inside the annotation map is a dropped set: the previous set
+// stays, the socket stays healthy, and no value reaches the log.
+func TestAnnotateDuplicateMapKeyDropsSetAndKeepsSocketHealthy(t *testing.T) {
+	logs := &lockedBuffer{changed: make(chan struct{}, 1)}
+	logger := newEventLogger(writerFunc(func(data []byte) (int, error) { return logs.Write(data) }))
+	t.Cleanup(func() { _ = logger.close() })
+	registry := newSessionConnectionRegistryWithLimit(8)
+	service := newSessionAuthService("", registry, logger, newFatalRuntimeReporter().report)
+	server := httptest.NewServer(http.HandlerFunc(service.handleConnect))
+	t.Cleanup(server.Close)
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	announcer, _ := openAnnotationSession(t, endpoint, annotationRouteA, "host", "/srv/project", true)
+	defer announcer.CloseNow()
+	observer, _ := openAnnotationSession(t, endpoint, annotationRouteB, "host", "/srv/other", true)
+	defer observer.CloseNow()
+
+	syncAnnotations(t, announcer, `{"name":"alice"}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := announcer.Write(ctx, websocket.MessageText, []byte(annotatePayloadFrame(
+		"01993c92-2222-7aaa-8aaa-222222222222",
+		`{"annotations":{"name":"first","name":"second"}}`,
+	))); err != nil {
+		t.Fatalf("write annotate frame: %v", err)
+	}
+	// The list frame on the same connection is ordered after the annotate
+	// frame, so a roster response proves the annotate frame was settled and
+	// the socket stayed healthy.
+	announcerRequest := "01993c93-3333-7aaa-8aaa-333333333333"
+	if err := announcer.Write(ctx, websocket.MessageText, []byte(listFrame(announcerRequest))); err != nil {
+		t.Fatalf("write list frame: %v", err)
+	}
+	readRoster(t, announcer, announcerRequest)
+
+	waitForLog(t, logs, `"reason":"duplicate_key"`)
+	output := logs.String()
+	for _, value := range []string{"first", "second"} {
+		if strings.Contains(output, value) {
+			t.Fatalf("annotation value %q reached the log: %s", value, output)
+		}
+	}
+
+	observerRequest := "01993c94-4444-7aaa-8aaa-444444444444"
+	if err := observer.Write(ctx, websocket.MessageText, []byte(listFrame(observerRequest))); err != nil {
+		t.Fatalf("write observer list: %v", err)
+	}
+	page := readRoster(t, observer, observerRequest)
+	for _, peer := range page.Peers {
+		if !strings.HasPrefix(peer.Address, "/srv/project@") {
+			continue
+		}
+		if len(peer.Annotations) != 1 || peer.Annotations["name"] != "alice" {
+			t.Fatalf("a dropped set changed the live set: %#v", peer.Annotations)
+		}
+	}
+}

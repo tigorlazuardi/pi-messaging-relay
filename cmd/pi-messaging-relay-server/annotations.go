@@ -29,8 +29,10 @@ type annotationSet map[string]string
 // decodeAnnotatePayload decodes one annotate operation payload. It never
 // rejects the connection: an invalid annotation set is reported with a stable
 // drop reason so the caller keeps the previous set and the socket stays
-// healthy. A duplicated annotations key is a dropped set, not a terminal
-// frame, because the annotation map is best-effort metadata.
+// healthy. A duplicated key inside the annotation map is a dropped set, not a
+// terminal frame, because the annotation map is best-effort metadata. A
+// duplicated annotations payload field is a protocol-level duplicate and stays
+// terminal.
 func decodeAnnotatePayload(data []byte, duplicate bool) (annotationSet, string) {
 	if duplicate {
 		return nil, "duplicate_key"
@@ -166,9 +168,10 @@ func annotationSerializedBytes(set annotationSet) int {
 	return len(bytes.TrimRight(buffer.Bytes(), "\n"))
 }
 
-// annotationPath reports whether one JSON field path belongs to the
+// annotationPath reports whether one JSON field path lies inside the
 // annotations map of an operation payload. Duplicates inside that map are a
-// dropped annotation set; every other duplicate stays a terminal frame.
+// dropped annotation set; every other duplicate, including a duplicated
+// annotations payload field, stays a terminal frame.
 func annotationPath(path string) bool {
-	return path == "payload.annotations" || strings.HasPrefix(path, "payload.annotations.")
+	return strings.HasPrefix(path, "payload.annotations.")
 }
