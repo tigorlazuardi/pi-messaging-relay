@@ -115,6 +115,24 @@ test("the annotation set stays inside the relay key and size ceilings", () => {
   assert.equal(Buffer.byteLength(JSON.stringify(annotations), "utf8") <= 1024, true);
 });
 
+test("oversized derived values are dropped instead of disabling every annotation", () => {
+  const annotations = buildAnnotationSet({
+    session: "s".repeat(256),
+    state: "b".repeat(256),
+    name: "n".repeat(256),
+    branch: "r".repeat(256),
+  });
+  assert.equal(Object.keys(annotations).length, 3);
+  assert.equal(typeof annotations.state, "string");
+  assert.equal(Buffer.byteLength(JSON.stringify(annotations), "utf8") <= 1024, true);
+});
+
+test("a launcher key that shadows an object prototype name is published", () => {
+  const annotations = buildAnnotationSet({ state: "idle", launcher: { constructor: "keep" } });
+  assert.equal(Object.hasOwn(annotations, "constructor"), true);
+  assert.equal(annotations.constructor, "keep");
+});
+
 test("annotation updates coalesce into at most one send per second", () => {
   const clock = fakeClock();
   const sent: AnnotationSet[] = [];

@@ -95,7 +95,9 @@ export function parseLauncherAnnotations(raw: string | undefined): {
 
 /** Builds the live annotation set from the extension-derived sources and the
  * launcher-supplied ones. Extension-derived keys win over launcher keys, and
- * an unusable value is omitted instead of invalidating the whole set. */
+ * an unusable value is omitted instead of invalidating the whole set. A
+ * derived set above the serialized ceiling drops its longest values instead
+ * of publishing nothing at all. */
 export function buildAnnotationSet(sources: {
   session?: string | undefined;
   state?: string | undefined;
@@ -114,11 +116,19 @@ export function buildAnnotationSet(sources: {
     if (!ANNOTATION_KEY_PATTERN.test(key) || !validAnnotationValue(value)) continue;
     derived[key] = value;
   }
+  // The derived keys must fit the ceiling on their own: an oversized set is
+  // dropped whole by the relay, and the session would publish nothing at all.
+  // The longest derived value goes first.
+  for (const key of Object.keys(derived).sort(
+    (left, right) => derived[right].length - derived[left].length)) {
+    if (annotationSerializedBytes(derived) <= MAX_ANNOTATION_SERIALIZED_BYTES) break;
+    delete derived[key];
+  }
   const annotations: AnnotationSet = { ...derived };
   const launcher = sources.launcher ?? {};
   for (const key of Object.keys(launcher).sort()) {
     if (Object.keys(annotations).length >= MAX_ANNOTATION_KEYS) break;
-    if (key in annotations) continue;
+    if (Object.hasOwn(annotations, key)) continue;
     const value = launcher[key];
     if (!ANNOTATION_KEY_PATTERN.test(key) || !validAnnotationValue(value)) continue;
     if (annotationSerializedBytes({ ...annotations, [key]: value }) > MAX_ANNOTATION_SERIALIZED_BYTES) continue;

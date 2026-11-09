@@ -155,6 +155,8 @@ test("two sessions in one cwd are told apart by their published annotations", { 
     const rendered = page(await first.executeTool("relay_list_peers", {})).content[0].text;
     assert.match(rendered, /"session":"session-second"/);
     assert.match(rendered, /"state":"idle"/);
+    // The untrusted-data note travels with the rendered page.
+    assert.match(rendered, /annotations_note/);
 
     // An update changes the roster output without changing the address.
     await second.emit("session_info_changed", { type: "session_info_changed", name: "reviewer-two" });
