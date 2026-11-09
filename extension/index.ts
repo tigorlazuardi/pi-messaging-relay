@@ -231,6 +231,11 @@ export default function relayExtension(pi: ExtensionAPI): void {
   let annotationSessionID: string | undefined;
   let annotationSessionName: string | undefined;
   let annotationBranch: string | undefined;
+  // The busy/idle state is event-derived: the host clears its idle flag only
+  // after a run settles, so reading ctx.isIdle() at agent_end reports a
+  // finished run as busy. The agent events own the state; the idle flag only
+  // seeds the first value of a fresh session.
+  let annotationState: "idle" | "busy" | undefined;
   let annotationLauncher: AnnotationSet = {};
   const annotationPublisher = new AnnotationPublisher({
     clock: productionAnnotationClock,
@@ -281,19 +286,23 @@ export default function relayExtension(pi: ExtensionAPI): void {
   // Current annotation set: extension-derived keys win over launcher-supplied
   // ones. Every source is best effort; an unusable value is omitted.
   const currentAnnotationSet = (): AnnotationSet => {
-    let state: string | undefined;
-    try {
-      state = activeSessionIdle?.() === false ? "busy" : "idle";
-    } catch {
-      state = undefined;
-    }
     return buildAnnotationSet({
       session: annotationSessionID,
-      state,
+      state: annotationState,
       name: annotationSessionName,
       branch: annotationBranch,
       launcher: annotationLauncher,
     });
+  };
+
+  // Reads the host idle flag once per session. Best effort: a host without
+  // the accessor keeps the idle default.
+  const readIdleState = (): "idle" | "busy" => {
+    try {
+      return activeSessionIdle?.() === false ? "busy" : "idle";
+    } catch {
+      return "idle";
+    }
   };
 
   const publishAnnotations = (force = false): void => {
@@ -675,6 +684,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
     annotationSessionID = undefined;
     annotationSessionName = undefined;
     annotationBranch = undefined;
+    annotationState = undefined;
     annotationLauncher = {};
     connectionStatus = undefined;
     applyStatus();
@@ -704,6 +714,7 @@ export default function relayExtension(pi: ExtensionAPI): void {
     sessionRouteID = generateUUIDv7(now());
     sessionCWD = ctx.cwd;
     activeSessionIdle = () => ctx.isIdle();
+    annotationState = readIdleState();
     annotationSessionID = readSessionManagerString(ctx, "getSessionId");
     annotationSessionName = readSessionManagerString(ctx, "getSessionName");
     annotationLauncher = parseLauncherAnnotations(process.env.PI_RELAY_ANNOTATIONS).annotations;
@@ -740,9 +751,24 @@ export default function relayExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => stopSession(true));
 
   // The busy/idle state and the session name are the two annotation sources
-  // that change during a session.
-  pi.on("agent_start", () => publishAnnotations());
-  pi.on("agent_end", () => publishAnnotations());
+  // that change during a session. The state follows the agent events: the
+  // host clears its idle flag only at agent_settled, so the events — not the
+  // flag — decide what peers see.
+  pi.on("agent_start", () => {
+    annotationState = "busy";
+    publishAnnotations();
+  });
+  pi.on("agent_end", () => {
+    annotationState = "idle";
+    publishAnnotations();
+  });
+  // The authoritative idle edge on hosts that emit it. A host without the
+  // event keeps the agent_end edge.
+  pi.on("agent_settled", () => {
+    if (annotationState === "idle") return;
+    annotationState = "idle";
+    publishAnnotations();
+  });
   pi.on("session_info_changed", (event) => {
     const name = (event as { name?: unknown }).name;
     annotationSessionName = typeof name === "string" && name !== "" ? name : undefined;

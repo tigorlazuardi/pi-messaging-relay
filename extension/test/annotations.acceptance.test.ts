@@ -169,6 +169,23 @@ test("two sessions in one cwd are told apart by their published annotations", { 
     const unfiltered = page(await first.executeTool("relay_list_peers", { filter: "session-second" })).details;
     assert.equal(unfiltered.peers.length, 1);
 
+    // The filter needle is case-insensitive over annotation values.
+    const differentCase = page(await first.executeTool("relay_list_peers", { filter: "REVIEWER-TWO" })).details;
+    assert.equal(differentCase.peers.length, 1);
+    assert.equal(differentCase.peers[0].annotations?.name, "reviewer-two");
+
+    // The busy/idle state follows the agent events, not the host idle flag.
+    await second.emit("agent_start");
+    const busy = await waitForPeer(first, (candidate) => candidate.annotations?.state === "busy");
+    assert.equal(busy.annotations?.session, "session-second");
+
+    // The real host clears its idle flag only after the run settles, so the
+    // flag stays false while the run ends and the peer still converges.
+    second.setIdle(false);
+    await second.emit("agent_end");
+    const idle = await waitForPeer(first, (candidate) => candidate.annotations?.state === "idle");
+    assert.equal(idle.annotations?.session, "session-second");
+
     // No annotation value reaches the extension or server logs.
     const allLogs = [...output.lines, ...extensionLogs].join("\n");
     assert.equal(allLogs.includes("reviewer-two"), false);
