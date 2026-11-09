@@ -175,7 +175,7 @@ test("relay_agent_send crosses real relay and two real extensions before settlin
       sender.executeTool("relay_list_peers", {}),
       "listing peers after offline result",
     ) as { content: Array<{ type: string; text: string }>; details: { peers: Array<{ address: string }> } };
-    assert.deepEqual(rosterAfterOffline.details, { peers: [{ address: recipientAddress }] });
+    assert.deepEqual(rosterAfterOffline.details.peers.map((peer) => peer.address), [recipientAddress]);
     assert.deepEqual(rosterAfterOffline.content, [{
       type: "text",
       text: JSON.stringify(rosterAfterOffline.details),
@@ -253,7 +253,7 @@ test("relay_agent_send crosses real relay and two real extensions before settlin
       sender.executeTool("relay_list_peers", {}),
       "listing peers after local body denial",
     ) as { details: { peers: Array<{ address: string }> } };
-    assert.deepEqual(rosterAfterBodyDenial.details, { peers: [{ address: recipientAddress }] });
+    assert.deepEqual(rosterAfterBodyDenial.details.peers.map((peer) => peer.address), [recipientAddress]);
     recipient.sendMessageAttempts.length = 0;
 
     const objectMarker = "local-object-body-crosses-canonically";

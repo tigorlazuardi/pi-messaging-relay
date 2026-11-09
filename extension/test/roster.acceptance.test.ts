@@ -20,7 +20,7 @@ const TEST_TIMEOUT_MS = 15_000;
 type Output = { iterator: AsyncIterator<string>; lines: string[] };
 type ToolPage = {
   content: Array<{ type: string; text: string }>;
-  details: { peers: Array<{ address: string }>; next_cursor?: string };
+  details: { peers: Array<{ address: string; annotations?: Record<string, string> }>; next_cursor?: string };
 };
 
 async function within<T>(promise: Promise<T>, action: string): Promise<T> {
@@ -61,6 +61,20 @@ async function stop(child: ChildProcessWithoutNullStreams): Promise<void> {
     child.kill("SIGKILL");
     await within(exited, "killing relay");
   }
+}
+
+// Polls the roster until every listed peer carries its published annotation.
+async function waitForAnnotatedPeers(host: FakePiHost, expectedPeers: number): Promise<boolean> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = page(await host.executeTool("relay_list_peers", {}));
+    if (result.details.peers.length === expectedPeers &&
+        result.details.peers.every((peer) => peer.annotations !== undefined)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
 }
 
 function page(result: unknown): ToolPage {
@@ -122,11 +136,21 @@ test("real extensions list live authenticated peers with strict address-only con
       addresses.push(String(accepted.address));
     }
 
+    // Every live peer publishes its idle state as an annotation. Wait for the
+    // first page to carry them so the page comparisons below stay stable.
+    const annotated = await waitForAnnotatedPeers(hosts[0], hosts.length - 1);
+    assert.equal(annotated, true, "peers carry their published annotations");
+
     for (let index = 0; index < hosts.length; index += 1) {
       const result = page(await hosts[index].executeTool("relay_list_peers", {}));
       const expected = addresses.filter((_address, candidate) => candidate !== index).sort();
-      assert.deepEqual(result.details, { peers: expected.map((address) => ({ address })) });
-      assert.equal(/idle|busy|connection_name|client_id|client_public_key/.test(result.content[0].text), false);
+      assert.deepEqual(result.details.peers.map((peer) => peer.address), expected);
+      // The idle state now travels as a peer annotation, never as connection
+      // metadata, and no connection identity leaks into the roster page.
+      assert.equal(/connection_name|client_id|client_public_key/.test(result.content[0].text), false);
+      for (const peer of result.details.peers) {
+        assert.deepEqual(peer.annotations, { state: "idle" });
+      }
       const settled = await nextEvent(output, "operation_settled", (event) => event.type === "list");
       assert.equal(settled.result, "settled");
       assert.equal(settled.count, expected.length);
@@ -144,7 +168,7 @@ test("real extensions list live authenticated peers with strict address-only con
 
     const filtered = page(await hosts[0].executeTool("relay_list_peers", { filter: "Bravo" })).details;
     await nextEvent(output, "operation_settled", (event) => event.type === "list");
-    assert.deepEqual(filtered.peers, [{ address: addresses[3] }]);
+    assert.deepEqual(filtered.peers.map((peer) => peer.address), [addresses[3]]);
     assert.equal((filtered as { next_cursor?: string }).next_cursor, undefined);
 
     await assert.rejects(

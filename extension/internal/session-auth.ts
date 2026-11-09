@@ -2,6 +2,7 @@ import { hostname as operatingSystemHostname } from "node:os";
 
 import WebSocket from "ws";
 
+import { ANNOTATIONS_CAPABILITY, type AnnotationSet } from "./annotations.ts";
 import { RosterClient, type RosterPage, type SendResult } from "./roster-client.ts";
 import type { RelayCardDetails } from "./message-renderer.ts";
 import { generateUUIDv7 } from "./uuid.ts";
@@ -81,7 +82,13 @@ export function startClientHeartbeat(
 type AuthenticatedConnection = {
   socket: WebSocket;
   address: string;
+  /** Capabilities the relay negotiated for this session. An empty list means
+   * the relay speaks the legacy protocol without optional extensions. */
+  capabilities: readonly string[];
   list(cursor: string | undefined, signal: AbortSignal): Promise<RosterPage>;
+  /** Publishes this session's live annotation set. A no-op without the
+   * annotations capability. */
+  annotate(annotations: AnnotationSet): void;
   send(
     to: string,
     body: string | Record<string, unknown>,
@@ -137,8 +144,12 @@ export class SessionSocketAttempt {
     const socket = new WebSocket(options.endpoint, {
       handshakeTimeout: ESTABLISHMENT_TIMEOUT_MS,
       // The secret is the only credential and is checked at the HTTP upgrade; the
-      // post-upgrade hello is unsigned display metadata.
-      headers: options.secret === undefined ? {} : { Authorization: `Bearer ${options.secret}` },
+      // post-upgrade hello is unsigned display metadata. The capability header
+      // selects optional wire extensions and grants no authority.
+      headers: {
+        ...(options.secret === undefined ? {} : { Authorization: `Bearer ${options.secret}` }),
+        "X-Relay-Capabilities": ANNOTATIONS_CAPABILITY,
+      },
       maxPayload: MAX_SOCKET_PAYLOAD_BYTES,
       perMessageDeflate: false,
     });
@@ -222,7 +233,7 @@ export class SessionSocketAttempt {
           const frame = parseJSONObject(text);
 
           const address = `${options.cwd}@${hostname}#${options.routeID}`;
-          parseWelcome(frame, requestID, address);
+          const capabilities = parseWelcome(frame, requestID, address);
           this.settled = true;
           cleanHandshakeListeners();
           const onRetainedError = () => {};
@@ -245,7 +256,12 @@ export class SessionSocketAttempt {
           resolve({
             socket,
             address,
+            capabilities,
             list: (cursor, signal) => roster.list(cursor, signal),
+            annotate: (annotations) => {
+              if (!capabilities.includes(ANNOTATIONS_CAPABILITY)) return;
+              roster.annotate(annotations);
+            },
             send: (to, body, re, signal) => roster.send(to, body, re, signal),
             closeAndWait: () => closeAndWait(socket),
           });
@@ -288,14 +304,20 @@ function hasExactKeys(value: Record<string, unknown>, expected: readonly string[
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
-function parseWelcome(frame: Record<string, unknown>, requestID: string, address: string): void {
+/**
+ * Parses one welcome envelope and returns the negotiated capabilities. A
+ * legacy relay sends the exact three-field payload; a capable relay adds one
+ * capabilities array. Unknown capability entries are ignored.
+ */
+function parseWelcome(frame: Record<string, unknown>, requestID: string, address: string): string[] {
   if (!hasExactKeys(frame, ["v", "type", "request_id", "payload"]) ||
       frame.v !== 1 || frame.type !== "welcome" || frame.request_id !== requestID) {
     throw new SessionEstablishmentError("invalid_welcome", "Relay welcome envelope is invalid.");
   }
   const payload = frame.payload;
   if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
-      !hasExactKeys(payload as Record<string, unknown>, ["self_address", "heartbeat_ms", "max_body_bytes"])) {
+      (!hasExactKeys(payload as Record<string, unknown>, ["self_address", "heartbeat_ms", "max_body_bytes"]) &&
+       !hasExactKeys(payload as Record<string, unknown>, ["self_address", "heartbeat_ms", "max_body_bytes", "capabilities"]))) {
     throw new SessionEstablishmentError("invalid_welcome", "Relay welcome payload is invalid.");
   }
   const welcome = payload as Record<string, unknown>;
@@ -303,6 +325,12 @@ function parseWelcome(frame: Record<string, unknown>, requestID: string, address
       welcome.max_body_bytes !== MAX_BODY_BYTES) {
     throw new SessionEstablishmentError("invalid_welcome", "Relay welcome values do not match this session.");
   }
+  if (!("capabilities" in welcome)) return [];
+  const advertised = welcome.capabilities;
+  if (!Array.isArray(advertised) || advertised.some((entry) => typeof entry !== "string")) {
+    throw new SessionEstablishmentError("invalid_welcome", "Relay welcome capabilities are invalid.");
+  }
+  return advertised as string[];
 }
 
 function validateDisplayMetadata(value: string, maximumBytes: number, name: string): void {

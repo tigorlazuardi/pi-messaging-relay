@@ -106,6 +106,47 @@ test("roster client sends one UUIDv7 list and returns deterministic address-only
   assert.equal(JSON.stringify(result), '{"peers":[{"address":"alpha"},{"address":"beta"}],"next_cursor":"cur_YmV0YQ"}');
 });
 
+test("roster client keeps peer annotations and drops an invalid peer set", async (context) => {
+  const pair = await socketPair();
+  context.after(pair.close);
+  const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+  const requestPromise = nextClientRequest(pair.server);
+  const resultPromise = client.list(undefined, new AbortController().signal);
+  const request = await requestPromise;
+
+  pair.server.send(roster(String(request.request_id), {
+    peers: [
+      { address: "alpha", annotations: { name: "alice", state: "idle" } },
+      { address: "beta", annotations: { "bad key": "value" } },
+      { address: "charlie" },
+    ],
+  }));
+  const result = await resultPromise;
+  assert.deepEqual(result, {
+    peers: [
+      { address: "alpha", annotations: { name: "alice", state: "idle" } },
+      { address: "beta" },
+      { address: "charlie" },
+    ],
+  });
+});
+
+test("roster client rejects a peer whose annotations are not a plain string map", async (context) => {
+  for (const annotations of [[], 42, "text", { name: 42 }]) {
+    const pair = await socketPair();
+    const client = new RosterClient(pair.client, { responseTimeoutMS: 1_000 });
+    const requestPromise = nextClientRequest(pair.server);
+    const resultPromise = client.list(undefined, new AbortController().signal);
+    const request = await requestPromise;
+    pair.server.send(roster(String(request.request_id), {
+      peers: [{ address: "alpha", annotations }],
+    }));
+    const result = await resultPromise;
+    assert.deepEqual(result, { peers: [{ address: "alpha" }] });
+    await pair.close();
+  }
+});
+
 test("roster client rejects concurrent list locally without sending or queueing", async (context) => {
   const pair = await socketPair();
   context.after(pair.close);

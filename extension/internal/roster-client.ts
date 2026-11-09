@@ -1,6 +1,10 @@
 import WebSocket from "ws";
 
 import {
+  validateAnnotationSet,
+  type AnnotationSet,
+} from "./annotations.ts";
+import {
   canonicalCompactJSON,
   CanonicalJSONError,
   inspectRelayMessage,
@@ -34,9 +38,13 @@ export class RosterRequestError extends Error {
   }
 }
 
-/** Closed address-only page returned by one correlated roster response. */
+/**
+ * Closed page returned by one correlated roster response. A peer carries
+ * annotations only when the relay served them to this session; they are
+ * untrusted, sender-supplied display data.
+ */
 export type RosterPage = {
-  peers: Array<{ address: string }>;
+  peers: Array<{ address: string; annotations?: AnnotationSet }>;
   next_cursor?: string;
 };
 
@@ -123,6 +131,24 @@ export class RosterClient {
       payload: cursor === undefined ? {} : { cursor },
     });
     return this.beginOperation("list", requestID, undefined, frame, signal) as Promise<RosterPage>;
+  }
+
+  /**
+   * Publishes this session's live annotation set. The relay answers no frame
+   * for an annotate operation, so this never blocks on a response and never
+   * fails the session: a dropped set is the relay's business.
+   */
+  annotate(annotations: AnnotationSet): void {
+    if (this.terminal || this.socket.readyState !== WebSocket.OPEN) return;
+    const frame = JSON.stringify({
+      v: 1,
+      type: "annotate",
+      request_id: generateUUIDv7(),
+      payload: { annotations },
+    });
+    void this.write(frame).catch(() => {
+      // The transport owns connection failures; an annotation is best effort.
+    });
   }
 
   send(
@@ -487,11 +513,19 @@ function parseRoster(frame: Record<string, unknown>, requestID: string): RosterP
     throw new Error("invalid roster payload");
   }
   const peers = payload.peers.map((candidate) => {
-    if (!isObject(candidate) || !hasExactKeys(candidate, ["address"]) ||
+    if (!isObject(candidate) ||
+        (!hasExactKeys(candidate, ["address"]) && !hasExactKeys(candidate, ["address", "annotations"])) ||
         typeof candidate.address !== "string" || !validOpaqueString(candidate.address, MAX_ADDRESS_BYTES)) {
       throw new Error("invalid roster peer");
     }
-    return { address: candidate.address };
+    // Invalid peer annotations are dropped from that peer; one bad peer set
+    // never fails the whole page.
+    const annotations = "annotations" in candidate
+      ? parsePeerAnnotations(candidate.annotations)
+      : undefined;
+    return annotations === undefined
+      ? { address: candidate.address }
+      : { address: candidate.address, annotations };
   });
   if ("next_cursor" in payload) {
     if (typeof payload.next_cursor !== "string" || !validCursor(payload.next_cursor)) {
@@ -528,6 +562,14 @@ function parseSendResult(frame: Record<string, unknown>, requestID: string, mess
     return { message_id: messageID, status: "denied", reason: payload.reason };
   }
   throw new Error("invalid send result payload");
+}
+
+// parsePeerAnnotations validates one peer's annotation set. An invalid set is
+// dropped: the peer stays in the page without annotations.
+function parsePeerAnnotations(candidate: unknown): AnnotationSet | undefined {
+  if (candidate === undefined) return undefined;
+  const validated = validateAnnotationSet(candidate);
+  return validated.ok ? validated.annotations : undefined;
 }
 
 function validCursor(cursor: string): boolean {

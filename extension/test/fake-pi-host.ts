@@ -43,6 +43,12 @@ export class FakePiHost {
   sessionFile: string | undefined = undefined;
   /** Host mode reported on ctx; default mirrors no-UI hosts for diagnostic streaming. */
   mode = "print";
+  /** Pi session id reported through ctx.sessionManager; undefined mirrors a
+   * host without that accessor. */
+  sessionID: string | undefined = undefined;
+  /** Pi session name reported through ctx.sessionManager; undefined mirrors a
+   * host without a named session. */
+  sessionName: string | undefined = undefined;
   private idle = true;
   private nextIdleCheckError: Error | undefined;
   private nextSendUserMessageError: Error | undefined;
@@ -171,6 +177,8 @@ export class FakePiHost {
         sessionManager: {
           getEntries: () => [...this.sessionEntries],
           getSessionFile: () => this.sessionFile,
+          getSessionId: () => this.sessionID,
+          getSessionName: () => this.sessionName,
         },
         isIdle: () => {
           const error = this.nextIdleCheckError;
