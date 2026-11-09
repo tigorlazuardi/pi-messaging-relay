@@ -23,6 +23,12 @@ const (
 	maxCWDBytes           = 4096
 	maxHostnameBytes      = 255
 	heartbeatMilliseconds = 30_000
+	// capabilityHeaderName carries the optional protocol capabilities a
+	// client supports. It is unsigned display metadata on the HTTP upgrade:
+	// it selects optional wire extensions and grants no authority.
+	capabilityHeaderName = "X-Relay-Capabilities"
+	// annotationsCapability is the only negotiated capability today.
+	annotationsCapability = "annotations"
 	// ponytail: fixed to the advertised 30 s liveness cadence; the ping write
 	// gets one full interval before the watchdog declares the transport dead.
 	// Make configurable when another deployment profile exists.
@@ -43,6 +49,11 @@ type helloPayload struct {
 	RouteID  string
 	Hostname string
 	CWD      string
+	// Annotations carries the optional initial annotation set. It is accepted
+	// only from a session that negotiated the annotations capability; a hello
+	// with annotations from any other session stays an unknown-field
+	// rejection.
+	Annotations json.RawMessage
 }
 
 type welcomeEnvelope struct {
@@ -56,6 +67,10 @@ type welcomePayload struct {
 	SelfAddress  string `json:"self_address"`
 	HeartbeatMS  int    `json:"heartbeat_ms"`
 	MaxBodyBytes int    `json:"max_body_bytes"`
+	// Capabilities is present only for sessions that negotiated optional
+	// protocol extensions. A legacy session receives the exact three-field
+	// welcome payload.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 type websocketErrorEnvelope struct {
@@ -76,6 +91,13 @@ type authenticatedSession struct {
 	Hostname string
 	CWD      string
 	Address  string
+	// Annotations is the live, ephemeral, replace-all metadata this session
+	// published about itself. It lives only in this session entry, is never
+	// persisted, replayed, or logged with values, and dies with the session.
+	Annotations map[string]string
+	// AnnotationsCapable records that this session negotiated the annotations
+	// capability on its WebSocket upgrade request.
+	AnnotationsCapable bool
 }
 
 type trackedSessionConnection struct {
@@ -458,7 +480,8 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	establishContext, cancelEstablish := context.WithTimeout(context.Background(), service.establishmentTimeout)
 	defer cancelEstablish()
 
-	hello, err := readHello(establishContext, connection)
+	annotationsCapable := negotiatedAnnotations(request.Header.Get(capabilityHeaderName))
+	hello, err := readHello(establishContext, connection, annotationsCapable)
 	if err != nil {
 		service.logRejected("invalid_hello", started, "", "")
 		_ = connection.CloseNow()
@@ -466,10 +489,11 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 	}
 	address := hello.Payload.CWD + "@" + hello.Payload.Hostname + "#" + hello.Payload.RouteID
 	session := &authenticatedSession{
-		RouteID:  hello.Payload.RouteID,
-		Hostname: hello.Payload.Hostname,
-		CWD:      hello.Payload.CWD,
-		Address:  address,
+		RouteID:            hello.Payload.RouteID,
+		Hostname:           hello.Payload.Hostname,
+		CWD:                hello.Payload.CWD,
+		Address:            address,
+		AnnotationsCapable: annotationsCapable,
 	}
 	switch service.connections.reserveAuthentication(entry, session) {
 	case sessionRegistryClosing:
@@ -494,6 +518,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 			SelfAddress:  address,
 			HeartbeatMS:  heartbeatMilliseconds,
 			MaxBodyBytes: maxBodyBytes,
+			Capabilities: negotiatedCapabilities(session),
 		},
 	}); err != nil {
 		service.logRejected(
@@ -508,6 +533,7 @@ func (service *sessionAuthService) handleConnect(response http.ResponseWriter, r
 		_ = connection.CloseNow()
 		return
 	}
+	service.applyHelloAnnotations(session, hello.Payload.Annotations)
 	service.writeAudit(logEvent{
 		Level:     "info",
 		Event:     "auth_accepted",
@@ -591,6 +617,64 @@ func (service *sessionAuthService) authorizeUpgrade(header string) bool {
 	return equalSecret(service.secret, submitted)
 }
 
+// applyHelloAnnotations applies the optional initial annotation set from one
+// hello. An invalid set is dropped: the session keeps an empty set, the
+// registration succeeds, and the socket stays healthy.
+func (service *sessionAuthService) applyHelloAnnotations(
+	session *authenticatedSession,
+	raw json.RawMessage,
+) {
+	if len(raw) == 0 {
+		return
+	}
+	set, reason := decodeAnnotationMap(raw)
+	if reason != "" {
+		service.writeAudit(logEvent{
+			Level:   "warn",
+			Event:   "annotations_dropped",
+			Result:  "dropped",
+			Type:    "hello",
+			Address: session.Address,
+			Reason:  reason,
+		})
+		return
+	}
+	service.connections.replaceAnnotations(session, set)
+	count := len(set)
+	service.writeAudit(logEvent{
+		Level:   "info",
+		Event:   "annotations_accepted",
+		Result:  "accepted",
+		Type:    "hello",
+		Address: session.Address,
+		Count:   &count,
+	})
+}
+
+// negotiatedAnnotations reports whether one upgrade request asked for the
+// annotations capability. The header value is an unordered, comma or space
+// separated token list; an unknown token is ignored.
+func negotiatedAnnotations(header string) bool {
+	for _, token := range strings.FieldsFunc(header, func(character rune) bool {
+		return character == ',' || character == ' ' || character == '\t'
+	}) {
+		if strings.EqualFold(token, annotationsCapability) {
+			return true
+		}
+	}
+	return false
+}
+
+// negotiatedCapabilities lists the capabilities one session may use. A
+// session without negotiated capabilities receives the exact legacy welcome
+// payload without a capabilities field.
+func negotiatedCapabilities(session *authenticatedSession) []string {
+	if session == nil || !session.AnnotationsCapable {
+		return nil
+	}
+	return []string{annotationsCapability}
+}
+
 func (service *sessionAuthService) logRejected(
 	reason string,
 	started time.Time,
@@ -623,7 +707,11 @@ func writeUpgradeUnauthorized(response http.ResponseWriter) {
 	_, _ = io.WriteString(response, `{"error":"not_authorized","message":"Authentication is required"}`)
 }
 
-func readHello(ctx context.Context, connection *websocket.Conn) (helloEnvelope, error) {
+func readHello(
+	ctx context.Context,
+	connection *websocket.Conn,
+	annotationsAllowed bool,
+) (helloEnvelope, error) {
 	messageType, reader, err := connection.Reader(ctx)
 	if err != nil {
 		return helloEnvelope{}, err
@@ -641,10 +729,16 @@ func readHello(ctx context.Context, connection *websocket.Conn) (helloEnvelope, 
 	if !utf8.Valid(data) {
 		return helloEnvelope{}, errors.New("hello must be valid UTF-8")
 	}
-	return decodeHello(data)
+	return decodeHelloWithAnnotations(data, annotationsAllowed)
 }
 
 func decodeHello(data []byte) (helloEnvelope, error) {
+	return decodeHelloWithAnnotations(data, false)
+}
+
+// decodeHelloWithAnnotations decodes one hello envelope. The annotations
+// field is optional and only a capability-negotiated session may send it.
+func decodeHelloWithAnnotations(data []byte, annotationsAllowed bool) (helloEnvelope, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	opening, err := decoder.Token()
 	if err != nil || opening != json.Delim('{') {
@@ -665,7 +759,7 @@ func decodeHello(data []byte) (helloEnvelope, error) {
 		case "request_id":
 			err = decoder.Decode(&hello.RequestID)
 		case "payload":
-			hello.Payload, err = decodeHelloPayload(decoder)
+			hello.Payload, err = decodeHelloPayload(decoder, annotationsAllowed)
 		default:
 			return helloEnvelope{}, fmt.Errorf("unknown hello field %q", name)
 		}
@@ -691,7 +785,7 @@ func decodeHello(data []byte) (helloEnvelope, error) {
 	return hello, nil
 }
 
-func decodeHelloPayload(decoder *json.Decoder) (helloPayload, error) {
+func decodeHelloPayload(decoder *json.Decoder, annotationsAllowed bool) (helloPayload, error) {
 	opening, err := decoder.Token()
 	if err != nil || opening != json.Delim('{') {
 		return helloPayload{}, errors.New("hello payload must be an object")
@@ -711,6 +805,14 @@ func decodeHelloPayload(decoder *json.Decoder) (helloPayload, error) {
 			target = &payload.Hostname
 		case "cwd":
 			target = &payload.CWD
+		case "annotations":
+			if !annotationsAllowed {
+				return helloPayload{}, fmt.Errorf("unknown hello payload field %q", name)
+			}
+			if err := decoder.Decode(&payload.Annotations); err != nil {
+				return helloPayload{}, fmt.Errorf("decode hello payload field %q: %w", name, err)
+			}
+			continue
 		default:
 			return helloPayload{}, fmt.Errorf("unknown hello payload field %q", name)
 		}
@@ -721,8 +823,10 @@ func decodeHelloPayload(decoder *json.Decoder) (helloPayload, error) {
 	if err := closeJSONObject(decoder); err != nil {
 		return helloPayload{}, err
 	}
-	if len(seen) != 3 {
-		return helloPayload{}, errors.New("hello payload fields are missing")
+	for _, required := range []string{"route_id", "hostname", "cwd"} {
+		if _, exists := seen[required]; !exists {
+			return helloPayload{}, errors.New("hello payload fields are missing")
+		}
 	}
 	return payload, nil
 }

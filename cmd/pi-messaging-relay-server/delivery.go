@@ -80,10 +80,39 @@ func (dispatcher *deliveryDispatcher) dispatch(
 		dispatcher.receive(session, operation.Received)
 		return operationResponse{}, false, nil
 	}
+	if operation.Type == "annotate" && operation.Annotate != nil {
+		return dispatcher.annotate(session, operation)
+	}
 	if operation.Type != "send" || operation.Send == nil {
 		return operationResponse{}, false, nil
 	}
 	return dispatcher.send(ctx, session, operation)
+}
+
+// annotate applies one replace-all annotation update to the live session
+// entry. A rejected set keeps the previous set and never produces a response
+// frame, so the socket stays healthy.
+func (dispatcher *deliveryDispatcher) annotate(
+	session *authenticatedSession,
+	operation clientOperation,
+) (operationResponse, bool, error) {
+	if operation.Annotate.Reason != "" {
+		return operationResponse{
+			Outcome: "dropped",
+			Code:    operation.Annotate.Reason,
+		}, false, nil
+	}
+	annotations := make(map[string]string, len(operation.Annotate.Annotations))
+	for key, value := range operation.Annotate.Annotations {
+		annotations[key] = value
+	}
+	dispatcher.registry.replaceAnnotations(session, annotations)
+	count := len(annotations)
+	return operationResponse{
+		Outcome:   "settled",
+		Code:      "annotations",
+		PeerCount: &count,
+	}, false, nil
 }
 
 func (dispatcher *deliveryDispatcher) send(

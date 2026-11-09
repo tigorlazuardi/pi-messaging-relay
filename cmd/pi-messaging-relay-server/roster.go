@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"maps"
 	"sort"
 	"unicode/utf8"
 )
@@ -13,6 +14,10 @@ const maxRosterFrameBytes = 48 * 1024
 
 type rosterPeer struct {
 	Address string `json:"address"`
+	// Annotations is present only for a capable requester and only for a peer
+	// that published a non-empty set. A legacy requester receives the exact
+	// legacy address-only peer shape.
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 type rosterPayload struct {
@@ -20,18 +25,51 @@ type rosterPayload struct {
 	NextCursor string       `json:"next_cursor,omitempty"`
 }
 
-func (registry *sessionConnectionRegistry) authenticatedAddressSnapshot(caller *authenticatedSession) []string {
+// authenticatedPeerSnapshot returns the live peers of one caller in address
+// order. Annotations are attached only when the caller negotiated the
+// annotations capability.
+func (registry *sessionConnectionRegistry) authenticatedPeerSnapshot(caller *authenticatedSession) []rosterPeer {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 
-	addresses := make([]string, 0, len(registry.entries))
+	peers := make([]rosterPeer, 0, len(registry.entries))
+	includeAnnotations := caller != nil && caller.AnnotationsCapable
 	for entry := range registry.entries {
-		if !entry.visible || entry.session == nil || entry.session == caller || entry.session.Address == caller.Address {
+		if !entry.visible || entry.session == nil || entry.session == caller ||
+			entry.session.Address == caller.Address {
 			continue
 		}
-		addresses = append(addresses, entry.session.Address)
+		peer := rosterPeer{Address: entry.session.Address}
+		if includeAnnotations && len(entry.session.Annotations) > 0 {
+			peer.Annotations = maps.Clone(entry.session.Annotations)
+		}
+		peers = append(peers, peer)
 	}
-	return addresses
+	sort.Slice(peers, func(left, right int) bool {
+		return peers[left].Address < peers[right].Address
+	})
+	return peers
+}
+
+// replaceAnnotations stores one session's live annotation set. The set is
+// replace-all, lives only in the session entry, and is never persisted.
+func (registry *sessionConnectionRegistry) replaceAnnotations(
+	session *authenticatedSession,
+	annotations map[string]string,
+) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for entry := range registry.entries {
+		if entry.session != session {
+			continue
+		}
+		if len(annotations) == 0 {
+			entry.session.Annotations = nil
+			return
+		}
+		entry.session.Annotations = maps.Clone(annotations)
+		return
+	}
 }
 
 func rosterOperationDispatcher(registry *sessionConnectionRegistry) operationDispatcher {
@@ -43,13 +81,16 @@ func rosterOperationDispatcher(registry *sessionConnectionRegistry) operationDis
 		if operation.Type != "list" || operation.List == nil {
 			return operationResponse{}, false, nil
 		}
-		addresses := registry.authenticatedAddressSnapshot(session)
-		sort.Strings(addresses)
+		peers := registry.authenticatedPeerSnapshot(session)
+		addresses := make([]string, len(peers))
+		for index, peer := range peers {
+			addresses[index] = peer.Address
+		}
 		first := sort.SearchStrings(addresses, operation.List.AfterAddress)
 		for first < len(addresses) && addresses[first] <= operation.List.AfterAddress {
 			first++
 		}
-		page, err := buildRosterPage(operation, addresses[first:])
+		page, err := buildRosterPage(operation, peers[first:])
 		if err != nil {
 			return operationResponse{}, false, err
 		}
@@ -64,15 +105,13 @@ func rosterOperationDispatcher(registry *sessionConnectionRegistry) operationDis
 	}
 }
 
-func buildRosterPage(operation clientOperation, addresses []string) (rosterPayload, error) {
-	peers := make([]rosterPeer, len(addresses))
-	peerSizes := make([]int, len(addresses))
-	for index, address := range addresses {
-		if address == "" || len(address) > maxAddressBytes || !utf8.ValidString(address) {
+func buildRosterPage(operation clientOperation, peers []rosterPeer) (rosterPayload, error) {
+	peerSizes := make([]int, len(peers))
+	for index, peer := range peers {
+		if peer.Address == "" || len(peer.Address) > maxAddressBytes || !utf8.ValidString(peer.Address) {
 			return rosterPayload{}, errors.New("registry supplied an invalid authenticated address")
 		}
-		peers[index] = rosterPeer{Address: address}
-		encoded, err := json.Marshal(peers[index])
+		encoded, err := json.Marshal(peer)
 		if err != nil {
 			return rosterPayload{}, errors.New("authenticated address cannot be encoded")
 		}
