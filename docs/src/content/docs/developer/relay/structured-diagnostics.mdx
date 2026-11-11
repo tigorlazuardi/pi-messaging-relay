@@ -33,7 +33,11 @@ The interactive TUI mutes stderr diagnostics, so its record lives in one JSONL f
 | `operation_settled` | `info` | `result`, `reason`, `code`, `type`, request correlation and outcome-specific fields, `latency_ms` |
 | `operation_denied` | `warn` | `result: "denied"`, `reason`, `code`, `type`, available correlation and route fields, `latency_ms` |
 | `send_settled` | `info` | `result: "settled"`, `reason`, `code`, request/message correlation, available delivery and routes, `status`, `body`, `latency_ms` |
+| `annotations_accepted` | `info` | `result: "accepted"`, `type` (`hello` or `annotate`), address, `count` |
+| `annotations_dropped` | `warn` | `result: "dropped"`, `type` (`hello` or `annotate`), address, `reason` |
 | `server_stopped` | `info` | `result: "graceful"`, `address` |
+
+The two annotation events carry no annotation key and no annotation value: an accepted set reports only its key `count`, and a dropped set reports only a stable `reason` (`invalid_payload`, `invalid_key`, `invalid_value`, `too_many_keys`, `too_large`, `duplicate_key`).
 
 `session_capacity_rejected` and `protocol_rejected` are recoverable server warnings with stable `result` and stable `reason`/`code` as applicable. An upgrade rejection before any WebSocket exists is `auth_rejected` with `reason: "not_authorized"` and no request or route field; post-hello rejections (`invalid_hello`, `route_conflict`, `welcome_failed`) add the hello request ID when available.
 

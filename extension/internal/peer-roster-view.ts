@@ -16,9 +16,16 @@ const UUID_DASHED_LENGTH = 36;
 
 /** Injected roster transport so the view never touches sockets directly. */
 export type RosterListFunction = (cursor: string | undefined) => Promise<{
-  peers?: Array<{ address?: unknown }>;
+  peers?: Array<{ address?: unknown; annotations?: unknown }>;
   next_cursor?: unknown;
 }>;
+
+/** One collected roster peer. Annotations are untrusted, sender-supplied
+ * display data and are kept only when they are a plain string map. */
+export type CollectedRosterPeer = {
+  address: string;
+  annotations?: Record<string, string>;
+};
 
 export type PeerRosterPeer = {
   cwd: string;
@@ -56,21 +63,27 @@ export function parsePeerAddress(address: string): PeerRosterPeer {
 }
 
 /** Walks injected roster pages until exhaustion or the fixed page budget,
- * returning the collected addresses and whether the walk hit the budget.
+ * returning the collected peers and whether the walk hit the budget.
  * Shared by the /relay-peers display snapshot and the filtered
  * relay_list_peers tool path. */
-export async function collectRosterAddresses(
+export async function collectRosterPeers(
   list: RosterListFunction,
-): Promise<{ addresses: string[]; truncated: boolean }> {
-  const addresses: string[] = [];
+): Promise<{ peers: CollectedRosterPeer[]; truncated: boolean }> {
+  const peers: CollectedRosterPeer[] = [];
   let cursor: string | undefined;
   let truncated = true;
   for (let page = 0; page < MAX_ROSTER_PAGES; page += 1) {
     const result = await list(cursor);
-    const peers = Array.isArray(result?.peers) ? result.peers : [];
-    for (const peer of peers) {
+    const page1 = Array.isArray(result?.peers) ? result.peers : [];
+    for (const peer of page1) {
       if (peer !== null && typeof peer === "object" && typeof peer.address === "string") {
-        addresses.push(peer.address);
+        const annotations = peer.annotations !== null && typeof peer.annotations === "object" &&
+          !Array.isArray(peer.annotations)
+          ? peer.annotations as Record<string, string>
+          : undefined;
+        peers.push(annotations === undefined
+          ? { address: peer.address }
+          : { address: peer.address, annotations });
       }
     }
     const next = result?.next_cursor;
@@ -80,7 +93,15 @@ export async function collectRosterAddresses(
     }
     cursor = next;
   }
-  return { addresses, truncated };
+  return { peers, truncated };
+}
+
+/** Walks the roster and returns only the addresses. */
+export async function collectRosterAddresses(
+  list: RosterListFunction,
+): Promise<{ addresses: string[]; truncated: boolean }> {
+  const { peers, truncated } = await collectRosterPeers(list);
+  return { addresses: peers.map((peer) => peer.address), truncated };
 }
 
 /** Builds the grouped display snapshot from the collected roster walk. */

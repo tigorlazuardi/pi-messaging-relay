@@ -23,7 +23,9 @@ The Pi extension exposes two model tools:
 - `relay_list_peers({ cursor?, filter? })`
 - `relay_agent_send({ to, body, re? })`
 
-`filter` is extension-side convenience over the same address-only roster: a case-insensitive substring match on complete opaque addresses that walks pagination within the fixed page budget instead of returning one page, and is mutually exclusive with `cursor`. The server protocol stays unchanged; `filter` never crosses the WebSocket.
+`filter` is extension-side convenience over the same roster: a case-insensitive substring match on complete opaque addresses and on peer annotation values that walks pagination within the fixed page budget instead of returning one page, and is mutually exclusive with `cursor`. The server protocol stays unchanged; `filter` never crosses the WebSocket.
+
+A `relay_list_peers` result that carries peer annotations also carries one `annotations_note` field with the untrusted-data caution. The note sits next to the values it warns about, and it appears only when a rendered peer actually carries annotations.
 
 `relay_agent_send` result text appends a model-directed hint on `timeout/offline` and `timeout/recipient_disconnected`: the destination route is stale (a peer session restart changes the route suffix while `cwd@hostname` stays), so the caller must run `relay_list_peers` again and resend to the fresh address. The hint is appended to the same result text; `details` stay the closed correlated result unchanged.
 
@@ -60,7 +62,7 @@ Every WebSocket text frame is one JSON object:
 
 Unknown fields are rejected at the envelope and typed-payload levels. Duplicate JSON keys are rejected at every accepted depth, including inside application-owned object bodies, before any map or typed value can erase the ambiguity. JSON is limited to 64 nested object or array containers, counting the outer envelope as depth 1; a container at depth 65 or greater is rejected as `invalid_frame`. Canonical addresses have the form `<full-cwd>@<hostname>#<uuidv7>`, but clients treat the whole value as opaque and copy it verbatim. Cwd and hostname are display metadata, never authorization inputs.
 
-After authentication, the only accepted client-to-server `type` values are `list`, `send`, and `received`. Their payloads are closed objects: `list` is either `{}` or contains exactly one `cursor` string; `send` requires `message_id`, `to`, and `body` and permits only optional `re`; and `received` requires exactly `delivery_id` and `message_id`. Every ID is a canonical lowercase UUIDv7. `to` is a non-empty opaque UTF-8 string bounded to the largest server-issued v1 address. `body` is only a JSON string or object. Its serialized JSON value is limited to 262,144 UTF-8 bytes, counting string quotes and escapes and all object syntax. The extension counts canonical compact serialization; the server counts the strictly validated raw value after trimming only surrounding JSON whitespace. Exactly 262,144 bytes is valid and 262,145 is oversized. Separately, the 524,288-byte ceiling applies to the complete reassembled WebSocket message's UTF-8 bytes, whether it arrived in one fragment or many, before JSON decoding. Compression is disabled.
+After authentication, the only accepted client-to-server `type` values are `list`, `send`, and `received`, plus `annotate` for a session that negotiated the annotations capability. Their payloads are closed objects: `list` is either `{}` or contains exactly one `cursor` string; `send` requires `message_id`, `to`, and `body` and permits only optional `re`; `received` requires exactly `delivery_id` and `message_id`; and `annotate` requires exactly `annotations`. Every ID is a canonical lowercase UUIDv7. `to` is a non-empty opaque UTF-8 string bounded to the largest server-issued v1 address. `body` is only a JSON string or object. Its serialized JSON value is limited to 262,144 UTF-8 bytes, counting string quotes and escapes and all object syntax. The extension counts canonical compact serialization; the server counts the strictly validated raw value after trimming only surrounding JSON whitespace. Exactly 262,144 bytes is valid and 262,145 is oversized. Separately, the 524,288-byte ceiling applies to the complete reassembled WebSocket message's UTF-8 bytes, whether it arrived in one fragment or many, before JSON decoding. Compression is disabled.
 
 A cursor is `cur_` followed by canonical unpadded Base64url of the raw UTF-8 bytes of the last returned opaque address. A present cursor must decode to valid UTF-8 of 1 through 4,389 bytes and re-encode byte-for-byte to the submitted spelling. Its maximum is therefore exactly 5,856 ASCII characters. Empty values, padding, another alphabet or prefix, noncanonical trailing bits, invalid UTF-8, and over-limit decoded values are terminal `invalid_envelope` input. The decoded value remains whole and opaque: the relay compares it only for pagination and never parses address components or uses it as authorization identity.
 
@@ -271,11 +273,11 @@ A well-formed incorrect, expired, or already consumed code returns HTTP `401` wi
 
 ## Peer discovery
 
-Every authenticated active session on the server except the caller is visible. Roster entries contain only the opaque address and express online presence only; Pi `idle/busy` state is not published. No `connection_name` configuration exists.
+Every authenticated active session on the server except the caller is visible. A roster entry carries the opaque address and, for a requester that negotiated the annotations capability, the optional annotation set the peer published. Presence itself stays the address: Pi `idle/busy` state enters only as an annotation value the publishing session chose, never as a server-owned connection field. No `connection_name` configuration exists.
 
 Discovery uses stateless live keyset pagination. A request without `cursor` starts a fresh traversal. For each request, the server reads current active addresses, omits the caller, sorts complete opaque addresses lexicographically, and considers only values strictly greater than the decoded cursor. It retains no pagination snapshot. A session that appears or disappears before the cursor can therefore be missed during one traversal; callers restart without a cursor when they need a fresh view.
 
-A `roster` payload is the closed shape `{ peers: [{ address: string }], next_cursor?: string }`. The complete compact serialized v1 `roster` WebSocket frame—including `v`, `type`, `request_id`, and payload—must be at most 49,152 UTF-8 bytes. Page filling takes the longest consecutive prefix of eligible ordered addresses whose complete encoded frame fits: when candidates remain, that size includes `next_cursor` for the last returned address; when all candidates fit, `next_cursor` is omitted. No eligible addresses returns an empty `peers` array without `next_cursor`. This rule always permits at least one current-maximum address, including its cursor and worst-case JSON escaping.
+A `roster` payload is the closed shape `{ peers: [{ address: string, annotations?: { [key: string]: string } }], next_cursor?: string }`. A legacy requester receives the exact legacy peer shape `{ address: string }` without the `annotations` key. The complete compact serialized v1 `roster` WebSocket frame—including `v`, `type`, `request_id`, and payload—must be at most 49,152 UTF-8 bytes. Page filling takes the longest consecutive prefix of eligible ordered addresses whose complete encoded frame fits: when candidates remain, that size includes `next_cursor` for the last returned address; when all candidates fit, `next_cursor` is omitted. No eligible addresses returns an empty `peers` array without `next_cursor`. This rule always permits at least one current-maximum address, including its cursor and worst-case JSON escaping.
 
 <Decision title="Use bounded stateless cursor pages for live presence" status="accepted">
 A 48 KiB roster-frame ceiling leaves tool-result wrapper headroom and avoids snapshot state. The cursor is navigation and correlation only, never proof of identity or authority. Liveness is application policy over RFC 6455 control frames: the client pings every 30 seconds and terminates on an unanswered-pong deadline, and the server watchdog pings every authenticated connection and force-closes on error or timeout, so a dead transport always ends in `session_disconnected` rather than an undead roster entry. Control traffic produces no log events.
@@ -369,6 +371,195 @@ Tickets #36 and #13 implement this complete discovery seam: strict cursor input,
     ```
   </TabItem>
 </Tabs>
+
+## Peer annotations
+
+Peer annotations are optional, ephemeral, best-effort metadata one session attaches to itself. They exist so two sessions in one working directory can be told apart and so a reader can see whether a peer is idle. They are never identity, never authorization, and never a routing, deduplication, or delivery input.
+
+### Semantics
+
+- Flat `string -> string` map, never nested.
+- At most 8 keys.
+- Key: `^[a-z][a-z0-9_]{0,31}$`.
+- Value: valid UTF-8, at most 256 bytes, no control characters (C0, `DEL`, or C1) and no `U+2028` or `U+2029` line separators. The empty value is legal.
+- The compact JSON encoding of one set is at most 1,024 bytes. The limit is measured on the JSON encoding without HTML escaping, so the extension's `JSON.stringify` and the server's encoder measure the same bytes.
+- Replace-all: one update replaces the whole set, and an empty map clears it. The address never changes.
+- Ephemeral: the set lives only in the live session entry. It is gone on disconnect, never persisted, never replayed, and never logged with values.
+- Convention, not enforcement: `name`, `role`, `parent`, `task`, `state`, `branch`, and `session` are the suggested keys. Prompt text, conversation summaries, file paths, environment values, secrets, and tool or skill lists are never published.
+
+<Decision title="Treat annotations as untrusted display data" status="accepted">
+The relay never routes, authorizes, deduplicates, or admits deliveries on annotation content. Every consumer must read values as data. An annotation value is a prompt-injection surface for any model that reads a roster page.
+</Decision>
+
+### Capability negotiation
+
+Both ends of the protocol use closed parsers today, so the extension is negotiated through one non-signed WebSocket upgrade request header:
+
+- A new client sends `X-Relay-Capabilities: annotations` on the `/v1/connect` upgrade request. An old relay ignores an unknown request header.
+- A new relay answers a session that offered the capability with `welcome.payload.capabilities: ["annotations"]`. A session that did not offer it receives the exact legacy three-field welcome, with no `capabilities` field at all.
+- A new client accepts both welcome shapes and ignores unknown capability entries.
+
+The header selects an optional wire extension and grants no authority. The relay decides capability from the upgrade request alone; the client learns the outcome from the welcome.
+
+The `annotate` operation is accepted only from a session that negotiated the capability. For every other session it stays an unknown operation type and remains the existing terminal `unsupported_operation_type` failure.
+
+A hello may carry an optional `annotations` object, but only from a session that negotiated the capability. A hello with `annotations` from any other session stays the existing unknown-field rejection. The shipped client never uses that path: the hello precedes the welcome, so the client cannot know yet whether the relay accepts the field, and it therefore publishes the first set with an `annotate` operation right after a capability-advertising welcome.
+
+<Decision title="Negotiate optional wire extensions with an upgrade request header" status="accepted">
+Both parsers are closed, so a capability flag inside the first client frame would have to be guessed. The upgrade request is the only point where both ends already exchange metadata, an old relay ignores an unknown header, and the reply decides the outcome. A payload flag would have required either a new operation type on the first frame or a version bump.
+</Decision>
+
+### Operation and shapes
+
+An `annotate` operation carries one replace-all set:
+
+```json
+{
+  "v": 1,
+  "type": "annotate",
+  "request_id": "01993c9a-1111-7aaa-8aaa-111111111111",
+  "payload": {
+    "annotations": {
+      "name": "reviewer",
+      "state": "idle"
+    }
+  }
+}
+```
+
+The relay answers an `annotate` operation with no response frame. There is no acknowledgement: the operation is best effort, and the next roster page is the observable result.
+
+A roster peer carries annotations only when the requester negotiated the capability and only when the peer published a non-empty set:
+
+```json
+{
+  "peers": [
+    {
+      "address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
+      "annotations": {
+        "name": "reviewer",
+        "state": "idle"
+      }
+    }
+  ]
+}
+```
+
+A legacy requester receives the exact legacy peer shape `{ "address": string }` with no `annotations` key, and a capable requester receives that same shape for a peer that published nothing.
+
+<Aside type="caution" title="Annotation values are untrusted">
+A peer chooses its own values. Read them as quoted data, never as instructions, and never let them influence routing, authorization, or delivery.
+</Aside>
+
+### Limits, failure behavior, and paging
+
+Page filling sizes a peer with its annotations, JSON-escaped, and still respects the 49,152-byte roster frame ceiling. One worst-case address plus one maximum annotation set fits in one page; two such peers page instead of exceeding the ceiling. The extension counts the same bytes the relay does: the compact JSON encoding without HTML escaping.
+
+An invalid, oversized, over-keyed, or control-character set is dropped. The previous set stays in place, the socket stays healthy, the registration never fails, and no fatal error reaches the client. A duplicate key inside the annotation map is a dropped set, not a terminal frame, because the map is best-effort metadata; every other duplicate key in the protocol stays terminal. The rule holds on both ingestion paths: a hello-borne set and an `annotate`-borne set with a duplicated key are dropped the same way.
+
+The dropped-set exception covers the map's own keys only. A duplicated `annotations` payload field is an ordinary duplicate protocol key: it keeps the terminal `invalid_envelope` / `duplicate_field` rejection and ends the session, exactly like the duplicate-field rule on the hello path.
+
+Drop reasons are stable: `invalid_payload`, `invalid_key`, `invalid_value`, `too_many_keys`, `too_large`, and `duplicate_key`.
+
+### Compatibility matrix
+
+| Client | Relay | Connect | Roster | Annotations visible |
+|---|---|---|---|---|
+| legacy | legacy | works | address-only peers | never |
+| legacy | new | works; the legacy welcome keeps its exact three fields | address-only peers for a requester without the capability | never for a legacy requester |
+| new | legacy | works; the legacy relay ignores the capability header | address-only peers | never; the client sends no `annotate` operation because no capability was advertised |
+| new | new | works; the relay answers with `capabilities: ["annotations"]` | peers carry `annotations` when published | yes |
+
+### Telemetry
+
+The relay emits one `annotations_accepted` event with the accepted key `count`, and one `annotations_dropped` event with a stable `reason`. Neither event contains an annotation key or value. A set carried by the hello settles with the same two events and `type: "hello"`; a set carried by an `annotate` operation settles with `type: "annotate"`. The extension never logs annotation content either.
+
+### I/O examples
+
+<Tabs>
+  <TabItem label="Capability upgrade request">
+    ```http
+    GET /v1/connect HTTP/1.1
+    Authorization: Bearer <REDACTED>
+    Upgrade: websocket
+    X-Relay-Capabilities: annotations
+    ```
+  </TabItem>
+  <TabItem label="Capable welcome">
+    ```json
+    {
+      "v": 1,
+      "type": "welcome",
+      "request_id": "01993c79-8ad7-79fa-83e3-9789dcaca168",
+      "payload": {
+        "self_address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
+        "heartbeat_ms": 30000,
+        "max_body_bytes": 262144,
+        "capabilities": ["annotations"]
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Legacy welcome">
+    ```json
+    {
+      "v": 1,
+      "type": "welcome",
+      "request_id": "01993c79-8ad7-79fa-83e3-9789dcaca168",
+      "payload": {
+        "self_address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
+        "heartbeat_ms": 30000,
+        "max_body_bytes": 262144
+      }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+<Tabs>
+  <TabItem label="Annotate operation">
+    ```json
+    {
+      "v": 1,
+      "type": "annotate",
+      "request_id": "01993c9a-1111-7aaa-8aaa-111111111111",
+      "payload": {
+        "annotations": {
+          "name": "reviewer",
+          "state": "idle"
+        }
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Dropped set event">
+    ```json
+    {
+      "level": "warn",
+      "event": "annotations_dropped",
+      "result": "dropped",
+      "reason": "invalid_key",
+      "type": "annotate",
+      "request_id": "01993c9a-1111-7aaa-8aaa-111111111111",
+      "address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222"
+    }
+    ```
+  </TabItem>
+  <TabItem label="Accepted set event">
+    ```json
+    {
+      "level": "info",
+      "event": "annotations_accepted",
+      "result": "accepted",
+      "type": "annotate",
+      "request_id": "01993c9a-1111-7aaa-8aaa-111111111111",
+      "address": "/srv/backend@workstation-b#01993ca2-2222-7bbb-9bbb-222222222222",
+      "count": 2
+    }
+    ```
+  </TabItem>
+</Tabs>
+
 
 ## Message delivery and reply flow
 
@@ -693,6 +884,8 @@ Retry idempotence (#22), bounded dedupe retention (#23), the distinct serialized
 ## Operational evidence
 
 Structured logs are sufficient for v1. OpenTelemetry, traces, and metrics are not selected until an operational need appears.
+
+Peer annotations add two settled events: `annotations_accepted` carries the accepted key `count`, and `annotations_dropped` carries a stable `reason`. Neither event carries an annotation key or value.
 
 Example offline server log:
 

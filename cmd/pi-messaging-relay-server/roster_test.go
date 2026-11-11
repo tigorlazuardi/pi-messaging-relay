@@ -37,12 +37,12 @@ func TestAuthenticatedAddressSnapshotIsLiveAddressOnlyAndOmitsCaller(t *testing.
 	peer.session = &authenticatedSession{Address: "peer", Hostname: "private-host"}
 	peer.visible = true
 
-	got := registry.authenticatedAddressSnapshot(caller.session)
-	if len(got) != 1 || got[0] != "peer" {
+	got := registry.authenticatedPeerSnapshot(caller.session)
+	if len(got) != 1 || got[0].Address != "peer" {
 		t.Fatalf("snapshot = %#v, want peer only", got)
 	}
 	registry.remove(peer)
-	if got := registry.authenticatedAddressSnapshot(caller.session); len(got) != 0 {
+	if got := registry.authenticatedPeerSnapshot(caller.session); len(got) != 0 {
 		t.Fatalf("snapshot after removal = %#v, want empty", got)
 	}
 	registry.remove(caller)
@@ -282,7 +282,7 @@ func TestRosterPageUsesLongestExactBoundedPrefix(t *testing.T) {
 	for index := range addresses {
 		addresses[index] = string(rune('a'+index)) + strings.Repeat("x", 3_999)
 	}
-	payload, err := buildRosterPage(operation, addresses)
+	payload, err := buildRosterPage(operation, rosterPeers(addresses))
 	if err != nil {
 		t.Fatalf("build page: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestRosterPageUsesLongestExactBoundedPrefix(t *testing.T) {
 func TestRosterPageBoundaryAndMaximumLegalAddress(t *testing.T) {
 	operation := clientOperation{Type: "list", RequestID: "01993c84-5d38-7d75-8bc1-f945bfa42cdf", List: &listOperationPayload{}}
 	maximumEscaped := strings.Repeat("\u0001", maxCWDBytes) + "@" + strings.Repeat("h", maxHostnameBytes) + "#" + strings.Repeat("0", 36)
-	payload, err := buildRosterPage(operation, []string{maximumEscaped})
+	payload, err := buildRosterPage(operation, rosterPeers([]string{maximumEscaped}))
 	if err != nil {
 		t.Fatalf("maximum legal address did not fit: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestRosterPageBoundaryAndMaximumLegalAddress(t *testing.T) {
 		t.Fatalf("maximum-address page = %#v", payload)
 	}
 	secondMaximum := maximumEscaped[:len(maximumEscaped)-1] + "1"
-	payload, err = buildRosterPage(operation, []string{maximumEscaped, secondMaximum})
+	payload, err = buildRosterPage(operation, rosterPeers([]string{maximumEscaped, secondMaximum}))
 	if err != nil {
 		t.Fatalf("maximum legal address with required cursor did not fit: %v", err)
 	}
@@ -346,4 +346,13 @@ func TestRosterPageBoundaryAndMaximumLegalAddress(t *testing.T) {
 	}); err == nil {
 		t.Fatal("encode boundary accepted oversized roster")
 	}
+}
+
+// rosterPeers turns plain addresses into address-only roster peers.
+func rosterPeers(addresses []string) []rosterPeer {
+	peers := make([]rosterPeer, len(addresses))
+	for index, address := range addresses {
+		peers[index] = rosterPeer{Address: address}
+	}
+	return peers
 }

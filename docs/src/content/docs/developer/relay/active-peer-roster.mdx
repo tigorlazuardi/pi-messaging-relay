@@ -1,6 +1,6 @@
 ---
 title: Active peer roster
-description: How authenticated registry membership becomes bounded, live address-only roster pages and correlated Pi tool results.
+description: How authenticated registry membership becomes bounded, live roster pages with optional peer annotations, and correlated Pi tool results.
 status: accepted
 date: 2026-09-11
 ---
@@ -8,13 +8,13 @@ date: 2026-09-11
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 import Decision from '../../../../components/Decision.astro';
 
-The roster seam connects the server's authenticated session registry to the extension's `relay_list_peers` tool. It publishes only complete opaque addresses. Installation identity, client ID, cwd, hostname, route fields, socket details, connection names, and Pi idle/busy state do not enter roster entries.
+The roster seam connects the server's authenticated session registry to the extension's `relay_list_peers` tool. It publishes complete opaque addresses and, for a requester that negotiated the annotations capability, the optional peer annotations described in [peer annotations](../../protocol/online-relay-api-v1/#peer-annotations). Installation identity, client ID, cwd, hostname, route fields, socket details, and connection names do not enter roster entries. Pi idle/busy state enters only as an annotation value that the publishing session chose, never as a server-owned connection field.
 
 ## Live registry boundary
 
 A connection reserves capacity before WebSocket upgrade, but a reserved or unauthenticated entry is absent from discovery. Successful authentication atomically installs the session address. Disconnect clears authenticated membership before the server emits `session_disconnected`, then releases the tracked connection after logging, so a request after that event cannot return the removed address.
 
-Each `list` operation takes one concurrency-safe copy of currently authenticated addresses, omits the caller, sorts with Go string ordering, and retains only complete strings strictly greater than the decoded cursor. Server lists execute synchronously one at a time in the connection's sole reader: they may overlap admitted SEND workers, consume no 128-send capacity, and are never queued. The server does not parse addresses and does not retain roster or pagination snapshots.
+Each `list` operation takes one concurrency-safe copy of the currently authenticated peers, omits the caller, sorts with Go string ordering, and retains only complete strings strictly greater than the decoded cursor. A capable requester receives the published annotation set of each peer with that peer's entry; a legacy requester receives the exact address-only peer shape. Server lists execute synchronously one at a time in the connection's sole reader: they may overlap admitted SEND workers, consume no 128-send capacity, and are never queued. The server does not parse addresses and does not retain roster or pagination snapshots.
 
 <Decision title="Expose live authenticated addresses through a copy-only registry seam" status="accepted">
 The dispatcher receives no registry map, socket, identity record, or mutable entry. One request gets one address-string copy, limiting accidental identity disclosure and keeping registry synchronization inside its owner.
@@ -26,7 +26,7 @@ Membership can change between pages. A peer added or removed at or before an exi
 
 ## Deterministic page construction
 
-Candidates remain in sorted order. The page is the longest consecutive prefix whose complete compact `roster` envelope is at most 49,152 UTF-8 bytes. If all candidates fit, the response omits `next_cursor`. Otherwise, every tested prefix includes the exact cursor for its last address, and the selected response includes that cursor. This prevents silent truncation.
+Candidates remain in sorted order. A peer is sized with its annotations, JSON-escaped. The page is the longest consecutive prefix whose complete compact `roster` envelope is at most 49,152 UTF-8 bytes; one worst-case address plus one maximum annotation set still fits. If all candidates fit, the response omits `next_cursor`. Otherwise, every tested prefix includes the exact cursor for its last address, and the selected response includes that cursor. This prevents silent truncation.
 
 The size pass encodes each peer once, accumulates prefix sizes, and computes each candidate cursor once. It does not repeatedly serialize every growing page. The protocol encoder applies the 49,152-byte ceiling again; any dispatcher or encoder invariant failure reaches the fatal runtime owner. A write failure caused by client disconnect remains local to that connection.
 
@@ -34,7 +34,7 @@ The size pass encodes each peer once, accumulates prefix sizes, and computes eac
 Page construction owns the exact longest-prefix calculation, while the final encoder independently prevents an oversized roster from crossing the wire if an internal invariant regresses.
 </Decision>
 
-The existing server `operation_settled` event remains the single settled-operation log. A list event adds only bounded `count`; it never records the cursor or peer array.
+The existing server `operation_settled` event remains the single settled-operation log. A list event adds only bounded `count`; it never records the cursor or peer array. Annotation updates settle in their own `annotations_accepted` and `annotations_dropped` events, which carry the accepted key count or a stable drop reason and never an annotation key or value.
 
 ## Extension request lifecycle
 
@@ -58,7 +58,7 @@ Stable local errors are:
 | Socket closes | `Relay disconnected during relay_list_peers.` |
 | Invalid or wrongly correlated response | `Relay returned an invalid relay_list_peers response.` |
 
-A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain only `peers` and optional `next_cursor`. Successful idle and busy string/object `relay_agent_send` shares this operation owner; see [authenticated message delivery](../message-delivery/).
+A successful Pi tool result includes deterministic compact JSON text and matching structured `details`. Both contain `peers`, an optional `next_cursor`, and — only when a rendered peer carries annotations — one `annotations_note` field with the untrusted-data caution. Successful idle and busy string/object `relay_agent_send` shares this operation owner; see [authenticated message delivery](../message-delivery/).
 
 ### I/O examples
 

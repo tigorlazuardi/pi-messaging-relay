@@ -41,11 +41,19 @@ type receivedOperationPayload struct {
 	DeliveryID string
 	MessageID  string
 }
+type annotateOperationPayload struct {
+	// Annotations is the validated replace-all set; empty when Reason is set.
+	Annotations map[string]string
+	// Reason is the stable drop reason for a rejected annotation set; empty
+	// when the set was accepted.
+	Reason string
+}
 
 type clientOperation struct {
 	Type       string
 	RequestID  string
 	List       *listOperationPayload
+	Annotate   *annotateOperationPayload
 	Send       *sendOperationPayload
 	Received   *receivedOperationPayload
 	Record     *dedupeRecord
@@ -384,17 +392,20 @@ func (service *sessionAuthService) serveAuthenticated(
 		}
 		return publishReservedResponseBatch([]authenticatedResponseWork{work})
 	}
-	dispatchSynchronous := func(operation clientOperation, operationStarted time.Time) bool {
+	dispatchSynchronous := func(operation clientOperation, operationStarted time.Time) (operationResponse, bool) {
 		response, respond, err := service.dispatchOperation(producerContext, session, operation)
 		if err != nil {
 			service.reportFatal(fmt.Errorf("dispatch %s operation: %w", operation.Type, err))
 			terminate()
-			return false
+			return operationResponse{}, false
 		}
 		if !respond {
-			return true
+			return response, true
 		}
-		return enqueuePreparedResponse(operation, response, operationStarted)
+		if !enqueuePreparedResponse(operation, response, operationStarted) {
+			return operationResponse{}, false
+		}
+		return response, true
 	}
 
 	startSend := func(operation clientOperation, operationStarted time.Time) {
@@ -476,7 +487,7 @@ func (service *sessionAuthService) serveAuthenticated(
 	}
 
 	for {
-		operation, failure, err := readClientOperation(serveContext, connection)
+		operation, failure, err := readClientOperation(serveContext, connection, session)
 		if err != nil {
 			return
 		}
@@ -534,7 +545,7 @@ func (service *sessionAuthService) serveAuthenticated(
 		// ACK candidates have no response and remain synchronous reader work, so
 		// they can settle any of this exact session's concurrently held sends.
 		if operation.Type == "received" {
-			if !dispatchSynchronous(operation, operationStarted) {
+			if _, ok := dispatchSynchronous(operation, operationStarted); !ok {
 				return
 			}
 			continue
@@ -542,7 +553,7 @@ func (service *sessionAuthService) serveAuthenticated(
 
 		// Body size is classified before dedupe and sender capacity by contract.
 		if operation.Type == "send" && operation.Send.BodyTooLarge {
-			if !dispatchSynchronous(operation, operationStarted) {
+			if _, ok := dispatchSynchronous(operation, operationStarted); !ok {
 				return
 			}
 			continue
@@ -594,13 +605,53 @@ func (service *sessionAuthService) serveAuthenticated(
 			continue
 		}
 
+		// Annotation updates are best-effort metadata: they never produce a
+		// response frame and never release the sender-current tombstone.
+		if operation.Type == "annotate" {
+			response, ok := dispatchSynchronous(operation, operationStarted)
+			if !ok {
+				return
+			}
+			if !service.writeAudit(annotationAuditEvent(session, operation, response)) {
+				terminate()
+				return
+			}
+			continue
+		}
 		// Lists run one at a time in the sole reader. They may overlap admitted
 		// sends but cannot create a queue or consume sender SEND capacity.
 		service.connections.dedupe.advanceSender(session)
-		if !dispatchSynchronous(operation, operationStarted) {
+		if _, ok := dispatchSynchronous(operation, operationStarted); !ok {
 			return
 		}
 	}
+}
+
+// annotationAuditEvent renders the telemetry for one annotation update. It
+// carries the accepted key count or a stable drop reason and never an
+// annotation key or value.
+func annotationAuditEvent(
+	session *authenticatedSession,
+	operation clientOperation,
+	response operationResponse,
+) logEvent {
+	event := logEvent{
+		Level:     "info",
+		Event:     "annotations_accepted",
+		Result:    "accepted",
+		Type:      "annotate",
+		RequestID: operation.RequestID,
+		Address:   session.Address,
+		Count:     response.PeerCount,
+	}
+	if response.Outcome == "dropped" {
+		event.Level = "warn"
+		event.Event = "annotations_dropped"
+		event.Result = "dropped"
+		event.Reason = response.Code
+		event.Count = nil
+	}
+	return event
 }
 
 func senderCapacityResponse(sender *authenticatedSession, messageID string) operationResponse {
@@ -622,6 +673,7 @@ func senderCapacityResponse(sender *authenticatedSession, messageID string) oper
 func readClientOperation(
 	ctx context.Context,
 	connection *websocket.Conn,
+	session *authenticatedSession,
 ) (clientOperation, *protocolFailure, error) {
 	messageType, reader, err := connection.Reader(ctx)
 	if err != nil {
@@ -661,7 +713,22 @@ func readClientOperation(
 			Reason: "invalid_utf8",
 		}, nil
 	}
-	return decodeClientOperation(data)
+	operation, failure, err := decodeClientOperation(data)
+	if err != nil || failure != nil {
+		return operation, failure, err
+	}
+	// The annotate operation exists only for sessions that negotiated the
+	// annotations capability. For every other session it stays an unknown
+	// operation with the unchanged terminal rejection.
+	if operation.Type == "annotate" && !session.AnnotationsCapable {
+		return clientOperation{}, &protocolFailure{
+			Code:      "invalid_envelope",
+			Reason:    "unsupported_operation_type",
+			RequestID: operation.RequestID,
+			Type:      safeClientOperationType(operation.Type),
+		}, nil
+	}
+	return operation, nil, nil
 }
 
 func decodeClientOperation(data []byte) (clientOperation, *protocolFailure, error) {
@@ -736,6 +803,11 @@ func decodeClientOperation(data []byte) (clientOperation, *protocolFailure, erro
 			return failure("invalid_envelope", "invalid_received_payload", operationType)
 		}
 		operation.Received = &payload
+	case "annotate":
+		// A rejected annotation set is dropped, never terminal: the previous
+		// set stays and the socket stays healthy.
+		annotations, reason := decodeAnnotatePayload(fields["payload"], inspection.annotationDuplicate)
+		operation.Annotate = &annotateOperationPayload{Annotations: annotations, Reason: reason}
 	default:
 		return failure("invalid_envelope", "unsupported_operation_type", operationType)
 	}
@@ -872,6 +944,10 @@ type jsonInspection struct {
 	object             bool
 	duplicate          bool
 	duplicateRequestID bool
+	// annotationDuplicate marks a duplicated key inside the annotations map
+	// of an operation payload. Such a duplicate drops the annotation set
+	// instead of ending the connection.
+	annotationDuplicate bool
 }
 
 func inspectJSON(data []byte) (jsonInspection, error) {
@@ -884,7 +960,7 @@ func inspectJSON(data []byte) (jsonInspection, error) {
 	}
 	opening, isDelimiter := token.(json.Delim)
 	inspection.object = isDelimiter && opening == '{'
-	if err := inspectJSONToken(decoder, token, 0, true, &inspection); err != nil {
+	if err := inspectJSONToken(decoder, token, 0, true, "", &inspection); err != nil {
 		return jsonInspection{}, err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -901,6 +977,7 @@ func inspectJSONToken(
 	token json.Token,
 	parentDepth int,
 	root bool,
+	path string,
 	inspection *jsonInspection,
 ) error {
 	delimiter, ok := token.(json.Delim)
@@ -923,8 +1000,19 @@ func inspectJSONToken(
 			if !ok {
 				return errors.New("object name is not a string")
 			}
+			childPath := name
+			if path != "" {
+				childPath = path + "." + name
+			}
 			if _, exists := seen[name]; exists {
-				inspection.duplicate = true
+				// A duplicated key inside the annotations map of an operation
+				// payload drops the annotation set; every other duplicated key
+				// keeps the terminal duplicate-field rejection.
+				if annotationPath(childPath) {
+					inspection.annotationDuplicate = true
+				} else {
+					inspection.duplicate = true
+				}
 				if root && name == "request_id" {
 					inspection.duplicateRequestID = true
 				}
@@ -934,7 +1022,7 @@ func inspectJSONToken(
 			if err != nil {
 				return err
 			}
-			if err := inspectJSONToken(decoder, value, depth, false, inspection); err != nil {
+			if err := inspectJSONToken(decoder, value, depth, false, childPath, inspection); err != nil {
 				return err
 			}
 		}
@@ -948,7 +1036,7 @@ func inspectJSONToken(
 			if err != nil {
 				return err
 			}
-			if err := inspectJSONToken(decoder, value, depth, false, inspection); err != nil {
+			if err := inspectJSONToken(decoder, value, depth, false, path, inspection); err != nil {
 				return err
 			}
 		}
