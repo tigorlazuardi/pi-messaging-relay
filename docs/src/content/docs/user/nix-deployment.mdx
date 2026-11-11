@@ -5,7 +5,7 @@ description: Consume the pinned relay flake, run its system or user service, pro
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The flake supports `x86_64-linux` and `aarch64-linux`. It exports a self-contained Pi extension package, a Linux relay server package, and server-only NixOS and Home Manager modules. Both services bind only to `127.0.0.1` or `::1`.
+The flake supports `x86_64-linux` and `aarch64-linux` for everything below. On `aarch64-darwin` and `x86_64-darwin` it exports only the Pi extension package (`packages.<system>.pi-messaging-relay-extension`) and the dev shell, so a macOS client can consume the extension while the relay server runs on Linux. On Linux it exports a self-contained Pi extension package, a Linux relay server package, and server-only NixOS and Home Manager modules. Both services bind only to `127.0.0.1` or `::1`.
 
 <Aside type="caution" title="No public exposure">
 These modules do not configure nginx, TLS, a firewall, VPN, SSH, or Pi settings. Keep the relay on loopback. A consumer that adds a proxy owns its complete exposure and security boundary.

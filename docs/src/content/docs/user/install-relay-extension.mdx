@@ -20,7 +20,7 @@ A `relay_auth_accepted` diagnostic means the session connected and can use disco
 - A running Linux relay server
 - One configuration file at `~/.config/pi/pi-messaging-relay.json`
 
-The TypeScript extension remains a platform-neutral Node component; the Linux-only support boundary applies to the Go relay server because its state-directory safety depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and resolves `typebox` through the Pi host loader (peer dependency `"*"`; Pi 1.0.0+ ships it).
+The TypeScript extension remains a platform-neutral Node component; the Nix flake also builds it on `aarch64-darwin` and `x86_64-darwin`; the Linux-only support boundary applies to the Go relay server because its state-directory safety depends on Linux filesystem semantics. Pi extensions execute with the user's full system permissions. Review `extension/index.ts` and its locked dependencies before installation. The extension pins `ws` v8.21.3 (MIT) for its bounded WebSocket transport and resolves `typebox` through the Pi host loader (peer dependency `"*"`; Pi 1.0.0+ ships it).
 
 ## Install from a checkout
 

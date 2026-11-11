@@ -38,7 +38,7 @@ Initial systems are `x86_64-linux` and `aarch64-linux`. The server intentionally
 
 The flake pins `nixpkgs` and Home Manager in `flake.lock`; Home Manager follows the same nixpkgs input. Package, check, and development-shell execution use the locked nixpkgs default Go compiler (Go 1.26.7 at the accepted revision), which is compatible with the repository's preserved `go 1.24.0` module contract. No second nixpkgs input or custom compiler is introduced. The researched Home Manager revision `cd1c9e552f41894aeb5cc5cb353d5a1d61550357` confirms `systemd.user.services` support, while state creation relies on systemd's scope-aware `StateDirectory`, not an invented Home Manager XDG creation option. The implementation records its final locked revisions in acceptance evidence.
 
-Per-system outputs use `nixpkgs.lib.genAttrs`. No `flake-utils` or `flake-parts` input is justified for two Linux systems.
+Per-system outputs use `nixpkgs.lib.genAttrs`. Packages and dev shells cover the Linux and Darwin systems (Darwin: extension only); checks cover Linux only. No `flake-utils` or `flake-parts` input is justified.
 
 ### Server package
 
@@ -285,7 +285,7 @@ in {
 - Publishing to npm or wrapping/installing Pi.
 - Mutating Pi settings, nginx, firewall, TLS, VPN, SSH, DNS, or public access.
 - Dynamic users, fixed global numeric IDs, containers, socket activation, multiple instances, arbitrary server arguments, or configurable state roots.
-- macOS services or non-Linux server claims.
+- macOS services or non-Linux server claims. Darwin systems export only the platform-neutral extension package and dev shell; the server package, modules, and VM checks are Linux-only.
 - New protocol behavior, health endpoints, OpenTelemetry, metrics, traces, or dashboards.
 
 Ponytail: support two Linux systems, two unique package derivations, one service instance, fixed scope-owned state, host limited to standard IPv4/IPv6 loopback, one store-safe `secretFile` path option, and port `43127` by default. Broaden only for a second real consumer.

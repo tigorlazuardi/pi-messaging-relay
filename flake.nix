@@ -11,12 +11,18 @@
 
   outputs = inputs@{ self, nixpkgs, home-manager }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
+      linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
+      # ponytail: Darwin gets the platform-neutral Pi extension and dev shell only;
+      # the Go server, services, and VM checks stay Linux-only.
+      systems = linuxSystems ++ [ "aarch64-darwin" "x86_64-darwin" ];
+      forSystems = nixpkgs.lib.genAttrs;
+      forAllSystems = forSystems systems;
+      forLinuxSystems = forSystems linuxSystems;
     in {
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
           server = pkgs.buildGoModule {
             pname = "pi-messaging-relay-server";
             version = "0.0.0";
@@ -52,6 +58,7 @@
           };
         in {
           pi-messaging-relay-extension = extension;
+        } // nixpkgs.lib.optionalAttrs isLinux {
           pi-messaging-relay-server = server;
           default = server;
         });
@@ -66,7 +73,7 @@
         default = pi-messaging-relay;
       };
 
-      checks = forAllSystems (system:
+      checks = forLinuxSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
           packages = self.packages.${system};
